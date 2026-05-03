@@ -1,0 +1,41 @@
+{
+  "brief": {
+    "sessionId": "sess_zh_readiness",
+    "projectId": "proj_landing",
+    "meetingType": "requirement_scoping",
+    "title": "活動頁需求",
+    "goal": "決定活動頁第一版是否可排程",
+    "mustConfirm": ["負責人", "deadline", "驗收標準"],
+    "risks": ["驗收標準模糊"],
+    "constraints": ["不可影響既有報名流程"],
+    "knownParticipants": [],
+    "preferredTone": "gentle"
+  },
+  "projectContext": {
+    "id": "proj_landing",
+    "name": "Campaign Landing",
+    "currentPriorities": ["clear acceptance criteria"],
+    "constraints": ["keep signup stable"],
+    "recurringRisks": [],
+    "keyDecisions": []
+  },
+  "knowledgeMemories": [],
+  "transcriptEvents": [
+    { "id": "zh_t1", "sessionId": "sess_zh_readiness", "source": "system", "speakerConfidence": 0.6, "language": "zh-TW", "startedAtMs": 0, "endedAtMs": 5000, "text": "第一版就先做活動頁，細節之後再補。", "isFinal": true },
+    { "id": "zh_t2", "sessionId": "sess_zh_readiness", "source": "mic", "speakerConfidence": 0.8, "language": "zh-TW", "startedAtMs": 6000, "endedAtMs": 10000, "text": "驗收標準還沒講清楚，誰負責也還沒定。", "isFinal": true },
+    { "id": "zh_t3", "sessionId": "sess_zh_readiness", "source": "system", "speakerConfidence": 0.6, "language": "zh-TW", "startedAtMs": 11000, "endedAtMs": 16000, "text": "那 deadline 先不要寫死，我們先這樣決定好了。", "isFinal": true }
+  ],
+  "expectedInterventionMoments": [
+    {
+      "id": "zh_expected_missing_inputs",
+      "transcriptEventId": "zh_t3",
+      "expectedReason": "決策前缺負責人 deadline 驗收標準",
+      "acceptableSuggestionPatterns": ["先不要定案|owner|deadline|驗收標準|缺"],
+      "severity": "high"
+    }
+  ],
+  "baselineChecklist": [
+    { "id": "base_acceptance", "label": "驗收標準", "pattern": "驗收" }
+  ],
+  "expectedNoSuggestionRegions": []
+}

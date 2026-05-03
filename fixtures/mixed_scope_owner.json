@@ -1,0 +1,43 @@
+{
+  "brief": {
+    "sessionId": "sess_mixed_scope",
+    "projectId": "proj_checkout",
+    "meetingType": "requirement_scoping",
+    "title": "Checkout rollback scope",
+    "goal": "確認 checkout migration scope 是否可以 commit",
+    "mustConfirm": ["owner", "deadline", "rollback plan", "success metric"],
+    "risks": ["rollback 不清楚", "owner 未定"],
+    "constraints": ["不能影響 existing checkout"],
+    "knownParticipants": [],
+    "preferredTone": "direct"
+  },
+  "projectContext": {
+    "id": "proj_checkout",
+    "name": "Checkout Migration",
+    "strategicGoal": "降低 migration blast radius",
+    "currentPriorities": ["rollback clarity"],
+    "constraints": ["no checkout outage"],
+    "recurringRisks": ["owner ambiguity"],
+    "keyDecisions": []
+  },
+  "knowledgeMemories": [],
+  "transcriptEvents": [
+    { "id": "mix_t1", "sessionId": "sess_mixed_scope", "source": "system", "speakerConfidence": 0.6, "language": "mixed", "startedAtMs": 0, "endedAtMs": 4000, "text": "This checkout migration 應該可以 commit this sprint.", "isFinal": true },
+    { "id": "mix_t2", "sessionId": "sess_mixed_scope", "source": "mic", "speakerConfidence": 0.7, "language": "mixed", "startedAtMs": 5000, "endedAtMs": 9000, "text": "owner 是誰？rollback plan 還沒定吧。", "isFinal": true },
+    { "id": "mix_t3", "sessionId": "sess_mixed_scope", "source": "system", "speakerConfidence": 0.6, "language": "mixed", "startedAtMs": 10000, "endedAtMs": 15000, "text": "deadline 先不要卡死，success metric 也還沒講。", "isFinal": true }
+  ],
+  "expectedInterventionMoments": [
+    {
+      "id": "mix_expected_readiness",
+      "transcriptEventId": "mix_t3",
+      "expectedReason": "owner rollback deadline success metric are missing",
+      "acceptableSuggestionPatterns": ["先不要定案|owner|deadline|驗收標準|rollback"],
+      "severity": "high"
+    }
+  ],
+  "baselineChecklist": [
+    { "id": "base_owner", "label": "owner", "pattern": "owner" },
+    { "id": "base_rollback", "label": "rollback", "pattern": "rollback" }
+  ],
+  "expectedNoSuggestionRegions": []
+}

@@ -1,0 +1,9 @@
+{
+  "fixtures": [
+    "requirement_scoping_layer3",
+    "mixed_scope_owner",
+    "zh_decision_readiness",
+    "mixed_false_positive",
+    "customer_interview_en"
+  ]
+}

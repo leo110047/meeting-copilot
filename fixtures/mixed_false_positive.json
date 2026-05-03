@@ -1,0 +1,35 @@
+{
+  "brief": {
+    "sessionId": "sess_mixed_fp",
+    "projectId": "proj_weekly",
+    "meetingType": "open_discussion",
+    "title": "Weekly sync",
+    "goal": "同步近況，不做交付承諾",
+    "mustConfirm": ["是否有 blocker"],
+    "risks": ["誤把閒聊當成決策"],
+    "constraints": [],
+    "knownParticipants": [],
+    "preferredTone": "curious"
+  },
+  "projectContext": {
+    "id": "proj_weekly",
+    "name": "Weekly",
+    "currentPriorities": ["avoid noise"],
+    "constraints": [],
+    "recurringRisks": [],
+    "keyDecisions": []
+  },
+  "knowledgeMemories": [],
+  "transcriptEvents": [
+    { "id": "fp_t1", "sessionId": "sess_mixed_fp", "source": "system", "speakerConfidence": 0.6, "language": "mixed", "startedAtMs": 0, "endedAtMs": 4000, "text": "我昨天看了一下 dashboard，沒有 blocker。", "isFinal": true },
+    { "id": "fp_t2", "sessionId": "sess_mixed_fp", "source": "mic", "speakerConfidence": 0.8, "language": "mixed", "startedAtMs": 5000, "endedAtMs": 9000, "text": "今天只是 sync，不做 scope decision。", "isFinal": true },
+    { "id": "fp_t3", "sessionId": "sess_mixed_fp", "source": "system", "speakerConfidence": 0.6, "language": "zh-TW", "startedAtMs": 10000, "endedAtMs": 15000, "text": "好，那大家繼續照原本節奏走。", "isFinal": true }
+  ],
+  "expectedInterventionMoments": [],
+  "baselineChecklist": [
+    { "id": "base_blocker", "label": "blocker", "pattern": "blocker" }
+  ],
+  "expectedNoSuggestionRegions": [
+    { "fromTranscriptEventId": "fp_t1", "toTranscriptEventId": "fp_t3", "reason": "no strong decision moment" }
+  ]
+}

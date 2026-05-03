@@ -1,0 +1,41 @@
+{
+  "brief": {
+    "sessionId": "sess_customer_en",
+    "projectId": "proj_sales",
+    "meetingType": "customer_interview",
+    "title": "Customer discovery",
+    "goal": "Decide whether the pain is frequent enough to continue discovery",
+    "mustConfirm": ["buyer", "frequency", "current workaround", "budget owner"],
+    "risks": ["nice-to-have signal mistaken as urgent pain"],
+    "constraints": [],
+    "knownParticipants": [],
+    "preferredTone": "curious"
+  },
+  "projectContext": {
+    "id": "proj_sales",
+    "name": "Discovery",
+    "currentPriorities": ["validate buyer pain"],
+    "constraints": [],
+    "recurringRisks": ["confusing user with buyer"],
+    "keyDecisions": []
+  },
+  "knowledgeMemories": [],
+  "transcriptEvents": [
+    { "id": "en_t1", "sessionId": "sess_customer_en", "source": "system", "speakerConfidence": 0.6, "language": "en", "startedAtMs": 0, "endedAtMs": 4000, "text": "This is interesting, but I am not the budget owner.", "isFinal": true },
+    { "id": "en_t2", "sessionId": "sess_customer_en", "source": "mic", "speakerConfidence": 0.8, "language": "en", "startedAtMs": 5000, "endedAtMs": 9000, "text": "How often does this happen and what is your current workaround?", "isFinal": true },
+    { "id": "en_t3", "sessionId": "sess_customer_en", "source": "system", "speakerConfidence": 0.6, "language": "en", "startedAtMs": 10000, "endedAtMs": 15000, "text": "Maybe once a quarter. Deadline and owner are not clear for a purchase decision.", "isFinal": true }
+  ],
+  "expectedInterventionMoments": [
+    {
+      "id": "en_expected_buyer",
+      "transcriptEventId": "en_t3",
+      "expectedReason": "buyer and purchase owner missing",
+      "acceptableSuggestionPatterns": ["先不要定案|owner|deadline|驗收標準|缺"],
+      "severity": "medium"
+    }
+  ],
+  "baselineChecklist": [
+    { "id": "base_buyer", "label": "buyer", "pattern": "buyer" }
+  ],
+  "expectedNoSuggestionRegions": []
+}

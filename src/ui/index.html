@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Meeting Copilot</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body data-state="setup">
+    <main class="shell">
+      <section class="setup-screen" aria-label="會前準備">
+        <header class="setup-header">
+          <div>
+            <p class="eyebrow">會前</p>
+            <h1>會前準備</h1>
+          </div>
+          <button id="startListening" class="start-button" type="button" disabled>
+            <span>開始會議</span>
+            <small>AI 啟用後可用</small>
+          </button>
+        </header>
+
+        <section class="provider-settings" aria-label="AI 啟用狀態">
+          <div class="status-dot" aria-hidden="true"></div>
+          <div>
+            <p>AI 狀態</p>
+            <strong id="textProviderName">尚未啟用</strong>
+            <small id="textProviderDetail">正在檢查 ChatGPT 登入狀態。</small>
+          </div>
+          <div class="provider-actions">
+            <button id="loginTextProvider" type="button">登入 ChatGPT</button>
+            <button id="enableOAuthProvider" type="button" disabled>啟用 AI</button>
+          </div>
+        </section>
+
+        <div class="prep-layout">
+          <section class="prep-input-panel" aria-label="輸入會議背景">
+            <header>
+              <div>
+                <p class="section-kicker">背景</p>
+                <h2>這場會議的重點</h2>
+              </div>
+              <button id="prepDictation" type="button">語音輸入</button>
+            </header>
+            <textarea
+              id="setupContext"
+              rows="8"
+              placeholder="例：這場只確認 demo 範圍，不承諾正式版時程。需要問清楚負責人、驗收標準、回復方案。"
+            ></textarea>
+            <small id="setupContextMeta">尚未加入會議背景。</small>
+          </section>
+
+          <section id="setupDropZone" class="context-dropzone" aria-label="拖拉會議檔案">
+            <p class="section-kicker">檔案</p>
+            <h2>拖拉會議檔案</h2>
+            <p>支援 txt、md、csv、json、srt、vtt 等文字檔。啟用 AI 後，檔案文字內容會送給 AI 作為會議背景。</p>
+            <strong id="droppedFileCount">尚未加入檔案</strong>
+          </section>
+        </div>
+
+        <section class="prep-summary" aria-label="AI 重點整理">
+          <div>
+            <p class="section-kicker">AI 整理</p>
+            <h2>AI 重點整理</h2>
+          </div>
+          <div id="prepSummary">加入文字、語音或檔案後，AI 會整理這場會議要注意的重點。</div>
+        </section>
+      </section>
+
+      <section class="listening-curtain" aria-label="會議進行中">
+        <header class="curtain-bar">
+          <div class="listening-status">
+            <span class="state-label" id="sessionState">待機中</span>
+            <p id="providerState">尚未開始會議。</p>
+          </div>
+          <div class="curtain-actions">
+            <label for="captureSource">音訊</label>
+            <select id="captureSource">
+              <option value="mic">我的麥克風</option>
+              <option value="system">系統音訊</option>
+            </select>
+            <label class="opacity-control" for="curtainOpacity">
+              <span>透明度 <strong id="curtainOpacityValue">100%</strong></span>
+              <input id="curtainOpacity" type="range" min="10" max="100" value="100" />
+            </label>
+            <button id="stopListening" class="stop-button" type="button" disabled>結束會議</button>
+          </div>
+        </header>
+
+        <div class="curtain-focus" aria-live="polite">
+          <div id="suggestion" class="suggestion-empty">目前沒有提醒。</div>
+          <div class="feedback-row" id="feedbackRow" hidden>
+            <button type="button">有用</button>
+            <button type="button">太吵</button>
+            <button type="button">錯誤</button>
+            <button type="button">略過</button>
+          </div>
+        </div>
+
+        <section id="liveTranscript" class="transcript-drawer" aria-label="即時逐字稿">
+          <header>
+            <div>
+              <span>逐字稿</span>
+              <strong id="transcriptDrawerCount">0 句</strong>
+            </div>
+            <button id="transcriptDrawerToggle" type="button" aria-expanded="false">展開</button>
+          </header>
+          <div id="transcriptPreview" class="transcript-preview" aria-live="polite">
+            <p class="empty-line">最近 3 句會顯示在這裡。</p>
+          </div>
+          <div id="transcriptFull" class="transcript-full" hidden></div>
+        </section>
+      </section>
+
+      <section class="review-screen" aria-label="會議記錄">
+        <header class="review-header">
+          <div>
+            <span>會後</span>
+            <h1>會議記錄</h1>
+          </div>
+          <button id="newMeeting" type="button">開始下一場</button>
+        </header>
+
+        <div class="review-grid">
+          <section class="review-panel review-summary-panel" aria-label="AI 整理文件">
+            <header>
+              <p>文件一</p>
+              <h2>AI 整理</h2>
+            </header>
+            <div id="postMeetingSummary" class="review-summary"></div>
+          </section>
+
+          <section class="review-panel transcript-review-panel" aria-label="逐字稿文件">
+            <header>
+              <p>文件二</p>
+              <h2>逐字稿</h2>
+            </header>
+            <div id="postMeetingTranscript" class="post-transcript"></div>
+          </section>
+        </div>
+
+        <section class="export-panel" aria-label="下載會議記錄">
+          <div>
+            <p class="section-kicker">下載</p>
+            <h2>下載會議記錄</h2>
+            <small id="downloadState">結束後會產生兩份文件：AI 整理與逐字稿。</small>
+          </div>
+          <div class="download-actions">
+            <button class="primary-export" type="button" data-download-format="summary-markdown">下載 AI 整理 Markdown</button>
+            <button class="primary-export" type="button" data-download-format="transcript-txt">下載逐字稿 TXT</button>
+            <details class="secondary-export">
+              <summary>其他格式</summary>
+              <div>
+                <button type="button" data-download-format="summary-json">AI 整理 JSON</button>
+                <button type="button" data-download-format="summary-pdf">AI 整理 PDF</button>
+                <button type="button" data-download-format="transcript-json">逐字稿 JSON</button>
+                <button type="button" data-download-format="transcript-pdf">逐字稿 PDF</button>
+                <button id="downloadErrorLog" type="button">錯誤紀錄 JSON</button>
+              </div>
+            </details>
+          </div>
+        </section>
+      </section>
+
+      <section class="utility-row">
+        <details>
+          <summary>測試與 replay 工具</summary>
+          <p>這裡只保留工程驗證入口；正式使用流程會從「開始會議」進入。</p>
+          <code>npm run replay</code>
+          <code>npm run manual</code>
+        </details>
+      </section>
+    </main>
+    <script type="module" src="./app.mjs"></script>
+  </body>
+</html>

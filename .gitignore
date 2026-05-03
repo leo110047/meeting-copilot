@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# JavaScript build output
+dist/
+
+# Rust / Tauri build output
+target/
+src-tauri/target/
+src-tauri/binaries/
+
+# Local runtime data
+.data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor / IDE local state
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+.nyc_output/

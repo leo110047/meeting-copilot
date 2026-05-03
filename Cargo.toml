@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/meeting-copilot-core", "src-tauri"]
+resolver = "2"

@@ -1,0 +1,85 @@
+{
+  "brief": {
+    "sessionId": "sess_req_layer3",
+    "projectId": "proj_mogu_share",
+    "meetingType": "requirement_scoping",
+    "title": "分享功能 scope review",
+    "goal": "決定 v1 分享功能 scope，避免承諾正式版 scope",
+    "mustConfirm": ["v1 scope", "owner", "deadline", "驗收標準"],
+    "risks": ["demo scope 和正式版 scope 混在一起", "舊決策被無聲取代"],
+    "constraints": ["本週只能承諾 demo scope"],
+    "knownParticipants": [
+      { "name": "PM", "role": "product" },
+      { "name": "Leo", "role": "engineer" }
+    ],
+    "preferredTone": "direct"
+  },
+  "projectContext": {
+    "id": "proj_mogu_share",
+    "name": "MOGU Share",
+    "strategicGoal": "先讓 demo 可控，不要提前承諾正式版分享流程",
+    "currentPriorities": ["demo reliability", "scope containment"],
+    "constraints": ["本週只能承諾 demo scope"],
+    "recurringRisks": ["正式版 scope creep"],
+    "keyDecisions": ["上一場已決定 demo scope 和正式版 scope 要拆開"]
+  },
+  "knowledgeMemories": [
+    {
+      "id": "mem_split_demo_prod",
+      "projectId": "proj_mogu_share",
+      "participantIds": [],
+      "kind": "decision",
+      "text": "上一場已決定 demo scope 和正式版 scope 要拆開，今天不能把正式版承諾混進 demo。",
+      "sourceSessionIds": ["previous_scope_review"],
+      "evidenceTranscriptIds": ["prev_t4"],
+      "createdAt": "2026-05-01T10:00:00.000Z",
+      "confidence": 0.9
+    }
+  ],
+  "participantProfiles": [
+    {
+      "id": "profile_pm",
+      "displayName": "PM",
+      "role": "product",
+      "organization": "internal",
+      "observedPatterns": [
+        {
+          "kind": "jumps_to_solution",
+          "evidenceSessionIds": ["previous_scope_review"],
+          "confidence": 0.72
+        }
+      ],
+      "communicationPreferences": ["needs written follow-up"],
+      "sensitive": true
+    }
+  ],
+  "strategicContext": {
+    "id": "strategy_self",
+    "currentPriorities": ["不要承諾不可控交付", "會中先拆決策"],
+    "avoidCommitments": ["未定 owner/deadline 的正式版承諾"],
+    "preferredTradeoffs": ["先 demo 後正式版"],
+    "activeConstraints": ["本週時間有限"],
+    "updatedAt": "2026-05-03T00:00:00.000Z"
+  },
+  "transcriptEvents": [
+    { "id": "req_t1", "sessionId": "sess_req_layer3", "source": "system", "speaker": "PM", "speakerConfidence": 0.7, "language": "mixed", "startedAtMs": 0, "endedAtMs": 5000, "text": "我們今天先看 share flow，應該就照正式版的 scope 走吧。", "isFinal": true },
+    { "id": "req_t2", "sessionId": "sess_req_layer3", "source": "mic", "speaker": "Leo", "speakerConfidence": 0.8, "language": "mixed", "startedAtMs": 6000, "endedAtMs": 9000, "text": "如果只是 demo，我可以先卡 v1。", "isFinal": true },
+    { "id": "req_t3", "sessionId": "sess_req_layer3", "source": "system", "speaker": "PM", "speakerConfidence": 0.7, "language": "zh-TW", "startedAtMs": 10000, "endedAtMs": 15000, "text": "那就先這樣決定，deadline 我們晚點再看，owner 應該你們工程處理。", "isFinal": true },
+    { "id": "req_t4", "sessionId": "sess_req_layer3", "source": "system", "speaker": "PM", "speakerConfidence": 0.7, "language": "zh-TW", "startedAtMs": 17000, "endedAtMs": 22000, "text": "驗收標準先不要寫太細，反正到時候能分享出去就好。", "isFinal": true },
+    { "id": "req_t5", "sessionId": "sess_req_layer3", "source": "mic", "speaker": "Leo", "speakerConfidence": 0.8, "language": "mixed", "startedAtMs": 24000, "endedAtMs": 29000, "text": "這裡有 scope creep risk，rollback plan 也還沒有。", "isFinal": true }
+  ],
+  "expectedInterventionMoments": [
+    {
+      "id": "req_expected_layer3_split",
+      "transcriptEventId": "req_t3",
+      "expectedReason": "必須引用上一場 demo scope 和正式版 scope 要拆開的跨 session memory",
+      "acceptableSuggestionPatterns": ["上一場|先前脈絡|取代舊決策|demo scope"],
+      "severity": "high"
+    }
+  ],
+  "baselineChecklist": [
+    { "id": "base_owner", "label": "owner", "pattern": "owner" },
+    { "id": "base_deadline", "label": "deadline", "pattern": "deadline" }
+  ],
+  "expectedNoSuggestionRegions": []
+}
