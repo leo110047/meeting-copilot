@@ -27,6 +27,17 @@ src-tauri/binaries/
 .env
 .env.*
 !.env.example
+*.pem
+*.p8
+*.p12
+*.key
+*.keystore
+*.jks
+*.mobileprovision
+*.provisionprofile
+secrets/
+private/
+credentials/
 
 # OS metadata
 .DS_Store
