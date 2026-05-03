@@ -3,7 +3,7 @@
 Meeting Copilot 是一個 native desktop app，用來在會議中即時輔助決策。
 它會記錄會議內容、追蹤決策背景，並在 owner、scope、deadline、驗收標準還不清楚時，提示使用者先補問或暫停承諾。
 
-這不是單場會議摘要工具。產品目標是 Layer 3 決策副駕：透過會議歷史、專案記憶、deterministic reducers 與可 replay 的 fixtures，降低會議中做出不健康承諾的機率。
+它透過會議歷史、專案記憶、deterministic reducers 與可 replay 的 fixtures，降低會議中做出不健康承諾的機率。
 
 ## 環境需求
 
