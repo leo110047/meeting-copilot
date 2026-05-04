@@ -196,6 +196,13 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(helperBuildScript, /Meeting Copilot Speech\.app/);
   assert.match(helperBuildScript, /MEETING_COPILOT_CODESIGN_IDENTITY/);
   assert.match(helperBuildScript, /MEETING_COPILOT_CODESIGN_KEYCHAIN/);
+  assert.match(helperBuildScript, /readDotEnvValue/);
+  assert.match(helperBuildScript, /Meeting Copilot Local Code Signing/);
+  assert.match(helperBuildScript, /find-identity/);
+  assert.match(helperBuildScript, /loginKeychainPath/);
+  assert.match(helperBuildScript, /resolveMacSigningKeychain/);
+  assert.match(helperBuildScript, /firstValidCodesigningIdentity/);
+  assert.match(helperBuildScript, /CSSMERR_/);
   assert.match(helperBuildScript, /codesign/);
   assert.doesNotMatch(helperBuildScript, /LSUIElement/);
   assert.match(helperInstallScript, /Contents\/Frameworks\/libmeeting_copilot_speech_bridge\.dylib/);
@@ -203,6 +210,13 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(helperInstallScript, /rmSync/);
   assert.match(helperInstallScript, /MEETING_COPILOT_CODESIGN_IDENTITY/);
   assert.match(helperInstallScript, /MEETING_COPILOT_CODESIGN_KEYCHAIN/);
+  assert.match(helperInstallScript, /readDotEnvValue/);
+  assert.match(helperInstallScript, /Meeting Copilot Local Code Signing/);
+  assert.match(helperInstallScript, /find-identity/);
+  assert.match(helperInstallScript, /loginKeychainPath/);
+  assert.match(helperInstallScript, /resolveMacSigningKeychain/);
+  assert.match(helperInstallScript, /firstValidCodesigningIdentity/);
+  assert.match(helperInstallScript, /CSSMERR_/);
   assert.match(helperInstallScript, /codesign/);
   assert.match(runWithRustScript, /process\.platform === "win32"/);
   assert.match(runWithRustScript, /MEETING_COPILOT_RUST_BIN/);
