@@ -23,6 +23,7 @@ struct BridgeErrorLine: Codable {
     let kind: String
     let message: String
     let source: String
+    let code: String?
 }
 
 private let bridgeLock = NSLock()
@@ -43,6 +44,45 @@ private enum NativeSpeechStatusFlag {
     static let requiresMicrophone: Int32 = 1 << 10
     static let requiresScreenCapture: Int32 = 1 << 11
     static let macOS13OrNewer: Int32 = 1 << 12
+}
+
+private func classifySpeechError(_ error: NSError) -> String {
+    if error.domain == "kAFAssistantErrorDomain", [203, 1110].contains(error.code) {
+        return "no_speech_detected"
+    }
+    if let message = error.userInfo[NSLocalizedDescriptionKey] as? String,
+       let code = classifySpeechErrorMessage(message) {
+        return code
+    }
+    if error.domain == "MeetingCopilotSpeechBridge" {
+        switch error.code {
+        case 1, 2:
+            return "speech_permission_required"
+        case 4:
+            return "screen_recording_permission"
+        case 8:
+            return "microphone_permission_required"
+        default:
+            break
+        }
+    }
+    return "\(error.domain):\(error.code)"
+}
+
+private func classifySpeechErrorMessage(_ message: String) -> String? {
+    let lowered = message.lowercased()
+    if lowered.contains("no speech detected")
+        || message.contains("未偵測到語音")
+        || message.contains("未检测到语音") {
+        return "no_speech_detected"
+    }
+    if lowered.contains("screen") && lowered.contains("permission") {
+        return "screen_recording_permission"
+    }
+    if lowered.contains("microphone") && lowered.contains("permission") {
+        return "microphone_permission_required"
+    }
+    return nil
 }
 
 private func hasScreenCaptureAccess() -> Bool {
@@ -214,7 +254,7 @@ public func meetingCopilotNativeSpeechStart(
     do {
         try bridge.start()
     } catch {
-        bridge.emitError(error.localizedDescription)
+        bridge.emitError(error)
         return -4
     }
     bridgeLock.lock()
@@ -285,7 +325,7 @@ final class NativeSpeechBridge: NSObject {
                 self.emit(result: result)
             }
             if let error {
-                self.emitError(error.localizedDescription)
+                self.emitError(error)
             }
         }
         if source == "system" {
@@ -317,7 +357,7 @@ final class NativeSpeechBridge: NSObject {
                 do {
                     try await self.startScreenCaptureKitStream()
                 } catch {
-                    self.emitError(error.localizedDescription)
+                    self.emitError(error)
                 }
             }
         } else {
@@ -383,8 +423,13 @@ final class NativeSpeechBridge: NSObject {
         ))
     }
 
-    func emitError(_ message: String) {
-        emitLine(BridgeErrorLine(kind: "error", message: message, source: source))
+    func emitError(_ error: Error) {
+        let nsError = error as NSError
+        emitError(nsError.localizedDescription, code: classifySpeechError(nsError))
+    }
+
+    func emitError(_ message: String, code: String? = nil) {
+        emitLine(BridgeErrorLine(kind: "error", message: message, source: source, code: code ?? classifySpeechErrorMessage(message)))
     }
 
     private func emitLine<T: Encodable>(_ value: T) {

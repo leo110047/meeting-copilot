@@ -324,9 +324,10 @@ fn install_native_transcriber_io(
                         &error.to_string(),
                         serde_json::json!({"rawLineHash": stable_id(&line), "source": stdout_source}),
                     );
-                    let _ = app_for_stdout.emit(
-                        "native_transcription_error",
+                    emit_native_transcription_error(
+                        &app_for_stdout,
                         format!("failed to parse native transcript line: {error}"),
+                        &stdout_source,
                     );
                 }
             }
@@ -356,7 +357,7 @@ fn install_native_transcriber_io(
                 &line,
                 serde_json::json!({"source": stderr_source}),
             );
-            let _ = app_for_stderr.emit("native_transcription_error", line);
+            emit_native_transcription_error(&app_for_stderr, line, &stderr_source);
         }
     });
 }
@@ -391,10 +392,11 @@ fn handle_native_transcript_line(
         "native:{}:{}:{}:{}",
         session_id, helper_line.source, helper_line.ended_at_ms, cleaned_text
     ));
+    let event_source = helper_line.source.clone();
     let input = TranscriptInput {
         id: Some(event_id.clone()),
         text: cleaned_text,
-        source: Some(helper_line.source),
+        source: Some(event_source.clone()),
         speaker: None,
         speaker_confidence: Some(helper_line.confidence),
         started_at_ms: Some(helper_line.started_at_ms),
@@ -414,7 +416,7 @@ fn handle_native_transcript_line(
                 &error,
                 serde_json::json!({"eventId": event_id}),
             );
-            let _ = app.emit("native_transcription_error", error);
+            emit_native_transcription_error(app, error, &event_source);
         }
     }
 }
@@ -436,7 +438,13 @@ fn monitor_native_transcriber_exit(app: tauri::AppHandle, session_id: String, so
                     Ok(transcribers) => transcribers,
                     Err(error) => {
                         let message = format!("native speech helper monitor lock failed: {error}");
-                        return emit_native_transcriber_exit(&app, &session_id, &message, "error");
+                        return emit_native_transcriber_exit(
+                            &app,
+                            &session_id,
+                            &source,
+                            &message,
+                            "error",
+                        );
                     }
                 };
                 let Some(child) = transcribers.get_mut(&key) else {
@@ -459,12 +467,12 @@ fn monitor_native_transcriber_exit(app: tauri::AppHandle, session_id: String, so
                     let message = format!(
                         "{source} native speech helper exited before Stop Listening: {status}"
                     );
-                    emit_native_transcriber_exit(&app, &session_id, &message, "warning");
+                    emit_native_transcriber_exit(&app, &session_id, &source, &message, "warning");
                     return;
                 }
                 Some(Err(error)) => {
                     let message = format!("{source} native speech helper monitor failed: {error}");
-                    emit_native_transcriber_exit(&app, &session_id, &message, "error");
+                    emit_native_transcriber_exit(&app, &session_id, &source, &message, "error");
                     return;
                 }
                 None => {}
@@ -476,6 +484,7 @@ fn monitor_native_transcriber_exit(app: tauri::AppHandle, session_id: String, so
 fn emit_native_transcriber_exit(
     app: &tauri::AppHandle,
     session_id: &str,
+    source: &str,
     message: &str,
     severity: &str,
 ) {
@@ -490,7 +499,57 @@ fn emit_native_transcriber_exit(
         message,
         serde_json::json!({}),
     );
-    let _ = app.emit("native_transcription_error", message);
+    emit_native_transcription_error(app, message, source);
+}
+
+fn emit_native_transcription_error(
+    app: &tauri::AppHandle,
+    message: impl Into<String>,
+    source: &str,
+) {
+    let message = message.into();
+    emit_native_transcription_error_with_code(
+        app,
+        message,
+        source,
+        None,
+    );
+}
+
+fn emit_native_transcription_error_with_code(
+    app: &tauri::AppHandle,
+    message: impl Into<String>,
+    source: &str,
+    code: Option<String>,
+) {
+    let message = message.into();
+    let payload = NativeTranscriptionErrorEvent {
+        code: code.unwrap_or_else(|| classify_native_transcription_error(&message)),
+        source: source.to_string(),
+        message,
+    };
+    let _ = app.emit("native_transcription_error", payload);
+}
+
+fn classify_native_transcription_error(message: &str) -> String {
+    let lowered = message.to_lowercase();
+    if lowered.contains("no speech detected")
+        || message.contains("未偵測到語音")
+        || message.contains("未检测到语音")
+    {
+        return "no_speech_detected".to_string();
+    }
+    if lowered.contains("stopped from tray") {
+        return "stopped_from_tray".to_string();
+    }
+    if lowered.contains("screen recording")
+        || lowered.contains("screen capture")
+        || lowered.contains("screensystemaudiopreflight=false")
+        || message.contains("螢幕與系統錄音")
+    {
+        return "screen_recording_permission".to_string();
+    }
+    "native_transcription_error".to_string()
 }
 
 fn has_active_native_transcribers(session_id: &str) -> bool {
@@ -612,7 +671,7 @@ fn ingest_transcript_inner(
     session_id: String,
     input: TranscriptInput,
 ) -> Result<IngestTranscriptResponse, String> {
-    let (event, brief, events_snapshot) = {
+    let (event, brief, events_snapshot, should_persist_event) = {
         let mut sessions = LIVE_SESSIONS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -621,30 +680,42 @@ fn ingest_transcript_inner(
             .get_mut(&session_id)
             .ok_or_else(|| "session not found".to_string())?;
 
-        let event_index = session.events.len() + 1;
-        let event = TranscriptEvent {
-            id: input
-                .id
-                .unwrap_or_else(|| format!("native_{}_{}", session_id, event_index)),
-            session_id: session_id.clone(),
-            source: input.source.unwrap_or_else(|| "mic".to_string()),
-            speaker: input.speaker,
-            speaker_confidence: input.speaker_confidence.unwrap_or(0.35),
-            language: detect_language(&input.text),
-            started_at_ms: input
-                .started_at_ms
-                .unwrap_or(((event_index - 1) * 5000) as i64),
-            ended_at_ms: input.ended_at_ms,
-            text: input.text,
-            is_final: input.is_final.unwrap_or(true),
-        };
-        session.events.push(event.clone());
-        (event, session.brief.clone(), session.events.clone())
+        let source = input.source.unwrap_or_else(|| "mic".to_string());
+        let text = input.text;
+        if let Some(existing) = session.events.iter().find(|event| {
+            event.source == source && transcript_text_matches(&event.text, &text)
+        }) {
+            let event = existing.clone();
+            let events_snapshot = session.events.clone();
+            (event, session.brief.clone(), events_snapshot, false)
+        } else {
+            let event_index = session.events.len() + 1;
+            let event = TranscriptEvent {
+                id: input
+                    .id
+                    .unwrap_or_else(|| format!("native_{}_{}", session_id, event_index)),
+                session_id: session_id.clone(),
+                source,
+                speaker: input.speaker,
+                speaker_confidence: input.speaker_confidence.unwrap_or(0.35),
+                language: detect_language(&text),
+                started_at_ms: input
+                    .started_at_ms
+                    .unwrap_or(((event_index - 1) * 5000) as i64),
+                ended_at_ms: input.ended_at_ms,
+                text,
+                is_final: input.is_final.unwrap_or(true),
+            };
+            session.events.push(event.clone());
+            (event, session.brief.clone(), session.events.clone(), true)
+        }
     };
 
     let db_path = app_db_path()?;
     let conn = open_db(&db_path)?;
-    insert_transcript_event(&conn, &event)?;
+    if should_persist_event {
+        insert_transcript_event(&conn, &event)?;
+    }
 
     let decision_state = derive_decision_state(&session_id, &events_snapshot);
     let mut suggestions = derive_suggestions(&brief, &events_snapshot, &decision_state);
@@ -683,6 +754,19 @@ fn ingest_transcript_inner(
             decision_snapshot_id: snapshot_id,
         },
     })
+}
+
+fn transcript_text_matches(left: &str, right: &str) -> bool {
+    normalize_transcript_text(left) == normalize_transcript_text(right)
+}
+
+fn normalize_transcript_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() || "。！？；，、".contains(ch))
+        .to_lowercase()
 }
 
 #[tauri::command]

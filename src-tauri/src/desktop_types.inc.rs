@@ -379,3 +379,11 @@ struct HelperTranscriptLine {
     started_at_ms: i64,
     ended_at_ms: i64,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeTranscriptionErrorEvent {
+    message: String,
+    source: String,
+    code: String,
+}

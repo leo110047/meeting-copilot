@@ -61,6 +61,8 @@ export function buildAiSummaryDocument(artifact) {
     sessionId: artifact.sessionId,
     generatedAt: artifact.generatedAt,
     prepContext: artifact.prepContext,
+    transcriptCount: artifact.transcript.length,
+    recordingNotice: artifact.transcript.length > 0 ? null : "本文件沒有錄音逐字稿；內容只來自會前資料或本機整理狀態。",
     summary: artifact.summary,
     suggestions: artifact.suggestions,
     decisionState: artifact.decisionState
@@ -82,6 +84,8 @@ export function renderAiSummaryMarkdown(document) {
     `# ${document.title}`,
     `Session: ${document.sessionId}`,
     `Generated: ${document.generatedAt}`,
+    document.recordingNotice ? `Notice: ${document.recordingNotice}` : "",
+    document.prepContext ? `\n## 會前資料\n${document.prepContext}` : "",
     "",
     section("本場重點", document.summary.keyPoints),
     "",
@@ -98,7 +102,7 @@ export function renderTranscriptText(document) {
     `Generated: ${document.generatedAt}`,
     "",
     ...(document.transcript.length > 0
-      ? document.transcript.map((line, index) => `${index + 1}. ${line.text}`)
+      ? document.transcript.map((line, index) => `${index + 1}. ${line.text}${line.persistenceStatus === "failed" ? " [未儲存]" : ""}`)
       : ["本場沒有收到逐字稿。"])
   ].join("\n");
 }
@@ -121,6 +125,8 @@ function renderAiSummaryHtml(document) {
   return [
     `<h1>${escapeHtml(document.title)}</h1>`,
     `<p>Session: ${escapeHtml(document.sessionId)}<br />Generated: ${escapeHtml(document.generatedAt)}</p>`,
+    document.recordingNotice ? `<p><strong>${escapeHtml(document.recordingNotice)}</strong></p>` : "",
+    document.prepContext ? `<section><h2>會前資料</h2><pre>${escapeHtml(document.prepContext)}</pre></section>` : "",
     section("本場重點", document.summary.keyPoints),
     section("決策與待確認", document.summary.decisionsAndOpenQuestions),
     section("建議動作", document.summary.suggestedActions)
@@ -129,7 +135,7 @@ function renderAiSummaryHtml(document) {
 
 function renderTranscriptHtml(document) {
   const lines = document.transcript.length > 0
-    ? document.transcript.map((line, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(line.text)}</p>`).join("")
+    ? document.transcript.map((line, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(line.text)}${line.persistenceStatus === "failed" ? " <em>未儲存</em>" : ""}</p>`).join("")
     : "<p>本場沒有收到逐字稿。</p>";
   return [
     `<h1>${escapeHtml(document.title)}</h1>`,

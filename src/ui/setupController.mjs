@@ -11,6 +11,7 @@ export function createSetupController({
 }) {
   let droppedFileNames = [];
   let droppedContextChunks = [];
+  let droppedFileErrors = [];
   let prepDictating = false;
   let prepSummaryTimer;
   let prepSummaryRequestId = 0;
@@ -48,17 +49,33 @@ export function createSetupController({
       const files = [...(event.dataTransfer?.files ?? [])];
       if (files.length === 0) return;
       const loaded = [];
+      const errors = [];
       for (const file of files) {
+        if (!isSupportedTextContextFileName(file.name)) {
+          const message = "只支援文字檔：txt、md、csv、json、log、srt、vtt";
+          errors.push({ name: file.name, error: message });
+          recordDroppedFileError(file.name, message);
+          logAppError("files.browser_drop_file", message, { name: file.name, size: file.size, type: file.type }, "warning");
+          continue;
+        }
         const loadedFile = await readBrowserDroppedFile(file);
         if (loadedFile?.text) {
           loaded.push(loadedFile);
-          droppedFileNames.push(file.name);
+        } else if (loadedFile?.error) {
+          errors.push({ name: file.name, error: loadedFile.error });
+          recordDroppedFileError(file.name, loadedFile.error);
         }
       }
       appendDroppedContext(loaded.filter(Boolean));
+      droppedFileNames.push(...loaded.map((file) => file.name));
+      const loadedNames = loaded.map((file) => file.name).join("、");
       setupContextMeta.textContent = loaded.length > 0
-        ? `已加入檔案：${droppedFileNames.slice(-3).join("、")}。`
-        : "檔案讀取失敗，尚未加入會議背景。";
+        ? errors.length > 0
+          ? `已加入檔案：${loadedNames}；部分檔案未讀取：${formatFileErrors(errors)}`
+          : `已加入檔案：${loadedNames}。`
+        : errors.length > 0
+          ? `檔案未加入：${formatFileErrors(errors)}`
+          : "檔案讀取失敗，尚未加入會議背景。";
     });
     prepDictationButton.addEventListener("click", togglePrepDictation);
     installNativeDropListeners().catch((error) => {
@@ -153,12 +170,16 @@ export function createSetupController({
       appendDroppedContext(loaded);
       const errors = files.filter((file) => file.error).map((file) => `${file.name}: ${file.error}`);
       for (const file of files.filter((file) => file.error)) {
+        recordDroppedFileError(file.name, file.error);
         logAppError("files.native_drop_file", file.error, { name: file.name }, "warning");
       }
       droppedFileNames.push(...loaded.map((file) => file.name));
+      const loadedNames = loaded.map((file) => file.name).join("、");
       setupContextMeta.textContent = errors.length > 0
-        ? `部分檔案未讀取：${errors.slice(0, 2).join("；")}`
-        : `已加入檔案：${droppedFileNames.slice(-3).join("、")}。啟用 AI 後會送出檔案文字內容。`;
+        ? loaded.length > 0
+          ? `已加入檔案：${loadedNames}；部分檔案未讀取：${errors.slice(0, 2).join("；")}`
+          : `部分檔案未讀取：${errors.slice(0, 2).join("；")}`
+        : `已加入檔案：${loadedNames}。啟用 AI 後會送出檔案文字內容。`;
     });
   }
 
@@ -173,16 +194,33 @@ export function createSetupController({
     schedulePrepSummaryGeneration();
   }
 
+  function recordDroppedFileError(name, error) {
+    droppedFileErrors.push({ name, error });
+    if (droppedFileErrors.length > 50) droppedFileErrors = droppedFileErrors.slice(-50);
+  }
+
   function readBrowserDroppedFile(file) {
     return new Promise((resolve) => {
       const reader = new FileReader();
       reader.onload = () => resolve({ name: file.name, text: String(reader.result).slice(0, 8000), truncated: false });
       reader.onerror = () => {
         logAppError("files.browser_drop_file", reader.error ?? "browser FileReader failed", { name: file.name, size: file.size, type: file.type }, "warning");
-        resolve(undefined);
+        resolve({ name: file.name, text: "", truncated: false, error: reader.error?.message ?? "browser FileReader failed" });
       };
       reader.readAsText(file);
     });
+  }
+
+  function isSupportedTextContextFileName(name) {
+    // Keep in sync with read_dropped_context_file in src-tauri/src/shell_storage.inc.rs.
+    return /\.(txt|md|markdown|csv|json|log|srt|vtt)$/i.test(name);
+  }
+
+  function formatFileErrors(errors) {
+    return errors
+      .slice(0, 2)
+      .map((file) => `${file.name}: ${file.error}`)
+      .join("；");
   }
 
   function setPrepDictating(enabled) {
@@ -197,6 +235,13 @@ export function createSetupController({
       .map((chunk) => `檔案 ${chunk.name}${chunk.truncated ? "（已截斷）" : ""}\n${chunk.text}`)
       .join("\n\n");
     return [typed, files].filter(Boolean).join("\n\n").trim();
+  }
+
+  function contextDiagnostics() {
+    return {
+      fileCount: droppedContextChunks.length,
+      failedFiles: droppedFileErrors.slice(-5)
+    };
   }
 
   function renderPrepSummary() {
@@ -267,6 +312,7 @@ export function createSetupController({
   return {
     install,
     combinedPrepContext,
+    contextDiagnostics,
     renderPrepSummary,
     resetPrepSummaryQueue,
     schedulePrepSummaryGeneration,

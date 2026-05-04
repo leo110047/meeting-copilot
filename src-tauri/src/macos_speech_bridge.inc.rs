@@ -408,6 +408,10 @@ unsafe extern "C" fn macos_speech_bridge_callback(line: *const c_char, context: 
                 .and_then(|message| message.as_str())
                 .unwrap_or("macOS speech bridge error")
                 .to_string();
+            let code = error_line
+                .get("code")
+                .and_then(|code| code.as_str())
+                .map(|code| code.to_string());
             let _ = log_app_error_inner(
                 Some(&context.session_id),
                 "native_transcription.bridge_error",
@@ -416,7 +420,7 @@ unsafe extern "C" fn macos_speech_bridge_callback(line: *const c_char, context: 
                 &message,
                 serde_json::json!({"source": context.source}),
             );
-            let _ = context.app.emit("native_transcription_error", message);
+            emit_native_transcription_error_with_code(&context.app, message, &context.source, code);
             return;
         }
     }
@@ -467,7 +471,7 @@ unsafe extern "C" fn macos_speech_bridge_callback(line: *const c_char, context: 
                 &message,
                 serde_json::json!({"rawLineHash": stable_id(&line), "source": context.source}),
             );
-            let _ = context.app.emit("native_transcription_error", message);
+            emit_native_transcription_error(&context.app, message, &context.source);
         }
     }
 }

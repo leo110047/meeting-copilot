@@ -160,6 +160,9 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /transcriptDrawerOpen/);
   assert.match(js, /currentPartialTranscript/);
   assert.match(js, /native_transcript_preview/);
+  assert.match(js, /promoteCurrentPartialTranscript/);
+  assert.match(js, /preview_\$\{activeSessionId\}_\$\{transcriptIndex\}/);
+  assert.match(js, /native\.promote_partial_transcript/);
   assert.match(js, /記錄中/);
   assert.match(js, /TRANSCRIPT_STALL_MS/);
   assert.match(js, /startTranscriptStallMonitor/);
@@ -197,6 +200,9 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /tauri:\/\/drag-drop/);
   assert.match(js, /read_dropped_context_files/);
   assert.match(js, /readBrowserDroppedFile/);
+  assert.match(js, /isSupportedTextContextFileName/);
+  assert.match(js, /droppedFileErrors/);
+  assert.match(js, /contextDiagnostics/);
   assert.match(js, /if \(loadedFile\?\.text\)/);
   assert.match(js, /droppedFileNames\.push\(\.\.\.loaded\.map\(\(file\) => file\.name\)\)/);
   assert.match(js, /尚未加入會議背景/);
@@ -216,9 +222,15 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /renderProcessingDocument/);
   assert.match(js, /finalizeMeetingReview/);
   assert.match(js, /reviewScreen\.dataset\.reviewState = "ready"/);
+  assert.match(js, /hasReviewContent/);
+  assert.match(js, /renderNoReviewInput/);
+  assert.match(js, /syncReviewDownloadButtons/);
+  assert.match(js, /不會送出空內容給 ChatGPT/);
+  assert.match(js, /沒有收到逐字稿，也沒有可整理的會前資料/);
   assert.match(js, /本機文件已整理完成/);
   assert.match(js, /AI 整理已更新/);
   assert.match(js, /已從系統列結束會議/);
+  assert.match(js, /No speech detected/);
   assert.match(js, /沒有系統音訊權限/);
   assert.match(js, /系統音訊轉錄已停止/);
   assert.match(js, /語音轉錄已停止/);

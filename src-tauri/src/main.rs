@@ -1,5 +1,5 @@
 use meeting_copilot_core::{DecisionReadiness, DecisionState, DecisionType};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{include_image, DragDropEvent, Emitter, Manager, WindowEvent};
+use tauri::{DragDropEvent, Emitter, Manager, WindowEvent, include_image};
 
 static LIVE_SESSIONS: OnceLock<Mutex<HashMap<String, NativeLiveSession>>> = OnceLock::new();
 static NATIVE_TRANSCRIBERS: OnceLock<Mutex<HashMap<String, Child>>> = OnceLock::new();

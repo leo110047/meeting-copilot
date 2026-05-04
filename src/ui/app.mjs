@@ -1,6 +1,7 @@
 import { downloadMeetingArtifact as downloadMeetingArtifactFile, escapeHtml } from "./documentExports.mjs";
 import { labelMove, summarizeDecisionState, summarizeSuggestions, summarizeTranscript } from "./meetingSummaries.mjs";
 import { createSetupController } from "./setupController.mjs";
+import { upsertTranscriptEventInPlace } from "./transcriptState.mjs";
 import { renderTranscriptDrawerView, transcriptSpeakerLabel } from "./transcriptDrawer.mjs";
 import { clamp, detectUiLanguage, formatAudioMonitorMessage, formatError, isScreenRecordingPermissionMessage, labelCaptureSource, labelLanguage, makeClientId } from "./uiUtils.mjs";
 const startButton = document.querySelector("#startListening");
@@ -65,7 +66,10 @@ let textProviderRefreshTimers = [];
 let transcriptStallTimer;
 let reviewFinalized = false;
 let postMeetingAiSummaryStarted = false;
+let activeCaptureSource;
 const TRANSCRIPT_STALL_MS = 12000;
+const NO_REVIEW_CONTENT_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料。請確認音訊來源或加入會議背景後再開始下一場。";
+const NO_REVIEW_AI_SKIP_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料；不會送出空內容給 ChatGPT。";
 const nativeInvoke = window.__TAURI__?.core?.invoke;
 const nativeListen = window.__TAURI__?.event?.listen;
 const setupController = createSetupController({
@@ -138,6 +142,7 @@ startButton.addEventListener("click", async () => {
   transcriptIndex = 0;
   lastAiExtractionEventCount = 0;
   liveAiExtractionRunning = false;
+  activeCaptureSource = undefined;
   startedAt = performance.now();
   resetListeningSurface();
   activeSessionId = await createLiveSession();
@@ -187,6 +192,7 @@ stopButton.addEventListener("click", async () => {
   stopButton.disabled = true;
   sessionState.textContent = "整理中";
   providerState.textContent = "正在結束會議...";
+  await promoteCurrentPartialTranscript("stop_button");
   enterReviewProcessing({ statusText: "正在切換到會後頁。" });
   await waitForReviewPaint();
   finalizeMeetingReview({
@@ -278,6 +284,7 @@ async function startNativeListening() {
   await setupController.stopPrepDictationBeforeMeeting();
   sessionState.textContent = "檢查音訊";
   const requestedSource = captureSource?.value ?? "mic";
+  activeCaptureSource = requestedSource;
   hideAudioPermissionAction();
   let health = await nativeInvoke("request_native_audio_permissions", {
     request: { source: requestedSource }
@@ -354,12 +361,22 @@ async function installNativeListeners() {
       renderTranscriptDrawer();
     });
     await nativeListen("native_transcription_error", (event) => {
-      const message = String(event.payload ?? "");
+      const payload = event.payload;
+      const message = typeof payload === "object" && payload !== null
+        ? String(payload.message ?? "")
+        : String(payload ?? "");
+      const source = typeof payload === "object" && payload !== null
+        ? payload.source ?? activeCaptureSource ?? captureSource?.value ?? "mic"
+        : activeCaptureSource ?? captureSource?.value ?? "mic";
+      const code = typeof payload === "object" && payload !== null
+        ? String(payload.code ?? "native_transcription_error")
+        : classifyNativeTranscriptionError(message);
       clearTranscriptStallMonitor();
-      logAppError("native.transcription_event_error", message, { source: captureSource?.value ?? "mic" }, "error");
-      providerState.textContent = formatAudioMonitorMessage(message);
+      const severity = code === "no_speech_detected" ? "warning" : "error";
+      logAppError("native.transcription_event_error", message, { source, code }, severity);
+      providerState.textContent = formatAudioMonitorMessage(message, code);
       handleAudioPermissionProblem(message);
-      if (message.includes("stopped from tray") && document.body.dataset.state === "listening") {
+      if (code === "stopped_from_tray" && document.body.dataset.state === "listening") {
         finalizeMeetingReview({ statusText: "已從系統列結束會議，正在整理記錄。" });
       }
     });
@@ -428,6 +445,65 @@ async function sendTranscript(text) {
   } catch (error) {
     logAppError("transcript.ingest", error, { sessionId: activeSessionId }, "error");
     providerState.textContent = `逐字稿寫入失敗：${formatError(error)}`;
+  }
+}
+
+async function promoteCurrentPartialTranscript(reason) {
+  const partial = currentPartialTranscript;
+  const text = partial?.text?.trim();
+  if (!text || !activeSessionId) return;
+  const duplicate = transcriptEvents.some((event) =>
+    event.text.trim() === text
+    && (event.source ?? "unknown") === (partial.source ?? "unknown")
+  );
+  currentPartialTranscript = undefined;
+  if (duplicate) {
+    renderTranscriptDrawer();
+    return;
+  }
+  transcriptIndex += 1;
+  const elapsedMs = Math.round(performance.now() - startedAt);
+  const promotedEvent = {
+    id: `preview_${activeSessionId}_${transcriptIndex}`,
+    sessionId: activeSessionId,
+    source: partial.source ?? activeCaptureSource ?? "unknown",
+    speaker: partial.speaker,
+    // TODO: keep ASR confidence separate from speaker confidence in the transcript model.
+    speakerConfidence: partial.speakerConfidence ?? 0.35,
+    language: partial.language ?? detectUiLanguage(text),
+    startedAtMs: partial.startedAtMs ?? Math.max(0, elapsedMs - 3000),
+    endedAtMs: partial.endedAtMs ?? elapsedMs,
+    text,
+    isFinal: true,
+    persistenceStatus: "pending"
+  };
+  upsertTranscriptEvent(promotedEvent);
+  renderTranscriptDrawer();
+  logAppError("native.promote_partial_transcript", "Promoted visible partial transcript before review", {
+    sessionId: activeSessionId,
+    reason,
+    source: promotedEvent.source
+  }, "warning");
+  if (!nativeInvoke) return;
+  try {
+    const payload = await nativeInvoke("ingest_transcript", {
+      sessionId: activeSessionId,
+      input: {
+        id: promotedEvent.id,
+        text: promotedEvent.text,
+        source: promotedEvent.source,
+        speaker: promotedEvent.speaker,
+        speakerConfidence: promotedEvent.speakerConfidence,
+        startedAtMs: promotedEvent.startedAtMs,
+        endedAtMs: promotedEvent.endedAtMs,
+        isFinal: true
+      }
+    });
+    if (payload.event) payload.event.persistenceStatus = "saved";
+    renderRuntimePayload(payload);
+  } catch (error) {
+    markTranscriptPersistence(promotedEvent.id, "failed");
+    logAppError("native.promote_partial_transcript_failed", error, { sessionId: activeSessionId, reason }, "error");
   }
 }
 
@@ -541,6 +617,7 @@ function initializeSetupState() {
   aiSummaryOverride = undefined;
   lastAiExtractionEventCount = 0;
   liveAiExtractionRunning = false;
+  activeCaptureSource = undefined;
   reviewFinalized = false;
   postMeetingAiSummaryStarted = false;
   setupController.resetPrepSummaryQueue();
@@ -709,17 +786,19 @@ function finalizeMeetingReview({ statusText, runAiSummary = true, allowNewMeetin
   startButton.disabled = false;
   stopButton.disabled = true;
   newMeetingButton.disabled = !allowNewMeeting;
-  setDownloadActionsEnabled(true);
-  renderPostMeetingReview();
+  const artifact = renderPostMeetingReview();
   reviewFinalized = true;
-  const readyText = oauthAiEnabled && textProviderStatus?.authenticated
+  const hasContent = hasReviewContent(artifact);
+  const readyText = !hasContent
+    ? NO_REVIEW_CONTENT_MESSAGE
+    : oauthAiEnabled && textProviderStatus?.authenticated
     ? runAiSummary
       ? "本機文件已整理完成，正在用 ChatGPT 更新 AI 整理。"
       : "本機文件已先整理完成，錄音正在背景收尾。"
     : "整理完成，可以檢查文件並下載。";
   reviewStatus.textContent = readyText;
   providerState.textContent = readyText;
-  if (runAiSummary && !postMeetingAiSummaryStarted) {
+  if (hasContent && runAiSummary && !postMeetingAiSummaryStarted) {
     postMeetingAiSummaryStarted = true;
     generateOAuthSummaryIfEnabled(sessionId);
   }
@@ -741,17 +820,65 @@ function setDownloadActionsEnabled(enabled) {
 
 function renderPostMeetingReview() {
   const artifact = buildMeetingArtifact();
+  if (!hasReviewContent(artifact)) {
+    postMeetingSummary.innerHTML = renderNoReviewInput(artifact);
+    postMeetingTranscript.innerHTML = `<p class="empty-line">本場沒有收到逐字稿。</p>`;
+    downloadState.textContent = "沒有可整理內容；請下載錯誤紀錄協助排查，或開始下一場。";
+    syncReviewDownloadButtons(artifact);
+    return artifact;
+  }
   postMeetingSummary.innerHTML = [
     renderReviewList("本場重點", artifact.summary.keyPoints),
     renderReviewList("決策與待確認", artifact.summary.decisionsAndOpenQuestions),
     renderReviewList("建議動作", artifact.summary.suggestedActions)
   ].join("");
   postMeetingTranscript.innerHTML = artifact.transcript.length > 0
-    ? artifact.transcript.map((line, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(line.text)}</p>`).join("")
+    ? artifact.transcript.map((line, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(line.text)}${line.persistenceStatus === "failed" ? " <em>未儲存</em>" : ""}</p>`).join("")
     : `<p class="empty-line">本場沒有收到逐字稿。</p>`;
   downloadState.textContent = artifact.transcript.length > 0
     ? `已整理 ${artifact.transcript.length} 段逐字稿。建議先下載 AI 整理 Markdown 與逐字稿 TXT。`
     : "沒有逐字稿內容；仍可下載 AI 整理。";
+  syncReviewDownloadButtons(artifact);
+  return artifact;
+}
+
+function renderNoReviewInput(artifact) {
+  const diagnostics = artifact.contextDiagnostics ?? { failedFiles: [] };
+  const failedFiles = diagnostics.failedFiles ?? [];
+  const reasons = [
+    "沒有收到任何可用的逐字稿。",
+    artifact.prepContext ? "" : "沒有可整理的會前資料。",
+    ...failedFiles.map((file) => `未加入 ${file.name}：${file.error}`)
+  ].filter(Boolean);
+  const actions = [
+    "確認音訊來源是否正在播放或有人說話。",
+    "若要用會前資料整理，請加入支援的文字檔或直接貼上內容。",
+    "保留錯誤紀錄 JSON 供排查。"
+  ];
+  return [
+    renderReviewList("本場沒有可整理內容", reasons),
+    renderReviewList("下一步", actions)
+  ].join("");
+}
+
+function hasReviewContent(artifact) {
+  return artifact.transcript.length > 0 || artifact.prepContext.trim().length > 0;
+}
+
+function classifyNativeTranscriptionError(message) {
+  if (/No speech detected|未偵測到語音|未检测到语音/i.test(message)) return "no_speech_detected";
+  if (/stopped from tray/i.test(message)) return "stopped_from_tray";
+  if (isScreenRecordingPermissionMessage(message)) return "screen_recording_permission";
+  return "native_transcription_error";
+}
+
+function syncReviewDownloadButtons(artifact) {
+  const hasContent = hasReviewContent(artifact);
+  for (const button of downloadButtons) {
+    const format = button.dataset.downloadFormat ?? "";
+    button.disabled = !hasContent || (format.startsWith("transcript") && artifact.transcript.length === 0);
+  }
+  if (downloadErrorLogButton) downloadErrorLogButton.disabled = false;
 }
 
 function renderReviewList(title, items) {
@@ -761,10 +888,11 @@ function renderReviewList(title, items) {
 
 function buildMeetingArtifact() {
   const transcript = transcriptEvents.length > 0
-    ? transcriptEvents.map((event) => ({ id: event.id, text: event.text, source: event.source, language: event.language }))
+    ? transcriptEvents.map((event) => ({ id: event.id, text: event.text, source: event.source, language: event.language, persistenceStatus: event.persistenceStatus ?? "saved" }))
     : transcriptLines.map((text, index) => ({ id: `line_${index + 1}`, text, source: "unknown", language: detectUiLanguage(text) }));
   const transcriptText = transcript.map((line) => line.text).join("\n");
   const prepContext = setupController.combinedPrepContext();
+  const contextDiagnostics = setupController.contextDiagnostics();
   const localSummary = {
     keyPoints: summarizeTranscript(transcriptText),
     decisionsAndOpenQuestions: summarizeDecisionState(latestDecisionState, transcriptText),
@@ -780,6 +908,7 @@ function buildMeetingArtifact() {
     localSummary,
     summaryProvider: aiSummaryOverride ? "codex-chatgpt-oauth" : "local-rule",
     transcript,
+    contextDiagnostics,
     suggestions: suggestionHistory,
     decisionState: latestDecisionState ?? null
   };
@@ -910,6 +1039,12 @@ async function generateOAuthSummaryIfEnabled(sessionId = activeSessionId) {
   if (!nativeInvoke || !oauthAiEnabled || !textProviderStatus?.authenticated) return;
   if (!isCurrentReviewSession(sessionId)) return;
   const artifact = buildMeetingArtifact();
+  if (!hasReviewContent(artifact)) {
+    renderPostMeetingReview();
+    reviewStatus.textContent = NO_REVIEW_AI_SKIP_MESSAGE;
+    downloadState.textContent = "沒有可整理內容；可下載錯誤紀錄協助排查。";
+    return;
+  }
   downloadState.textContent = "正在用 ChatGPT 產生 AI 整理。";
   reviewStatus.textContent = "本機文件已可檢查；ChatGPT 正在更新 AI 整理。";
   try {
@@ -976,11 +1111,14 @@ async function downloadErrorLog() {
 }
 
 function upsertTranscriptEvent(event) {
-  if (!event?.text) return;
-  if (transcriptEvents.some((existing) => existing.id === event.id)) return;
-  transcriptEvents.push(event);
-  if (!transcriptLines.includes(event.text)) transcriptLines.push(event.text);
+  upsertTranscriptEventInPlace(transcriptEvents, transcriptLines, event);
 }
+
+function markTranscriptPersistence(id, status) {
+  const event = transcriptEvents.find((item) => item.id === id);
+  if (event) event.persistenceStatus = status;
+}
+
 
 function renderTranscriptDrawer() {
   renderTranscriptDrawerView({

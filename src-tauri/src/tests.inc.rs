@@ -25,6 +25,24 @@ mod tests {
     }
 
     #[test]
+    fn transcript_text_match_dedupes_preview_and_final_punctuation() {
+        assert!(transcript_text_matches("這是最後一句。", "這是最後一句"));
+        assert!(!transcript_text_matches("這是最後一句", "這是另一句"));
+    }
+
+    #[test]
+    fn native_transcription_error_classifier_handles_no_speech_without_locale_only_matching() {
+        assert_eq!(
+            classify_native_transcription_error("No speech detected"),
+            "no_speech_detected"
+        );
+        assert_eq!(
+            classify_native_transcription_error("未偵測到語音"),
+            "no_speech_detected"
+        );
+    }
+
+    #[test]
     fn oauth_status_parser_does_not_accept_negative_logged_in_text() {
         assert_eq!(
             parse_subscription_oauth_authenticated("Not logged in. Run codex login to use ChatGPT."),

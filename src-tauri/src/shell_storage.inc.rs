@@ -13,9 +13,10 @@ fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "stop" => {
                 stop_all_native_transcribers(app);
                 show_main_window(app);
-                let _ = app.emit(
-                    "native_transcription_error",
+                emit_native_transcription_error(
+                    app,
                     "Native transcription stopped from tray",
+                    "tray",
                 );
             }
             "quit" => app.exit(0),
