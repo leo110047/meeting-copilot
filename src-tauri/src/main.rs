@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "macos")]
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -96,9 +97,9 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Meeting Copilot native app")
-        .run(|app, event| match event {
+        .run(|_app, event| match event {
             #[cfg(target_os = "macos")]
-            tauri::RunEvent::Reopen { .. } => show_main_window(app),
+            tauri::RunEvent::Reopen { .. } => show_main_window(_app),
             _ => {}
         });
 }

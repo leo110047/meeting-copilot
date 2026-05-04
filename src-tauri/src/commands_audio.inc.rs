@@ -166,7 +166,8 @@ fn start_native_transcription(
         vec![source.clone()]
     };
     let mut processes = vec![];
-    let mut bridge_sources = vec![];
+    #[cfg(target_os = "macos")]
+    let mut bridge_sources: Vec<String> = vec![];
     for helper_source in requested_sources {
         #[cfg(target_os = "macos")]
         {

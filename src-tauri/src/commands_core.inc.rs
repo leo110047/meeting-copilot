@@ -145,13 +145,13 @@ fn native_transcriber_health_for_source(source: &str) -> Result<NativeTranscribe
 fn request_native_audio_permissions_for_source(
     source: &str,
 ) -> Result<NativeTranscriberHealth, String> {
-    let sources = if source == "mixed" {
-        vec!["mic", "system"]
-    } else {
-        vec![source]
-    };
     #[cfg(target_os = "macos")]
     {
+        let sources = if source == "mixed" {
+            vec!["mic", "system"]
+        } else {
+            vec![source]
+        };
         for helper_source in sources {
             if helper_source == "mic" || helper_source == "system" {
                 let _ = request_macos_speech_bridge_permissions(helper_source, "zh-TW")?;
