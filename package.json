@@ -17,8 +17,8 @@
     "manual": "node cli/meeting-copilot.mjs manual --fixture requirement_scoping_layer3",
     "stt:bakeoff": "node cli/meeting-copilot.mjs stt-bakeoff --fixture mixed_scope_owner",
     "tauri:dev": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri dev",
-    "native:build": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri build --debug",
-    "native:build:mac": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri build --debug --bundles app",
+    "native:build": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri build --debug && node scripts/install-mac-helper-app.mjs",
+    "native:build:mac": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri build --debug --bundles app && node scripts/install-mac-helper-app.mjs",
     "native:build:windows": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri build --debug --bundles nsis,msi",
     "rust:test": "node scripts/run-with-rust.mjs cargo test --workspace",
     "desktop:build": "node scripts/run-with-rust.mjs cargo build --manifest-path src-tauri/Cargo.toml",
@@ -28,6 +28,7 @@
     "node": ">=20"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.0"
+    "@tauri-apps/cli": "^2.11.0",
+    "better-sqlite3": "^12.9.0"
   }
 }

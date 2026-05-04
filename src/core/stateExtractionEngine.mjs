@@ -1,4 +1,4 @@
-import { validateExtractionOutput, sha16, normalizeText } from "../domain/contracts.mjs";
+import { validateExtractionOutput, makeId, normalizeText } from "../domain/contracts.mjs";
 
 export class StateExtractionEngine {
   constructor({ provider, promptVersion = "extract_state_patch.v1", timeoutMs = 2500 } = {}) {
@@ -128,7 +128,7 @@ function failure(sessionId, failureKind, promptVersion, provider, rawOutputRef) 
   return {
     ok: false,
     failure: {
-      id: sha16(`${sessionId}:${failureKind}:${Date.now()}:${rawOutputRef}`),
+      id: makeId("extraction_failure"),
       sessionId,
       callType: "extract_state_patch",
       promptVersion,

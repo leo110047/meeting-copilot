@@ -30,15 +30,14 @@ export function applyMeetingStatePatch(state, patch, sessionId = state.sessionId
 export function applyDecisionStatePatch(state, patch, sessionId = state.sessionId) {
   const next = structuredClone(state);
   if (patch.currentDecision) next.currentDecision = patch.currentDecision;
-  next.options = mergeById(next.options, patch.addOptions ?? [], sessionId, "option", "label");
-  next.options = mergeById(next.options, patch.updateOptions ?? [], sessionId, "option", "label");
+  next.options = mergeById(next.options, patch.addOptions ?? [], sessionId, "option", "label", mergeDecisionOption);
+  next.options = mergeById(next.options, patch.updateOptions ?? [], sessionId, "option", "label", mergeDecisionOption);
   next.unresolvedRisks = mergeById(next.unresolvedRisks, patch.addRisks ?? [], sessionId, "risk", "text", noRegressRisk);
   next.missingInputs = mergeMissingInputs(next.missingInputs, patch.addMissingInputs ?? [], sessionId);
   if (patch.readinessPatch) {
     next.readiness = {
       ...next.readiness,
-      ...patch.readinessPatch,
-      score: Math.max(next.readiness.score ?? 0, patch.readinessPatch.score ?? 0)
+      ...patch.readinessPatch
     };
   }
   next.evidenceTranscriptIds = unique([...(next.evidenceTranscriptIds ?? []), ...(patch.evidenceTranscriptIds ?? [])]);
@@ -69,14 +68,22 @@ function upsertStateItem(state, incoming, sessionId) {
 }
 
 function mergeStateItem(existing, incoming) {
+  // Fallbacks keep legacy persisted snapshots readable; new patches should
+  // still normalize these fields in upsertStateItem before they reach merge.
+  const existingConfidence = existing.confidence ?? 0;
+  const incomingConfidence = incoming.confidence ?? 0;
+  const existingFirstSeenAt = existing.firstSeenAtMs ?? incoming.firstSeenAtMs ?? 0;
+  const incomingFirstSeenAt = incoming.firstSeenAtMs ?? existingFirstSeenAt;
+  const existingLastUpdatedAt = existing.lastUpdatedAtMs ?? existingFirstSeenAt;
+  const incomingLastUpdatedAt = incoming.lastUpdatedAtMs ?? incomingFirstSeenAt;
   return {
     ...existing,
-    text: incoming.confidence >= existing.confidence ? incoming.text : existing.text,
+    text: incomingConfidence >= existingConfidence ? incoming.text : existing.text,
     status: existing.status === "resolved" ? "resolved" : incoming.status,
-    confidence: Math.max(existing.confidence, incoming.confidence),
-    evidenceTranscriptIds: unique([...existing.evidenceTranscriptIds, ...incoming.evidenceTranscriptIds]),
-    firstSeenAtMs: Math.min(existing.firstSeenAtMs, incoming.firstSeenAtMs),
-    lastUpdatedAtMs: Math.max(existing.lastUpdatedAtMs, incoming.lastUpdatedAtMs)
+    confidence: Math.max(existingConfidence, incomingConfidence),
+    evidenceTranscriptIds: unique([...(existing.evidenceTranscriptIds ?? []), ...(incoming.evidenceTranscriptIds ?? [])]),
+    firstSeenAtMs: Math.min(existingFirstSeenAt, incomingFirstSeenAt),
+    lastUpdatedAtMs: Math.max(existingLastUpdatedAt, incomingLastUpdatedAt)
   };
 }
 
@@ -99,6 +106,14 @@ function mergeMissingInputs(existing, incoming, sessionId) {
     ...b,
     blocksDecision: a.blocksDecision || b.blocksDecision
   }));
+}
+
+function mergeDecisionOption(existing, incoming) {
+  return {
+    ...existing,
+    ...incoming,
+    evidenceTranscriptIds: unique([...(existing.evidenceTranscriptIds ?? []), ...(incoming.evidenceTranscriptIds ?? [])])
+  };
 }
 
 function noRegressRisk(existing, incoming) {

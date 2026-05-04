@@ -3,12 +3,18 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 test("UI only exposes stage-appropriate controls", async () => {
-  const [html, css, js, design] = await Promise.all([
+  const [html, css, appJs, exportsJs, setupJs, summariesJs, transcriptDrawerJs, utilsJs, design] = await Promise.all([
     readFile(new URL("../src/ui/index.html", import.meta.url), "utf8"),
     readFile(new URL("../src/ui/styles.css", import.meta.url), "utf8"),
     readFile(new URL("../src/ui/app.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../src/ui/documentExports.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../src/ui/setupController.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../src/ui/meetingSummaries.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../src/ui/transcriptDrawer.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../src/ui/uiUtils.mjs", import.meta.url), "utf8"),
     readFile(new URL("../DESIGN.md", import.meta.url), "utf8")
   ]);
+  const js = `${appJs}\n${exportsJs}\n${setupJs}\n${summariesJs}\n${transcriptDrawerJs}\n${utilsJs}`;
 
   assert.match(design, /three-stage desktop utility/);
   assert.match(design, /Setup/);
@@ -26,6 +32,9 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(html, /loginTextProvider/);
   assert.match(html, /enableOAuthProvider/);
   assert.match(html, /AI 狀態/);
+  assert.match(html, /setupAudioReadiness/);
+  assert.match(html, /setupAudioPermissions/);
+  assert.match(html, /開啟螢幕與系統錄音/);
   assert.match(html, /會前/);
   assert.match(html, /背景/);
   assert.match(html, /檔案/);
@@ -36,6 +45,8 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(html, /AI 重點整理/);
   assert.match(html, /listening-curtain/);
   assert.match(html, /review-screen/);
+  assert.match(html, /reviewStatus/);
+  assert.match(html, /會議結束後會在這裡整理文件/);
   assert.match(html, /postMeetingSummary/);
   assert.match(html, /postMeetingTranscript/);
   assert.match(html, /data-download-format="summary-json"/);
@@ -48,6 +59,7 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(html, /錯誤紀錄 JSON/);
   assert.match(html, /AI 整理/);
   assert.match(html, /逐字稿/);
+  assert.match(html, /value="mixed">麥克風 \+ 系統音訊/);
   assert.match(html, /curtainOpacity/);
   assert.match(html, /min="10"/);
   assert.match(html, /max="100"/);
@@ -57,6 +69,8 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(html, /transcriptDrawerToggle/);
   assert.match(html, /transcriptPreview/);
   assert.match(html, /transcriptFull/);
+  assert.match(html, /openAudioPermissions/);
+  assert.match(html, /開啟權限設定/);
   assert.match(html, /逐字稿/);
   assert.match(html, /目前沒有提醒/);
   assert.match(html, /0 句/);
@@ -87,24 +101,36 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(css, /\.transcript-line\.partial/);
   assert.match(css, /max-height: 34vh/);
   assert.match(css, /\.listening-status/);
+  assert.match(css, /\.permission-action/);
+  assert.match(css, /\.setup-audio-readiness/);
+  assert.match(css, /\.status-dot\.warning/);
   assert.match(css, /\.state-label::before/);
   assert.match(css, /\.prep-layout/);
   assert.match(css, /\.context-dropzone/);
   assert.match(css, /\.primary-export/);
   assert.match(css, /\.secondary-export/);
   assert.match(css, /\.evidence-disclosure/);
+  assert.match(css, /\.review-status/);
+  assert.match(css, /\.processing-block/);
+  assert.match(css, /@keyframes processing-sweep/);
 
   assert.match(js, /initializeSetupState\(\)/);
   assert.match(js, /refreshPlatformShellPlan/);
   assert.match(js, /applyPlatformCaptureAvailability/);
+  assert.match(js, /option\[value="mixed"\]/);
   assert.match(js, /refreshTextProviderStatus/);
   assert.match(js, /scheduleTextProviderRefresh/);
+  assert.match(js, /textProviderRefreshTimers/);
+  assert.match(js, /clearTimeout\(timer\)/);
   assert.match(js, /text_provider_status/);
   assert.match(js, /start_text_provider_login/);
   assert.match(js, /generate_ai_summary_oauth/);
   assert.match(js, /generate_prep_summary_oauth/);
   assert.match(js, /schedulePrepSummaryGeneration/);
   assert.match(js, /generatePrepSummary/);
+  assert.match(js, /clearTimeout\(prepSummaryTimer\)/);
+  assert.match(js, /prepSummaryRequestId \+= 1/);
+  assert.match(js, /if \(requestId !== prepSummaryRequestId\) return/);
   assert.match(js, /請先登入並啟用 AI/);
   assert.match(js, /extract_live_state_patch_oauth/);
   assert.match(js, /maybeRunLiveAiExtraction/);
@@ -113,7 +139,15 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /lastAiExtractionEventCount/);
   assert.match(js, /AI 正在判斷是否需要提醒/);
   assert.match(js, /oauthAiEnabled/);
+  assert.match(js, /AI_ENABLED_STORAGE_KEY/);
+  assert.match(js, /readAiEnabledPreference/);
+  assert.match(js, /setAiEnabledPreference\(true\)/);
+  assert.doesNotMatch(js, /authenticated && !oauthAiEnabled[\s\S]*setAiEnabledPreference\(true\)/);
+  assert.match(js, /window\.localStorage\?\.setItem/);
   assert.match(js, /canStartWithAi/);
+  assert.match(js, /updateStartButtonCopy/);
+  assert.match(js, /開始記錄會議音訊/);
+  assert.match(js, /請先按左側啟用 AI/);
   assert.match(js, /textProviderEnabled: canStartWithAi\(\)/);
   assert.match(js, /syncStartButtonAvailability/);
   assert.match(js, /請先啟用 AI/);
@@ -127,6 +161,26 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /currentPartialTranscript/);
   assert.match(js, /native_transcript_preview/);
   assert.match(js, /記錄中/);
+  assert.match(js, /TRANSCRIPT_STALL_MS/);
+  assert.match(js, /startTranscriptStallMonitor/);
+  assert.match(js, /native\.transcription_no_input/);
+  assert.match(js, /目前只聽你的麥克風/);
+  assert.match(js, /麥克風 \+ 系統音訊/);
+  assert.match(js, /native_transcriber_health", \{\s*request: \{ source: requestedSource \}/);
+  assert.match(js, /refreshNativeAudioReadiness\("startup"\)/);
+  assert.match(js, /permissions\.native_audio_health/);
+  assert.match(js, /setupAudioReadinessText\.textContent/);
+  assert.match(js, /setupAudioPermissionsButton\?\.addEventListener\("click"/);
+  assert.match(js, /openScreenRecordingSettings\("setup_audio_readiness"\)/);
+  assert.match(js, /screenSystemAudioPreflight=false/);
+  assert.match(js, /macOS 尚未把螢幕與系統錄音權限套用/);
+  assert.match(js, /request_native_audio_permissions", \{\s*request: \{ source: requestedSource \}/);
+  assert.match(js, /正在檢查音訊與權限/);
+  assert.match(js, /會議無法開始/);
+  assert.match(js, /isScreenRecordingPermissionMessage/);
+  assert.match(js, /request_screen_recording_permission/);
+  assert.doesNotMatch(js, /openScreenRecordingSettings\("screen_recording_required"\)/);
+  assert.match(js, /openAudioPermissionsButton\?\.addEventListener\("click"/);
   assert.match(js, /renderTranscriptDrawer/);
   assert.match(js, /currentTranscriptLines/);
   assert.match(js, /transcriptSpeakerLabel/);
@@ -143,9 +197,31 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /tauri:\/\/drag-drop/);
   assert.match(js, /read_dropped_context_files/);
   assert.match(js, /readBrowserDroppedFile/);
+  assert.match(js, /if \(loadedFile\?\.text\)/);
+  assert.match(js, /droppedFileNames\.push\(\.\.\.loaded\.map\(\(file\) => file\.name\)\)/);
+  assert.match(js, /尚未加入會議背景/);
   assert.match(js, /updateAppState\("listening"\)/);
+  assert.match(js, /enterReviewProcessing/);
+  assert.match(js, /waitForReviewPaint/);
+  assert.match(js, /const stoppingSessionId = activeSessionId/);
+  assert.match(js, /finishNativeStopInBackground/);
+  assert.match(js, /allowNewMeeting: false/);
+  assert.match(js, /newMeetingButton\.disabled = !allowNewMeeting/);
+  assert.match(js, /runAiSummary: false/);
+  assert.match(js, /postMeetingAiSummaryStarted/);
+  assert.match(js, /generateOAuthSummaryIfEnabled\(sessionId\)/);
+  assert.match(js, /isCurrentReviewSession/);
+  assert.match(js, /reviewScreen\.dataset\.reviewState = "processing"/);
+  assert.match(js, /setDownloadActionsEnabled\(false\)/);
+  assert.match(js, /renderProcessingDocument/);
   assert.match(js, /finalizeMeetingReview/);
+  assert.match(js, /reviewScreen\.dataset\.reviewState = "ready"/);
+  assert.match(js, /本機文件已整理完成/);
+  assert.match(js, /AI 整理已更新/);
   assert.match(js, /已從系統列結束會議/);
+  assert.match(js, /沒有系統音訊權限/);
+  assert.match(js, /系統音訊轉錄已停止/);
+  assert.match(js, /語音轉錄已停止/);
   assert.match(js, /renderDecisionOverview/);
   assert.match(js, /renderSuggestionCard/);
   assert.match(js, /renderEvidenceLines/);
@@ -162,6 +238,7 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /browserErrorLogs/);
   assert.match(js, /buildAiSummaryDocument/);
   assert.match(js, /buildTranscriptDocument/);
+  assert.match(js, /split\(\/\\n\|。\|；\|;\|\\\.\|！\|!\|？\|\\\?\//);
   assert.match(js, /renderAiSummaryMarkdown/);
   assert.match(js, /renderTranscriptText/);
   assert.match(js, /openPrintableDocument/);

@@ -1,7 +1,16 @@
+import { downloadMeetingArtifact as downloadMeetingArtifactFile, escapeHtml } from "./documentExports.mjs";
+import { labelMove, summarizeDecisionState, summarizeSuggestions, summarizeTranscript } from "./meetingSummaries.mjs";
+import { createSetupController } from "./setupController.mjs";
+import { renderTranscriptDrawerView, transcriptSpeakerLabel } from "./transcriptDrawer.mjs";
+import { clamp, detectUiLanguage, formatAudioMonitorMessage, formatError, isScreenRecordingPermissionMessage, labelCaptureSource, labelLanguage, makeClientId } from "./uiUtils.mjs";
 const startButton = document.querySelector("#startListening");
 const stopButton = document.querySelector("#stopListening");
 const sessionState = document.querySelector("#sessionState");
 const providerState = document.querySelector("#providerState");
+const openAudioPermissionsButton = document.querySelector("#openAudioPermissions");
+const setupAudioReadiness = document.querySelector("#setupAudioReadiness");
+const setupAudioReadinessText = document.querySelector("#setupAudioReadinessText");
+const setupAudioPermissionsButton = document.querySelector("#setupAudioPermissions");
 const liveTranscript = document.querySelector("#liveTranscript");
 const transcriptDrawerToggle = document.querySelector("#transcriptDrawerToggle");
 const transcriptDrawerCount = document.querySelector("#transcriptDrawerCount");
@@ -19,6 +28,10 @@ const prepDictationButton = document.querySelector("#prepDictation");
 const prepSummary = document.querySelector("#prepSummary");
 const feedbackRow = document.querySelector("#feedbackRow");
 const newMeetingButton = document.querySelector("#newMeeting");
+const reviewScreen = document.querySelector(".review-screen");
+const reviewStageLabel = document.querySelector("#reviewStageLabel");
+const reviewTitle = document.querySelector("#reviewTitle");
+const reviewStatus = document.querySelector("#reviewStatus");
 const postMeetingSummary = document.querySelector("#postMeetingSummary");
 const postMeetingTranscript = document.querySelector("#postMeetingTranscript");
 const downloadState = document.querySelector("#downloadState");
@@ -29,7 +42,7 @@ const textProviderDetail = document.querySelector("#textProviderDetail");
 const loginTextProviderButton = document.querySelector("#loginTextProvider");
 const enableOAuthProviderButton = document.querySelector("#enableOAuthProvider");
 const providerSettings = document.querySelector(".provider-settings");
-
+const AI_ENABLED_STORAGE_KEY = "meetingCopilot.aiEnabled";
 let recognition;
 let transcriptLines = [];
 let transcriptEvents = [];
@@ -38,40 +51,50 @@ let suggestionHistory = [];
 let latestDecisionState;
 let aiSummaryOverride;
 let textProviderStatus;
-let oauthAiEnabled = false;
+let oauthAiEnabled = readAiEnabledPreference();
 let activeSessionId;
 let transcriptIndex = 0;
 let startedAt = 0;
 let nativeListenersInstalled = false;
-let droppedFileNames = [];
-let droppedContextChunks = [];
-let prepDictating = false;
 let transcriptDrawerOpen = false;
 let liveAiExtractionRunning = false;
 let lastAiExtractionEventCount = 0;
-let prepSummaryTimer;
-let prepSummaryRequestId = 0;
-let prepSummaryInFlight = false;
-let prepSummaryQueued = false;
 let platformShellPlan;
 let browserErrorLogs = [];
-
+let textProviderRefreshTimers = [];
+let transcriptStallTimer;
+let reviewFinalized = false;
+let postMeetingAiSummaryStarted = false;
+const TRANSCRIPT_STALL_MS = 12000;
 const nativeInvoke = window.__TAURI__?.core?.invoke;
 const nativeListen = window.__TAURI__?.event?.listen;
-
+const setupController = createSetupController({
+  elements: {
+    setupContext,
+    setupDropZone,
+    setupContextMeta,
+    droppedFileCount,
+    prepDictationButton,
+    prepSummary
+  },
+  nativeInvoke,
+  nativeListen,
+  canStartWithAi,
+  syncStartButtonAvailability,
+  textProviderAuthenticated: () => Boolean(textProviderStatus?.authenticated),
+  logAppError,
+  formatError,
+  escapeHtml
+});
 initializeSetupState();
-installNativeDropListeners().catch((error) => {
-  logAppError("ui.install_native_drop_listeners", error, {}, "error");
-  setupContextMeta.textContent = `檔案拖拉尚未啟用：${formatError(error)}`;
-});
-installPrepDictationListeners().catch((error) => {
-  logAppError("ui.install_prep_dictation_listeners", error, {}, "error");
-  setupContextMeta.textContent = `語音輸入尚未啟用：${formatError(error)}`;
-});
+setupController.install();
 installOpacityControl();
 refreshPlatformShellPlan();
 refreshTextProviderStatus();
-
+refreshNativeAudioReadiness("startup");
+captureSource?.addEventListener("change", () => {
+  refreshNativeAudioReadiness("source_change");
+});
 startButton.addEventListener("click", async () => {
   if (!canStartWithAi()) {
     logAppError("meeting.start_blocked_without_ai", "Meeting start was requested before AI was enabled", { authenticated: Boolean(textProviderStatus?.authenticated) }, "warning");
@@ -82,14 +105,14 @@ startButton.addEventListener("click", async () => {
     return;
   }
   startButton.disabled = true;
-  updateAppState("listening");
-  applyWindowOpacityForCurrentState();
-  providerState.textContent = "正在開始會議...";
+  sessionState.textContent = "檢查音訊";
+  providerState.textContent = "正在檢查音訊與權限...";
   if (nativeInvoke) {
     try {
       await startNativeListening();
     } catch (error) {
       logAppError("meeting.start_native", error, { source: captureSource?.value ?? "mic" }, "error");
+      handleAudioPermissionProblem(formatError(error));
       updateAppState("setup");
       resetNativeWindowOpacity();
       sessionState.textContent = "啟動失敗";
@@ -99,7 +122,6 @@ startButton.addEventListener("click", async () => {
     }
     return;
   }
-
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
     logAppError("meeting.browser_speech_unavailable", "SpeechRecognition is not available", { nativeAvailable: Boolean(nativeInvoke) }, "error");
@@ -109,7 +131,6 @@ startButton.addEventListener("click", async () => {
     resetNativeWindowOpacity();
     return;
   }
-
   transcriptLines = [];
   transcriptEvents = [];
   suggestionHistory = [];
@@ -124,7 +145,6 @@ startButton.addEventListener("click", async () => {
   recognition.lang = "zh-TW";
   recognition.continuous = true;
   recognition.interimResults = false;
-
   recognition.onstart = () => {
     updateAppState("listening");
     sessionState.textContent = "記錄中";
@@ -132,7 +152,6 @@ startButton.addEventListener("click", async () => {
     startButton.disabled = true;
     stopButton.disabled = false;
   };
-
   recognition.onresult = async (event) => {
     for (let i = event.resultIndex; i < event.results.length; i += 1) {
       const result = event.results[i];
@@ -142,21 +161,18 @@ startButton.addEventListener("click", async () => {
       await sendTranscript(text);
     }
   };
-
   recognition.onerror = (event) => {
     logAppError("meeting.browser_speech_error", event.error ?? "unknown speech recognition error", { error: event.error }, "error");
     providerState.textContent = `語音辨識發生錯誤：${event.error}`;
   };
-
   recognition.onend = () => {
     if (activeSessionId) {
       fetch(`/api/sessions/${activeSessionId}/stop`, { method: "POST" }).catch((error) => {
         logAppError("meeting.browser_stop_session", error, { sessionId: activeSessionId }, "warning");
       });
     }
-    finalizeMeetingReview({ statusText: "會議已結束，正在整理記錄。" });
+    finishPostMeetingReview();
   };
-
   try {
     recognition.start();
   } catch (error) {
@@ -166,48 +182,57 @@ startButton.addEventListener("click", async () => {
     providerState.textContent = `無法啟動語音辨識：${error.message}`;
   }
 });
-
 stopButton.addEventListener("click", async () => {
+  const stoppingSessionId = activeSessionId;
   stopButton.disabled = true;
   sessionState.textContent = "整理中";
   providerState.textContent = "正在結束會議...";
-  if (nativeInvoke && activeSessionId) {
-    try {
-      await stopNativeListening();
-    } catch (error) {
-      logAppError("meeting.stop_native", error, { sessionId: activeSessionId }, "error");
-      providerState.textContent = `結束會議失敗：${error.message}`;
-      stopButton.disabled = false;
-    }
+  enterReviewProcessing({ statusText: "正在切換到會後頁。" });
+  await waitForReviewPaint();
+  finalizeMeetingReview({
+    statusText: "已切到會後頁；正在背景停止錄音並補齊最後資料。",
+    runAiSummary: false,
+    allowNewMeeting: false
+  });
+  if (nativeInvoke && stoppingSessionId) {
+    finishNativeStopInBackground(stoppingSessionId);
     return;
   }
   if (recognition) {
     recognition.stop();
   } else {
-    finalizeMeetingReview({ statusText: "會議已結束，正在整理記錄。" });
+    finishPostMeetingReview();
   }
 });
-
 transcriptDrawerToggle.addEventListener("click", () => {
   transcriptDrawerOpen = !transcriptDrawerOpen;
   renderTranscriptDrawer();
 });
-
 newMeetingButton.addEventListener("click", () => {
   initializeSetupState();
 });
-
 for (const button of downloadButtons) {
   button.addEventListener("click", () => {
     const format = button.dataset.downloadFormat;
     downloadMeetingArtifact(format);
   });
 }
-
 downloadErrorLogButton?.addEventListener("click", () => {
   downloadErrorLog();
 });
-
+openAudioPermissionsButton?.addEventListener("click", () => {
+  openScreenRecordingSettings("manual_button");
+});
+setupAudioPermissionsButton?.addEventListener("click", async () => {
+  setupAudioPermissionsButton.disabled = true;
+  setupAudioReadinessText.textContent = "正在要求 macOS 重新建立 Meeting Copilot 的系統音訊權限。";
+  try {
+    await openScreenRecordingSettings("setup_audio_readiness");
+  } finally {
+    setupAudioPermissionsButton.disabled = false;
+    setTimeout(() => refreshNativeAudioReadiness("permission_button"), 800);
+  }
+});
 loginTextProviderButton.addEventListener("click", async () => {
   if (!nativeInvoke) {
     logAppError("ai.login_unavailable", "Text provider login requires the desktop app", {}, "warning");
@@ -226,52 +251,16 @@ loginTextProviderButton.addEventListener("click", async () => {
     loginTextProviderButton.disabled = false;
   }
 });
-
 enableOAuthProviderButton.addEventListener("click", () => {
   if (!textProviderStatus?.authenticated) {
     logAppError("ai.enable_without_auth", "AI enable was requested without authenticated subscription OAuth", {}, "warning");
     textProviderDetail.textContent = "尚未登入 ChatGPT，無法啟用 AI。";
     return;
   }
-  oauthAiEnabled = true;
+  setAiEnabledPreference(true);
   renderTextProviderStatus();
-  schedulePrepSummaryGeneration();
+  setupController.schedulePrepSummaryGeneration();
 });
-
-prepDictationButton.addEventListener("click", async () => {
-  if (!nativeInvoke) {
-    logAppError("prep.dictation_unavailable", "Prep dictation requires the desktop app", {}, "warning");
-    setupContextMeta.textContent = "語音輸入需要使用桌面 app。";
-    return;
-  }
-  if (!prepDictating && !canStartWithAi()) {
-    logAppError("prep.dictation_blocked_without_ai", "Prep dictation was requested before AI was enabled", { authenticated: Boolean(textProviderStatus?.authenticated) }, "warning");
-    syncStartButtonAvailability();
-    setupContextMeta.textContent = textProviderStatus?.authenticated
-      ? "請先啟用 AI，才能使用語音輸入。"
-      : "請先登入 ChatGPT，才能使用語音輸入。";
-    return;
-  }
-  prepDictationButton.disabled = true;
-  try {
-    if (prepDictating) {
-      await nativeInvoke("stop_prep_dictation");
-      setPrepDictating(false);
-      setupContextMeta.textContent = "語音輸入已停止。";
-    } else {
-      await nativeInvoke("start_prep_dictation");
-      setPrepDictating(true);
-      setupContextMeta.textContent = "正在記錄你補充的會議背景。說完後會自動加入文字欄。";
-    }
-  } catch (error) {
-    logAppError("prep.dictation_toggle", error, { nextState: prepDictating ? "stop" : "start" }, "error");
-    setPrepDictating(false);
-    setupContextMeta.textContent = `語音輸入無法啟動：${formatError(error)}`;
-  } finally {
-    prepDictationButton.disabled = false;
-  }
-});
-
 async function startNativeListening() {
   transcriptLines = [];
   transcriptEvents = [];
@@ -283,37 +272,66 @@ async function startNativeListening() {
   lastAiExtractionEventCount = 0;
   liveAiExtractionRunning = false;
   startedAt = performance.now();
+  reviewFinalized = false;
+  postMeetingAiSummaryStarted = false;
   resetListeningSurface();
-  if (prepDictating) {
-    await nativeInvoke("stop_prep_dictation").catch((error) => {
-      logAppError("prep.dictation_stop_before_meeting", error, {}, "warning");
+  await setupController.stopPrepDictationBeforeMeeting();
+  sessionState.textContent = "檢查音訊";
+  const requestedSource = captureSource?.value ?? "mic";
+  hideAudioPermissionAction();
+  let health = await nativeInvoke("request_native_audio_permissions", {
+    request: { source: requestedSource }
+  });
+  if (!health.ready) {
+    health = await nativeInvoke("native_transcriber_health", {
+      request: { source: requestedSource }
     });
-    setPrepDictating(false);
+  }
+  if (!health.ready) {
+    handleAudioPermissionProblem(health.lastError ?? "");
+    throw new Error(`音訊尚未就緒：${health.lastError ?? "未知原因"}`);
+  }
+  health = await nativeInvoke("native_transcriber_health", {
+    request: { source: requestedSource }
+  });
+  if (!health.ready) {
+    handleAudioPermissionProblem(health.lastError ?? "");
+    throw new Error(`音訊尚未就緒：${health.lastError ?? "未知原因"}`);
   }
   sessionState.textContent = "建立會議";
   activeSessionId = await createLiveSession();
-  sessionState.textContent = "檢查音訊";
   await installNativeListeners();
-  const health = await nativeInvoke("native_transcriber_health");
-  if (!health.ready) {
-    providerState.textContent = `音訊尚未就緒：${health.lastError ?? "未知原因"}`;
-  }
   sessionState.textContent = "開始記錄";
   const started = await nativeInvoke("start_native_transcription", {
     sessionId: activeSessionId,
-    request: { language: "zh-TW", source: captureSource?.value ?? "mic" }
+    request: { language: "zh-TW", source: requestedSource }
   });
   updateAppState("listening");
   sessionState.textContent = "記錄中";
   providerState.textContent = `正在聽｜${labelCaptureSource(started.source)}｜${labelLanguage(started.language)}`;
+  startTranscriptStallMonitor(started.source);
   startButton.disabled = true;
   stopButton.disabled = false;
 }
 
-async function stopNativeListening() {
-  await nativeInvoke("stop_native_transcription", { sessionId: activeSessionId });
-  await nativeInvoke("stop_session", { sessionId: activeSessionId });
-  finalizeMeetingReview({ statusText: "會議已結束，正在整理記錄。" });
+async function stopNativeListening(sessionId = activeSessionId) {
+  if (!sessionId) throw new Error("session id is required to stop native listening");
+  await nativeInvoke("stop_native_transcription", { sessionId });
+  await nativeInvoke("stop_session", { sessionId });
+}
+
+async function finishNativeStopInBackground(sessionId) {
+  try {
+    await stopNativeListening(sessionId);
+    finishPostMeetingReview(sessionId);
+  } catch (error) {
+    logAppError("meeting.stop_native", error, { sessionId }, "error");
+    reviewStatus.textContent = `結束會議失敗：${formatError(error)}`;
+    downloadState.textContent = "錄音停止失敗；可下載錯誤紀錄協助排查。";
+    downloadErrorLogButton.disabled = false;
+    newMeetingButton.disabled = false;
+    stopButton.disabled = false;
+  }
 }
 
 async function installNativeListeners() {
@@ -323,6 +341,7 @@ async function installNativeListeners() {
     await nativeListen("native_transcript_ingested", (event) => {
       const payload = event.payload;
       if (!payload?.event?.text) return;
+      clearTranscriptStallMonitor();
       currentPartialTranscript = undefined;
       renderRuntimePayload(payload);
       maybeRunLiveAiExtraction();
@@ -330,13 +349,16 @@ async function installNativeListeners() {
     await nativeListen("native_transcript_preview", (event) => {
       const payload = event.payload;
       if (!payload?.text) return;
+      clearTranscriptStallMonitor();
       currentPartialTranscript = payload;
       renderTranscriptDrawer();
     });
     await nativeListen("native_transcription_error", (event) => {
       const message = String(event.payload ?? "");
+      clearTranscriptStallMonitor();
       logAppError("native.transcription_event_error", message, { source: captureSource?.value ?? "mic" }, "error");
       providerState.textContent = formatAudioMonitorMessage(message);
+      handleAudioPermissionProblem(message);
       if (message.includes("stopped from tray") && document.body.dataset.state === "listening") {
         finalizeMeetingReview({ statusText: "已從系統列結束會議，正在整理記錄。" });
       }
@@ -490,6 +512,7 @@ async function maybeRunLiveAiExtraction() {
 }
 
 function setProviderUnavailable() {
+  clearTranscriptStallMonitor();
   sessionState.textContent = "無法開始";
   providerState.textContent = "這個環境沒有可用的語音辨識。請改用桌面 app。";
   suggestion.className = "suggestion-empty";
@@ -498,8 +521,15 @@ function setProviderUnavailable() {
 }
 
 function initializeSetupState() {
+  clearTranscriptStallMonitor();
   updateAppState("setup");
   resetNativeWindowOpacity();
+  reviewScreen.dataset.reviewState = "idle";
+  reviewStageLabel.textContent = "會後";
+  reviewTitle.textContent = "會議記錄";
+  reviewStatus.textContent = "會議結束後會在這裡整理文件。";
+  setDownloadActionsEnabled(true);
+  newMeetingButton.disabled = false;
   syncStartButtonAvailability();
   stopButton.disabled = true;
   activeSessionId = undefined;
@@ -511,36 +541,202 @@ function initializeSetupState() {
   aiSummaryOverride = undefined;
   lastAiExtractionEventCount = 0;
   liveAiExtractionRunning = false;
-  prepSummaryInFlight = false;
-  prepSummaryQueued = false;
+  reviewFinalized = false;
+  postMeetingAiSummaryStarted = false;
+  setupController.resetPrepSummaryQueue();
   sessionState.textContent = "待機中";
   providerState.textContent = "尚未開始會議。";
   resetListeningSurface();
-  renderPrepSummary();
+  setupController.renderPrepSummary();
 }
 
 function resetListeningSurface() {
   transcriptDrawerOpen = false;
   currentPartialTranscript = undefined;
+  hideAudioPermissionAction({ includeSetup: false });
   renderTranscriptDrawer();
   suggestion.className = "suggestion-empty";
   suggestion.textContent = "目前沒有提醒。";
   feedbackRow.hidden = true;
 }
 
+function handleAudioPermissionProblem(message) {
+  if (!isScreenRecordingPermissionMessage(message)) return;
+  showAudioPermissionAction();
+}
+
+async function refreshNativeAudioReadiness(reason) {
+  if (!nativeInvoke) return;
+  const source = captureSource?.value ?? "mic";
+  try {
+    const health = await nativeInvoke("native_transcriber_health", {
+      request: { source }
+    });
+    if (health.ready) {
+      hideAudioPermissionAction();
+      if (/^音訊權限需處理/.test(providerState.textContent)) {
+        providerState.textContent = "尚未開始會議。";
+      }
+      return;
+    }
+    const message = health.lastError ?? "native audio is not ready";
+    logAppError("permissions.native_audio_health", message, { source, reason }, "warning");
+    handleAudioPermissionProblem(message);
+    const readinessMessage = formatNativeAudioReadinessMessage(message);
+    if (setupAudioReadinessText) setupAudioReadinessText.textContent = readinessMessage;
+    providerState.textContent = `音訊權限需處理：${readinessMessage}`;
+  } catch (error) {
+    logAppError("permissions.native_audio_health", error, { source, reason }, "warning");
+  }
+}
+
+function formatNativeAudioReadinessMessage(message) {
+  if (/screenSystemAudioPreflight=false/i.test(message)) {
+    return "macOS 尚未把螢幕與系統錄音權限套用到目前這個 Meeting Copilot。";
+  }
+  if (/microphone=(denied|restricted|notDetermined)/i.test(message)) {
+    return "麥克風權限尚未可用。";
+  }
+  if (/speechRecognition=(denied|restricted|notDetermined)/i.test(message)) {
+    return "語音辨識權限尚未可用。";
+  }
+  return formatAudioMonitorMessage(message);
+}
+
+function showAudioPermissionAction() {
+  if (openAudioPermissionsButton) {
+    openAudioPermissionsButton.hidden = false;
+    openAudioPermissionsButton.disabled = false;
+  }
+  if (setupAudioReadiness) {
+    setupAudioReadiness.hidden = false;
+  }
+  if (setupAudioPermissionsButton) {
+    setupAudioPermissionsButton.disabled = false;
+  }
+}
+
+function hideAudioPermissionAction(options = {}) {
+  const includeSetup = options.includeSetup ?? true;
+  if (openAudioPermissionsButton) {
+    openAudioPermissionsButton.hidden = true;
+    openAudioPermissionsButton.disabled = false;
+  }
+  if (includeSetup && setupAudioReadiness) {
+    setupAudioReadiness.hidden = true;
+  }
+  if (setupAudioPermissionsButton) {
+    setupAudioPermissionsButton.disabled = false;
+  }
+}
+
+async function openScreenRecordingSettings(reason) {
+  if (!nativeInvoke) return;
+  try {
+    await nativeInvoke("request_screen_recording_permission");
+  } catch (error) {
+    logAppError("permissions.request_screen_recording", error, { reason }, "warning");
+  }
+}
+
+function startTranscriptStallMonitor(source) {
+  clearTranscriptStallMonitor();
+  transcriptStallTimer = setTimeout(() => {
+    if (document.body.dataset.state !== "listening") return;
+    if (transcriptEvents.length > 0 || currentPartialTranscript?.text) return;
+    const sourceLabel = labelCaptureSource(source);
+    const hint = source === "mic"
+      ? "目前只聽你的麥克風；如果會議聲音從耳機或喇叭出來，請結束後改選麥克風 + 系統音訊。"
+      : source === "mixed"
+        ? "請確認麥克風、Meeting Copilot 的螢幕與系統錄音權限，並確認會議聲音不是靜音。"
+        : "請確認 Meeting Copilot 的螢幕與系統錄音權限，並確認會議聲音不是靜音。";
+    providerState.textContent = `還沒收到逐字稿｜${sourceLabel}。${hint}`;
+    logAppError("native.transcription_no_input", "No transcript or partial transcript was received after native listening started", { source, timeoutMs: TRANSCRIPT_STALL_MS }, "warning");
+  }, TRANSCRIPT_STALL_MS);
+}
+
+function clearTranscriptStallMonitor() {
+  if (!transcriptStallTimer) return;
+  clearTimeout(transcriptStallTimer);
+  transcriptStallTimer = undefined;
+}
+
 function updateAppState(state) {
   document.body.dataset.state = state;
 }
 
-function finalizeMeetingReview({ statusText }) {
+function enterReviewProcessing({ statusText }) {
+  clearTranscriptStallMonitor();
   updateAppState("review");
   resetNativeWindowOpacity();
+  reviewScreen.dataset.reviewState = "processing";
+  reviewStageLabel.textContent = "會後";
+  reviewTitle.textContent = "正在整理";
+  reviewStatus.textContent = statusText;
+  sessionState.textContent = "整理中";
+  providerState.textContent = statusText;
+  newMeetingButton.disabled = true;
+  setDownloadActionsEnabled(false);
+  postMeetingSummary.innerHTML = renderProcessingDocument("正在產生 AI 整理");
+  postMeetingTranscript.innerHTML = renderProcessingDocument("正在整理逐字稿");
+  downloadState.textContent = "整理完成後會開放下載 AI 整理與逐字稿。";
+}
+
+function waitForReviewPaint() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
+}
+
+function finishPostMeetingReview(sessionId = activeSessionId) {
+  finalizeMeetingReview({
+    statusText: "會議已結束，正在整理記錄。",
+    runAiSummary: true,
+    sessionId
+  });
+}
+
+function finalizeMeetingReview({ statusText, runAiSummary = true, allowNewMeeting = true, sessionId = activeSessionId }) {
+  clearTranscriptStallMonitor();
+  updateAppState("review");
+  resetNativeWindowOpacity();
+  reviewScreen.dataset.reviewState = "ready";
+  reviewStageLabel.textContent = "會後";
+  reviewTitle.textContent = "會議記錄";
+  reviewStatus.textContent = statusText;
   sessionState.textContent = "整理中";
   providerState.textContent = statusText;
   startButton.disabled = false;
   stopButton.disabled = true;
+  newMeetingButton.disabled = !allowNewMeeting;
+  setDownloadActionsEnabled(true);
   renderPostMeetingReview();
-  generateOAuthSummaryIfEnabled();
+  reviewFinalized = true;
+  const readyText = oauthAiEnabled && textProviderStatus?.authenticated
+    ? runAiSummary
+      ? "本機文件已整理完成，正在用 ChatGPT 更新 AI 整理。"
+      : "本機文件已先整理完成，錄音正在背景收尾。"
+    : "整理完成，可以檢查文件並下載。";
+  reviewStatus.textContent = readyText;
+  providerState.textContent = readyText;
+  if (runAiSummary && !postMeetingAiSummaryStarted) {
+    postMeetingAiSummaryStarted = true;
+    generateOAuthSummaryIfEnabled(sessionId);
+  }
+}
+
+function renderProcessingDocument(label) {
+  return `<div class="processing-block" aria-busy="true" aria-label="${escapeHtml(label)}">
+    <p class="empty-line">${escapeHtml(label)}...</p>
+    <div class="processing-line"></div>
+    <div class="processing-line medium"></div>
+    <div class="processing-line short"></div>
+  </div>`;
+}
+
+function setDownloadActionsEnabled(enabled) {
+  for (const button of downloadButtons) button.disabled = !enabled;
+  if (downloadErrorLogButton) downloadErrorLogButton.disabled = !enabled;
 }
 
 function renderPostMeetingReview() {
@@ -568,7 +764,7 @@ function buildMeetingArtifact() {
     ? transcriptEvents.map((event) => ({ id: event.id, text: event.text, source: event.source, language: event.language }))
     : transcriptLines.map((text, index) => ({ id: `line_${index + 1}`, text, source: "unknown", language: detectUiLanguage(text) }));
   const transcriptText = transcript.map((line) => line.text).join("\n");
-  const prepContext = combinedPrepContext();
+  const prepContext = setupController.combinedPrepContext();
   const localSummary = {
     keyPoints: summarizeTranscript(transcriptText),
     decisionsAndOpenQuestions: summarizeDecisionState(latestDecisionState, transcriptText),
@@ -632,11 +828,14 @@ async function refreshPlatformShellPlan() {
 
 function applyPlatformCaptureAvailability() {
   const systemOption = captureSource?.querySelector('option[value="system"]');
-  if (!systemOption || !platformShellPlan) return;
+  const mixedOption = captureSource?.querySelector('option[value="mixed"]');
+  if (!systemOption || !mixedOption || !platformShellPlan) return;
   const supportsSystemAudio = /screencapturekit|wasapi_loopback/i.test(platformShellPlan.audioCapture ?? "");
   systemOption.disabled = !supportsSystemAudio;
   systemOption.textContent = supportsSystemAudio ? "系統音訊" : "系統音訊（此平台尚未支援）";
-  if (!supportsSystemAudio && captureSource.value === "system") captureSource.value = "mic";
+  mixedOption.disabled = !supportsSystemAudio;
+  mixedOption.textContent = supportsSystemAudio ? "麥克風 + 系統音訊" : "麥克風 + 系統音訊（此平台尚未支援）";
+  if (!supportsSystemAudio && ["system", "mixed"].includes(captureSource.value)) captureSource.value = "mic";
 }
 
 function renderTextProviderStatus() {
@@ -654,7 +853,7 @@ function renderTextProviderStatus() {
   enableOAuthProviderButton.textContent = oauthAiEnabled && authenticated ? "AI 已啟用" : "啟用 AI";
   loginTextProviderButton.hidden = authenticated;
   syncStartButtonAvailability();
-  renderPrepSummary();
+  setupController.renderPrepSummary();
 }
 
 function canStartWithAi() {
@@ -663,21 +862,57 @@ function canStartWithAi() {
 
 function syncStartButtonAvailability() {
   if (document.body.dataset.state !== "setup") return;
-  startButton.disabled = !canStartWithAi();
+  const ready = canStartWithAi();
+  startButton.disabled = !ready;
+  updateStartButtonCopy(ready);
 }
 
-function scheduleTextProviderRefresh() {
-  const delays = [3000, 8000, 15000, 30000];
-  for (const delay of delays) {
-    setTimeout(() => refreshTextProviderStatus(), delay);
+function updateStartButtonCopy(ready) {
+  const title = startButton?.querySelector("span");
+  const subtitle = startButton?.querySelector("small");
+  if (title) title.textContent = ready ? "開始會議" : "等待 AI";
+  if (subtitle) {
+    subtitle.textContent = ready
+      ? "開始記錄會議音訊"
+      : textProviderStatus?.authenticated
+        ? "請先按左側啟用 AI"
+        : "請先登入 ChatGPT";
   }
 }
 
-async function generateOAuthSummaryIfEnabled() {
-  if (!nativeInvoke || !oauthAiEnabled || !textProviderStatus?.authenticated) return;
-  downloadState.textContent = "正在用 ChatGPT 產生 AI 整理。";
+function readAiEnabledPreference() {
   try {
-    const artifact = buildMeetingArtifact();
+    return window.localStorage?.getItem(AI_ENABLED_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function setAiEnabledPreference(enabled) {
+  oauthAiEnabled = enabled;
+  try {
+    window.localStorage?.setItem(AI_ENABLED_STORAGE_KEY, String(enabled));
+  } catch {
+    // Local storage is only for restoring the user's opt-in after restart.
+  }
+}
+
+function scheduleTextProviderRefresh() {
+  for (const timer of textProviderRefreshTimers) clearTimeout(timer);
+  textProviderRefreshTimers = [];
+  const delays = [3000, 8000, 15000, 30000];
+  for (const delay of delays) {
+    textProviderRefreshTimers.push(setTimeout(() => refreshTextProviderStatus(), delay));
+  }
+}
+
+async function generateOAuthSummaryIfEnabled(sessionId = activeSessionId) {
+  if (!nativeInvoke || !oauthAiEnabled || !textProviderStatus?.authenticated) return;
+  if (!isCurrentReviewSession(sessionId)) return;
+  const artifact = buildMeetingArtifact();
+  downloadState.textContent = "正在用 ChatGPT 產生 AI 整理。";
+  reviewStatus.textContent = "本機文件已可檢查；ChatGPT 正在更新 AI 整理。";
+  try {
     const response = await nativeInvoke("generate_ai_summary_oauth", {
       request: {
         title: artifact.title,
@@ -688,111 +923,28 @@ async function generateOAuthSummaryIfEnabled() {
         transcript: artifact.transcript
       }
     });
+    if (!isCurrentReviewSession(sessionId)) return;
     aiSummaryOverride = response.summary;
     renderPostMeetingReview();
+    reviewStatus.textContent = "AI 整理已更新，可以檢查文件並下載。";
     downloadState.textContent = "AI 整理已更新，可下載 Markdown、JSON 或 PDF。";
   } catch (error) {
-    logAppError("ai.post_meeting_summary", error, { sessionId: activeSessionId }, "error");
+    logAppError("ai.post_meeting_summary", error, { sessionId }, "error");
+    if (!isCurrentReviewSession(sessionId)) return;
     aiSummaryOverride = undefined;
     renderPostMeetingReview();
+    reviewStatus.textContent = "ChatGPT 整理暫時失敗；已保留本機整理，可以先下載。";
     downloadState.textContent = `AI 整理暫時失敗，已保留本機整理：${formatError(error)}`;
   }
 }
 
-function summarizeTranscript(text) {
-  if (!text.trim()) return [];
-  const lines = text
-    .split(/\n|。|；|;/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const priority = lines.filter((line) => /決定|結論|scope|範圍|deadline|期限|owner|負責|驗收|rollback|風險|risk|blocker/i.test(line));
-  return uniqueLimited([...priority, ...lines], 5);
-}
-
-function summarizeDecisionState(decisionState, text) {
-  const items = [];
-  if (decisionState?.readiness) {
-    items.push(`決策完整度 ${Math.round(decisionState.readiness.score * 100)}%，${decisionState.readiness.safeToDecide ? "目前可進入決策" : "仍不建議直接承諾"}`);
-    for (const blocker of decisionState.readiness.blockers ?? []) items.push(`待補：${blocker}`);
-  }
-  const openLines = text
-    .split(/\n|。|；|;/)
-    .map((line) => line.trim())
-    .filter((line) => /待確認|未定|還沒|不確定|下次|follow up|確認一下|再確認/i.test(line));
-  return uniqueLimited([...items, ...openLines], 6);
-}
-
-function summarizeSuggestions(suggestions, text) {
-  const shown = suggestions.map((item) => `${labelMove(item.kind)}：${item.text}`);
-  const actionLines = text
-    .split(/\n|。|；|;/)
-    .map((line) => line.trim())
-    .filter((line) => /要做|負責|owner|action|todo|下次|follow up|確認|補/i.test(line));
-  return uniqueLimited([...shown, ...actionLines], 6);
-}
-
-function uniqueLimited(items, limit) {
-  const unique = [];
-  for (const item of items) {
-    const compact = String(item).replace(/\s+/g, " ").slice(0, 160);
-    if (compact && !unique.includes(compact)) unique.push(compact);
-    if (unique.length >= limit) break;
-  }
-  return unique;
+function isCurrentReviewSession(sessionId) {
+  return document.body.dataset.state === "review" && (!sessionId || activeSessionId === sessionId);
 }
 
 function downloadMeetingArtifact(format) {
   const artifact = buildMeetingArtifact();
-  const summaryDocument = buildAiSummaryDocument(artifact);
-  const transcriptDocument = buildTranscriptDocument(artifact);
-  const baseName = `meeting-copilot-${artifact.sessionId}`;
-  const files = {
-    "summary-json": {
-      name: `${baseName}-ai-summary.json`,
-      type: "application/json;charset=utf-8",
-      content: JSON.stringify(summaryDocument, null, 2)
-    },
-    "summary-markdown": {
-      name: `${baseName}-ai-summary.md`,
-      type: "text/markdown;charset=utf-8",
-      content: renderAiSummaryMarkdown(summaryDocument)
-    },
-    "transcript-json": {
-      name: `${baseName}-transcript.json`,
-      type: "application/json;charset=utf-8",
-      content: JSON.stringify(transcriptDocument, null, 2)
-    },
-    "transcript-txt": {
-      name: `${baseName}-transcript.txt`,
-      type: "text/plain;charset=utf-8",
-      content: renderTranscriptText(transcriptDocument)
-    }
-  };
-  if (format === "summary-pdf") {
-    openPrintableDocument({
-      title: `${artifact.title} AI 整理`,
-      filenameHint: `${baseName}-ai-summary.pdf`,
-      bodyHtml: renderAiSummaryHtml(summaryDocument)
-    });
-    return;
-  }
-  if (format === "transcript-pdf") {
-    openPrintableDocument({
-      title: `${artifact.title} 逐字稿`,
-      filenameHint: `${baseName}-transcript.pdf`,
-      bodyHtml: renderTranscriptHtml(transcriptDocument)
-    });
-    return;
-  }
-  const file = files[format];
-  if (!file) return;
-  const url = URL.createObjectURL(new Blob([file.content], { type: file.type }));
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = file.name;
-  anchor.click();
-  URL.revokeObjectURL(url);
-  downloadState.textContent = `已準備下載 ${file.name}`;
+  downloadMeetingArtifactFile(format, { artifact, downloadState, logAppError });
 }
 
 async function downloadErrorLog() {
@@ -823,109 +975,6 @@ async function downloadErrorLog() {
   downloadState.textContent = `已準備下載 ${fileName}`;
 }
 
-function buildAiSummaryDocument(artifact) {
-  return {
-    title: `${artifact.title} AI 整理`,
-    sessionId: artifact.sessionId,
-    generatedAt: artifact.generatedAt,
-    prepContext: artifact.prepContext,
-    summary: artifact.summary,
-    suggestions: artifact.suggestions,
-    decisionState: artifact.decisionState
-  };
-}
-
-function buildTranscriptDocument(artifact) {
-  return {
-    title: `${artifact.title} 逐字稿`,
-    sessionId: artifact.sessionId,
-    generatedAt: artifact.generatedAt,
-    transcript: artifact.transcript
-  };
-}
-
-function renderAiSummaryMarkdown(document) {
-  const section = (title, items) => [`## ${title}`, ...(items.length > 0 ? items.map((item) => `- ${item}`) : ["- 本場沒有足夠資訊產生此區塊。"])].join("\n");
-  return [
-    `# ${document.title}`,
-    `Session: ${document.sessionId}`,
-    `Generated: ${document.generatedAt}`,
-    "",
-    section("本場重點", document.summary.keyPoints),
-    "",
-    section("決策與待確認", document.summary.decisionsAndOpenQuestions),
-    "",
-    section("建議動作", document.summary.suggestedActions)
-  ].join("\n");
-}
-
-function renderTranscriptText(document) {
-  return [
-    document.title,
-    `Session: ${document.sessionId}`,
-    `Generated: ${document.generatedAt}`,
-    "",
-    ...(document.transcript.length > 0
-      ? document.transcript.map((line, index) => `${index + 1}. ${line.text}`)
-      : ["本場沒有收到逐字稿。"])
-  ].join("\n");
-}
-
-function renderAiSummaryHtml(document) {
-  const section = (title, items) => `
-    <section>
-      <h2>${escapeHtml(title)}</h2>
-      <ul>${(items.length > 0 ? items : ["本場沒有足夠資訊產生此區塊。"]).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
-    </section>`;
-  return [
-    `<h1>${escapeHtml(document.title)}</h1>`,
-    `<p>Session: ${escapeHtml(document.sessionId)}<br />Generated: ${escapeHtml(document.generatedAt)}</p>`,
-    section("本場重點", document.summary.keyPoints),
-    section("決策與待確認", document.summary.decisionsAndOpenQuestions),
-    section("建議動作", document.summary.suggestedActions)
-  ].join("");
-}
-
-function renderTranscriptHtml(document) {
-  const lines = document.transcript.length > 0
-    ? document.transcript.map((line, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(line.text)}</p>`).join("")
-    : "<p>本場沒有收到逐字稿。</p>";
-  return [
-    `<h1>${escapeHtml(document.title)}</h1>`,
-    `<p>Session: ${escapeHtml(document.sessionId)}<br />Generated: ${escapeHtml(document.generatedAt)}</p>`,
-    `<section>${lines}</section>`
-  ].join("");
-}
-
-function openPrintableDocument({ title, filenameHint, bodyHtml }) {
-  const printWindow = window.open("", "_blank");
-  if (!printWindow) {
-    logAppError("download.pdf_popup_blocked", "Printable PDF window was blocked", { title, filenameHint }, "warning");
-    downloadState.textContent = "無法開啟 PDF 列印視窗，請允許彈出視窗後再試。";
-    return;
-  }
-  printWindow.document.write(`<!doctype html>
-    <html lang="zh-Hant">
-      <head>
-        <meta charset="UTF-8" />
-        <title>${escapeHtml(title)}</title>
-        <style>
-          body { color: #111; font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 36px; }
-          h1 { font-size: 28px; line-height: 1.2; margin: 0 0 12px; }
-          h2 { font-size: 18px; margin: 24px 0 8px; }
-          p { margin: 0 0 10px; }
-          li { margin: 4px 0; }
-          @page { margin: 18mm; }
-        </style>
-      </head>
-      <body>${bodyHtml}</body>
-    </html>`);
-  printWindow.document.close();
-  printWindow.focus();
-  printWindow.print();
-  downloadState.textContent = `已開啟 PDF 列印視窗，建議檔名：${filenameHint}`;
-}
-
 function upsertTranscriptEvent(event) {
   if (!event?.text) return;
   if (transcriptEvents.some((existing) => existing.id === event.id)) return;
@@ -934,66 +983,15 @@ function upsertTranscriptEvent(event) {
 }
 
 function renderTranscriptDrawer() {
-  const lines = currentTranscriptLines();
-  const latest = lines.slice(-3);
-  transcriptDrawerToggle.textContent = transcriptDrawerOpen ? "收合" : "展開";
-  transcriptDrawerToggle.setAttribute("aria-expanded", String(transcriptDrawerOpen));
-  transcriptFull.hidden = !transcriptDrawerOpen;
-  const finalCount = transcriptEvents.length > 0 ? transcriptEvents.length : transcriptLines.length;
-  transcriptDrawerCount.textContent = currentPartialTranscript?.text ? `${finalCount} 句｜記錄中` : `${finalCount} 句`;
-  liveTranscript.classList.toggle("expanded", transcriptDrawerOpen);
-  transcriptPreview.innerHTML = latest.length > 0
-    ? latest.map((line) => renderTranscriptLine(line)).join("")
-    : '<p class="empty-line">最近 3 句會顯示在這裡。</p>';
-  transcriptFull.innerHTML = transcriptDrawerOpen
-    ? lines.map((line) => renderTranscriptLine(line)).join("")
-    : "";
-  transcriptPreview.scrollTop = transcriptPreview.scrollHeight;
-  transcriptFull.scrollTop = transcriptFull.scrollHeight;
-}
-
-function currentTranscriptLines() {
-  const partialLine = currentPartialTranscript?.text
-    ? {
-        text: currentPartialTranscript.text,
-        speaker: transcriptSpeakerLabel(currentPartialTranscript),
-        source: currentPartialTranscript.source ?? "unknown",
-        language: currentPartialTranscript.language,
-        partial: true,
-        index: transcriptEvents.length
-      }
-    : undefined;
-  if (transcriptEvents.length > 0) {
-    const lines = transcriptEvents.map((event, index) => ({
-      text: event.text,
-      speaker: transcriptSpeakerLabel(event),
-      source: event.source ?? "unknown",
-      language: event.language,
-      index
-    }));
-    if (partialLine) lines.push(partialLine);
-    return lines;
-  }
-  const lines = transcriptLines.map((text, index) => ({
-    text,
-    speaker: "未知",
-    source: "unknown",
-    language: detectUiLanguage(text),
-    index
-  }));
-  if (partialLine) lines.push(partialLine);
-  return lines;
-}
-
-function renderTranscriptLine(line) {
-  return `<p class="transcript-line${line.partial ? " partial" : ""}"><span>${escapeHtml(line.speaker)}</span><span>${escapeHtml(line.text)}${line.partial ? " <em>記錄中</em>" : ""}</span></p>`;
-}
-
-function transcriptSpeakerLabel(event) {
-  if (event.speaker) return event.speaker;
-  if (event.source === "mic") return "我";
-  if (event.source === "system") return "系統音訊";
-  return "未知";
+  renderTranscriptDrawerView({
+    elements: { liveTranscript, transcriptDrawerToggle, transcriptDrawerCount, transcriptPreview, transcriptFull },
+    transcriptDrawerOpen,
+    transcriptEvents,
+    transcriptLines,
+    currentPartialTranscript,
+    escapeHtml,
+    detectUiLanguage
+  });
 }
 
 function installOpacityControl() {
@@ -1025,10 +1023,10 @@ function resetNativeWindowOpacity() {
 }
 
 function createBriefFromSetupContext() {
-  const context = combinedPrepContext();
+  const context = setupController.combinedPrepContext();
   const contextLine = context ? `會議背景：${context.slice(0, 1400)}` : "未提供會議背景，會議中只依照即時內容判斷。";
   return {
-    sessionId: `native_${Date.now()}`,
+    sessionId: makeClientId("native"),
     projectId: "live_default_project",
     meetingType: "live_decision_copilot",
     title: "即時會議",
@@ -1042,237 +1040,6 @@ function createBriefFromSetupContext() {
     preferredTone: "direct",
     startedAt: new Date().toISOString()
   };
-}
-
-setupContext.addEventListener("input", () => {
-  const length = setupContext.value.trim().length;
-  setupContextMeta.textContent = length > 0
-    ? `已加入 ${length} 字會議背景。`
-    : "尚未加入會議背景。";
-  renderPrepSummary();
-  schedulePrepSummaryGeneration();
-});
-
-setupDropZone.addEventListener("dragover", (event) => {
-  event.preventDefault();
-  setupDropZone.classList.add("drag-over");
-});
-
-setupDropZone.addEventListener("dragleave", () => {
-  setupDropZone.classList.remove("drag-over");
-});
-
-setupDropZone.addEventListener("drop", async (event) => {
-  event.preventDefault();
-  setupDropZone.classList.remove("drag-over");
-  const files = [...(event.dataTransfer?.files ?? [])];
-  if (files.length === 0) return;
-  const loaded = [];
-  for (const file of files) {
-    loaded.push(await readBrowserDroppedFile(file));
-    droppedFileNames.push(file.name);
-  }
-  appendDroppedContext(loaded.filter(Boolean));
-  setupContextMeta.textContent = `已加入檔案：${droppedFileNames.slice(-3).join("、")}。`;
-});
-
-async function installPrepDictationListeners() {
-  if (!nativeListen) return;
-  await nativeListen("prep_dictation_text", (event) => {
-    const text = String(event.payload ?? "").trim();
-    if (!text) return;
-    setupContext.value = [setupContext.value.trim(), text].filter(Boolean).join("\n");
-    setupContext.dispatchEvent(new Event("input"));
-  });
-  await nativeListen("prep_dictation_error", (event) => {
-    logAppError("prep.dictation_event_error", String(event.payload ?? ""), {}, "error");
-    setupContextMeta.textContent = `語音輸入狀態：${event.payload}`;
-  });
-}
-
-async function installNativeDropListeners() {
-  if (!nativeListen) return;
-  await nativeListen("tauri://drag-enter", () => {
-    setupDropZone.classList.add("drag-over");
-  });
-  await nativeListen("tauri://drag-leave", () => {
-    setupDropZone.classList.remove("drag-over");
-  });
-  await nativeListen("tauri://drag-drop", async (event) => {
-    setupDropZone.classList.remove("drag-over");
-    const paths = event.payload?.paths ?? [];
-    if (!Array.isArray(paths) || paths.length === 0 || !nativeInvoke) return;
-    let files;
-    try {
-      files = await nativeInvoke("read_dropped_context_files", { paths });
-    } catch (error) {
-      logAppError("files.native_drop_read", error, { pathCount: paths.length }, "error");
-      setupContextMeta.textContent = `檔案讀取失敗：${formatError(error)}`;
-      return;
-    }
-    const loaded = files
-      .filter((file) => file.text)
-      .map((file) => ({ name: file.name, text: file.text, truncated: file.truncated }));
-    appendDroppedContext(loaded);
-    const errors = files.filter((file) => file.error).map((file) => `${file.name}: ${file.error}`);
-    for (const file of files.filter((file) => file.error)) {
-      logAppError("files.native_drop_file", file.error, { name: file.name }, "warning");
-    }
-    droppedFileNames.push(...files.map((file) => file.name));
-    setupContextMeta.textContent = errors.length > 0
-      ? `部分檔案未讀取：${errors.slice(0, 2).join("；")}`
-      : `已加入檔案：${droppedFileNames.slice(-3).join("、")}。啟用 AI 後會送出檔案文字內容。`;
-  });
-}
-
-function appendDroppedContext(chunks) {
-  const normalized = chunks
-    .map((chunk) => typeof chunk === "string" ? { name: "拖入內容", text: chunk, truncated: false } : chunk)
-    .filter((chunk) => chunk.text?.trim());
-  if (normalized.length === 0) return;
-  droppedContextChunks.push(...normalized);
-  droppedFileCount.textContent = `已加入 ${droppedContextChunks.length} 個檔案`;
-  renderPrepSummary();
-  schedulePrepSummaryGeneration();
-}
-
-function readBrowserDroppedFile(file) {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(`檔案 ${file.name}\n${String(reader.result).slice(0, 8000)}`);
-    reader.onerror = () => {
-      logAppError("files.browser_drop_file", reader.error ?? "browser FileReader failed", { name: file.name, size: file.size, type: file.type }, "warning");
-      resolve("");
-    };
-    reader.readAsText(file);
-  });
-}
-
-function setPrepDictating(enabled) {
-  prepDictating = enabled;
-  prepDictationButton.textContent = enabled ? "停止語音輸入" : "語音輸入";
-  prepDictationButton.classList.toggle("recording", enabled);
-}
-
-function combinedPrepContext() {
-  const typed = setupContext.value.trim();
-  const files = droppedContextChunks
-    .map((chunk) => `檔案 ${chunk.name}${chunk.truncated ? "（已截斷）" : ""}\n${chunk.text}`)
-    .join("\n\n");
-  return [typed, files].filter(Boolean).join("\n\n").trim();
-}
-
-function renderPrepSummary() {
-  const context = combinedPrepContext();
-  if (!canStartWithAi()) {
-    prepSummary.textContent = "請先登入並啟用 AI。啟用後，這裡會整理會議背景，並開放開始會議。";
-    return;
-  }
-  if (!context) {
-    prepSummary.textContent = "加入文字、語音或檔案後，AI 會整理這場會議要注意的重點。";
-    return;
-  }
-  schedulePrepSummaryGeneration();
-}
-
-function schedulePrepSummaryGeneration() {
-  clearTimeout(prepSummaryTimer);
-  if (!nativeInvoke || !canStartWithAi()) return;
-  const context = combinedPrepContext();
-  if (!context) return;
-  prepSummary.textContent = "AI 正在整理會議背景...";
-  const requestId = ++prepSummaryRequestId;
-  prepSummaryTimer = setTimeout(() => generatePrepSummary(requestId), 650);
-}
-
-async function generatePrepSummary(requestId) {
-  const context = combinedPrepContext();
-  if (!context || !canStartWithAi()) return;
-  if (prepSummaryInFlight) {
-    prepSummaryQueued = true;
-    return;
-  }
-  prepSummaryInFlight = true;
-  try {
-    const response = await nativeInvoke("generate_prep_summary_oauth", {
-      request: {
-        context,
-        fileCount: droppedContextChunks.length
-      }
-    });
-    if (requestId !== prepSummaryRequestId) return;
-    const points = response.keyPoints ?? [];
-    prepSummary.innerHTML = points.length > 0
-      ? `<ul>${points.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
-      : "AI 沒有從目前內容整理出明確重點。";
-  } catch (error) {
-    if (requestId !== prepSummaryRequestId) return;
-    logAppError("ai.prep_summary", error, { fileCount: droppedContextChunks.length }, "error");
-    prepSummary.textContent = `AI 整理會議背景失敗：${formatError(error)}`;
-  } finally {
-    prepSummaryInFlight = false;
-    if (prepSummaryQueued) {
-      prepSummaryQueued = false;
-      schedulePrepSummaryGeneration();
-    }
-  }
-}
-
-function labelMove(kind) {
-  return {
-    ask_question: "Ask｜補問",
-    defer_decision: "Hold｜先停一下",
-    split_decision: "Clarify｜拆清楚",
-    challenge_assumption: "Hold｜挑戰假設",
-    confirm_commitment: "Decide｜確認承諾",
-    surface_tradeoff: "Clarify｜攤開取捨",
-    identify_missing_input: "Ask｜補齊條件"
-  }[kind] ?? "決策建議";
-}
-
-function labelCaptureSource(source) {
-  if (source === "mic") return "我的麥克風";
-  if (source === "system") return "系統音訊";
-  return source ?? "未知音訊";
-}
-
-function labelLanguage(language) {
-  if (!language) return "自動語言";
-  if (/zh/i.test(language)) return "中文";
-  if (/en/i.test(language)) return "英文";
-  return language;
-}
-
-function formatAudioMonitorMessage(message) {
-  if (message.includes("stopped from tray")) return "已從系統列結束會議。";
-  if (/permission|denied/i.test(message)) return "沒有麥克風或系統音訊權限。";
-  if (/read-only file system/i.test(message)) return "目前無法啟動音訊，請重新開啟 app 後再試。";
-  return `語音狀態：${message}`;
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function clamp(value, min, max) {
-  if (!Number.isFinite(value)) return min;
-  return Math.min(max, Math.max(min, Math.round(value)));
-}
-
-function detectUiLanguage(text) {
-  if (/[\u4e00-\u9fff]/.test(text) && /[a-z]/i.test(text)) return "mixed";
-  if (/[\u4e00-\u9fff]/.test(text)) return "zh";
-  return "en";
-}
-
-function formatError(error) {
-  if (typeof error === "string") return error;
-  return error?.message ?? JSON.stringify(error);
 }
 
 function logAppError(stage, error, detail = {}, severity = "error") {

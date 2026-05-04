@@ -8,5 +8,7 @@
   <string>Meeting Copilot uses native speech recognition to turn live meeting audio into transcript events.</string>
   <key>NSScreenCaptureUsageDescription</key>
   <string>Meeting Copilot can use screen/system audio capture for remote participant audio when that provider is enabled.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Meeting Copilot needs access to capture system audio so it can transcribe remote meeting participants.</string>
 </dict>
 </plist>

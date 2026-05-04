@@ -15,8 +15,8 @@
             <h1>會前準備</h1>
           </div>
           <button id="startListening" class="start-button" type="button" disabled>
-            <span>開始會議</span>
-            <small>AI 啟用後可用</small>
+            <span>等待 AI</span>
+            <small>正在檢查狀態</small>
           </button>
         </header>
 
@@ -31,6 +31,16 @@
             <button id="loginTextProvider" type="button">登入 ChatGPT</button>
             <button id="enableOAuthProvider" type="button" disabled>啟用 AI</button>
           </div>
+        </section>
+
+        <section id="setupAudioReadiness" class="setup-audio-readiness" aria-label="音訊權限狀態" hidden>
+          <div class="status-dot warning" aria-hidden="true"></div>
+          <div>
+            <p>音訊權限</p>
+            <strong>系統音訊尚未可用</strong>
+            <small id="setupAudioReadinessText">macOS 尚未允許 Meeting Copilot 擷取系統音訊。</small>
+          </div>
+          <button id="setupAudioPermissions" type="button">開啟螢幕與系統錄音</button>
         </section>
 
         <div class="prep-layout">
@@ -72,10 +82,12 @@
           <div class="listening-status">
             <span class="state-label" id="sessionState">待機中</span>
             <p id="providerState">尚未開始會議。</p>
+            <button id="openAudioPermissions" class="permission-action" type="button" hidden>開啟權限設定</button>
           </div>
           <div class="curtain-actions">
             <label for="captureSource">音訊</label>
             <select id="captureSource">
+              <option value="mixed">麥克風 + 系統音訊</option>
               <option value="mic">我的麥克風</option>
               <option value="system">系統音訊</option>
             </select>
@@ -115,8 +127,9 @@
       <section class="review-screen" aria-label="會議記錄">
         <header class="review-header">
           <div>
-            <span>會後</span>
-            <h1>會議記錄</h1>
+            <span id="reviewStageLabel">會後</span>
+            <h1 id="reviewTitle">會議記錄</h1>
+            <p id="reviewStatus" class="review-status">會議結束後會在這裡整理文件。</p>
           </div>
           <button id="newMeeting" type="button">開始下一場</button>
         </header>

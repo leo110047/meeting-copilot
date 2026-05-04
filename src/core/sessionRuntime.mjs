@@ -20,84 +20,111 @@ export class SessionRuntime {
   }
 
   async runManual({ brief, transcriptEvents }) {
+    const state = this.createSessionState(brief);
+    for (const chunk of chunkFinalEvents(transcriptEvents, 3)) {
+      await this.ingestFinalEvents(state, chunk);
+    }
+    return this.resultFromSessionState(state);
+  }
+
+  createSessionState(brief) {
     const playbook = this.playbookCompiler.compile(brief);
     const decisionContext = createDecisionContext(brief);
-    let meetingState = createMeetingState({ sessionId: brief.sessionId, projectId: brief.projectId, startedAt: brief.startedAt ?? nowIso() });
-    let decisionState = createDecisionState({
+    const meetingState = createMeetingState({ sessionId: brief.sessionId, projectId: brief.projectId, startedAt: brief.startedAt ?? nowIso() });
+    const decisionState = createDecisionState({
       sessionId: brief.sessionId,
       decisionType: decisionContext.decisionScope,
       constraints: decisionContext.knownConstraints,
       stakeholders: decisionContext.stakeholders
     });
-    const suggestions = [];
-    const failures = [];
-    const committedTranscript = [];
-
-    for (const chunk of chunkFinalEvents(transcriptEvents, 3)) {
-      committedTranscript.push(...chunk);
-      await this.eventBus?.emit("transcript.final", { events: chunk });
-      const layer3Context = this.contextSnapshot({ meetingState, decisionState, transcriptWindow: committedTranscript.slice(-8) });
-      const extraction = await this.extractionEngine.extract({
-        sessionId: brief.sessionId,
-        priorMeetingState: meetingState,
-        priorDecisionState: decisionState,
-        newFinalTranscriptEvents: chunk,
-        playbook,
-        decisionContext,
-        layer3Context
-      });
-      if (!extraction.ok) {
-        failures.push(extraction.failure);
-        continue;
-      }
-      meetingState = applyMeetingStatePatch(meetingState, extraction.output.meetingStatePatch, brief.sessionId);
-      decisionState = applyDecisionStatePatch(decisionState, extraction.output.decisionStatePatch, brief.sessionId);
-      decisionState.readiness = this.readinessEvaluator.evaluate(decisionState);
-
-      const refreshedContext = this.contextSnapshot({ meetingState, decisionState, transcriptWindow: committedTranscript.slice(-8) });
-      const move = this.coachEngine.generate({
-        brief,
-        decisionContext,
-        decisionState,
-        playbook,
-        state: meetingState,
-        recentTranscript: committedTranscript.slice(-8),
-        recentTranscriptWindowMs: 120_000,
-        priorSuggestions: suggestions,
-        layer3Context: refreshedContext
-      });
-      const policyDecision = this.policy.decide({ move, meetingState, priorSuggestions: suggestions });
-      if (policyDecision.shouldShow) {
-        const suggestion = {
-          ...move,
-          sessionId: brief.sessionId,
-          shownAt: nowIso(),
-          policyReason: policyDecision.reason
-        };
-        suggestions.push(suggestion);
-        meetingState.lastSuggestionAt = suggestion.shownAt;
-        await this.eventBus?.emit("suggestion.shown", suggestion);
-      }
-    }
-
-    const memoryCandidates = extractMemoryCandidatesFromSession({
-      sessionId: brief.sessionId,
-      projectId: brief.projectId,
-      transcriptEvents: committedTranscript,
-      decisionState
-    });
-    for (const candidate of memoryCandidates) this.knowledgeStore.addMemoryCandidate(candidate);
-
     return {
       brief,
       playbook,
       decisionContext,
       meetingState,
       decisionState,
-      suggestions,
-      failures,
+      suggestions: [],
+      failures: [],
+      committedTranscript: []
+    };
+  }
+
+  async ingestFinalEvents(state, events) {
+    const chunk = events.filter((event) => event.isFinal !== false);
+    if (chunk.length === 0) return [];
+    state.committedTranscript.push(...chunk);
+    await this.eventBus?.emit("transcript.final", { events: chunk });
+    const layer3Context = this.contextSnapshot({
+      meetingState: state.meetingState,
+      decisionState: state.decisionState,
+      transcriptWindow: state.committedTranscript.slice(-8)
+    });
+    const extraction = await this.extractionEngine.extract({
+      sessionId: state.brief.sessionId,
+      priorMeetingState: state.meetingState,
+      priorDecisionState: state.decisionState,
+      newFinalTranscriptEvents: chunk,
+      playbook: state.playbook,
+      decisionContext: state.decisionContext,
+      layer3Context
+    });
+    if (!extraction.ok) {
+      state.failures.push(extraction.failure);
+      return [];
+    }
+    state.meetingState = applyMeetingStatePatch(state.meetingState, extraction.output.meetingStatePatch, state.brief.sessionId);
+    state.decisionState = applyDecisionStatePatch(state.decisionState, extraction.output.decisionStatePatch, state.brief.sessionId);
+    state.decisionState.readiness = this.readinessEvaluator.evaluate(state.decisionState);
+
+    const refreshedContext = this.contextSnapshot({
+      meetingState: state.meetingState,
+      decisionState: state.decisionState,
+      transcriptWindow: state.committedTranscript.slice(-8)
+    });
+    const move = this.coachEngine.generate({
+      brief: state.brief,
+      decisionContext: state.decisionContext,
+      decisionState: state.decisionState,
+      playbook: state.playbook,
+      state: state.meetingState,
+      recentTranscript: state.committedTranscript.slice(-8),
+      recentTranscriptWindowMs: 120_000,
+      priorSuggestions: state.suggestions,
+      layer3Context: refreshedContext
+    });
+    const policyDecision = this.policy.decide({ move, meetingState: state.meetingState, priorSuggestions: state.suggestions });
+    if (!policyDecision.shouldShow) return [];
+    const suggestion = {
+      ...move,
+      sessionId: state.brief.sessionId,
+      shownAt: nowIso(),
+      policyReason: policyDecision.reason
+    };
+    state.suggestions.push(suggestion);
+    state.meetingState.lastSuggestionAt = suggestion.shownAt;
+    await this.eventBus?.emit("suggestion.shown", suggestion);
+    return [suggestion];
+  }
+
+  resultFromSessionState(state) {
+    const memoryCandidates = extractMemoryCandidatesFromSession({
+      sessionId: state.brief.sessionId,
+      projectId: state.brief.projectId,
+      transcriptEvents: state.committedTranscript,
+      decisionState: state.decisionState
+    });
+    for (const candidate of memoryCandidates) this.knowledgeStore.addMemoryCandidate(candidate);
+
+    return {
+      brief: state.brief,
+      playbook: state.playbook,
+      decisionContext: state.decisionContext,
+      meetingState: state.meetingState,
+      decisionState: state.decisionState,
+      suggestions: state.suggestions,
+      failures: state.failures,
       memoryCandidates,
-      transcriptEvents: committedTranscript
+      transcriptEvents: state.committedTranscript
     };
   }
 

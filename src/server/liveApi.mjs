@@ -4,7 +4,7 @@ import { extname, join, resolve } from "node:path";
 import { EventBus } from "../core/eventBus.mjs";
 import { KnowledgeStore } from "../core/knowledgeStore.mjs";
 import { SessionRuntime } from "../core/sessionRuntime.mjs";
-import { sha16, nowIso } from "../domain/contracts.mjs";
+import { makeId, nowIso } from "../domain/contracts.mjs";
 import { createTranscriptEvent } from "../transcription/transcriptEvent.mjs";
 import { SessionRepository } from "../storage/sessionRepository.mjs";
 
@@ -40,7 +40,7 @@ export function createLiveApiServer({ distRoot = "dist", dbPath = ".data/meeting
       } catch (logError) {
         console.error("failed to persist live API error log", logError);
       }
-      json(response, 500, { error: error.message });
+      json(response, error.statusCode ?? 500, { error: error.message });
     }
   });
 }
@@ -53,21 +53,26 @@ export function startLiveApiServer({ port = 8767, host = "127.0.0.1", distRoot =
 }
 
 export class LiveSessionService {
-  constructor({ dbPath = ".data/meeting-copilot.db" } = {}) {
+  constructor({ dbPath = ".data/meeting-copilot.db", runtimeFactory } = {}) {
     this.repository = new SessionRepository(dbPath);
     this.sessions = new Map();
+    this.runtimeFactory = runtimeFactory ?? (({ knowledgeStore }) => new SessionRuntime({ knowledgeStore, eventBus: new EventBus() }));
   }
 
   startSession({ brief: briefOverride } = {}) {
     const brief = createLiveBrief(briefOverride);
+    const knowledgeStore = new KnowledgeStore({
+      projects: [defaultProject()],
+      memories: defaultMemories(brief.projectId)
+    });
+    const runtime = this.runtimeFactory({ knowledgeStore });
     const state = {
       brief,
       events: [],
       shownSuggestionIds: new Set(),
-      knowledgeStore: new KnowledgeStore({
-        projects: [defaultProject()],
-        memories: defaultMemories(brief.projectId)
-      })
+      knowledgeStore,
+      runtime,
+      runtimeState: runtime.createSessionState(brief)
     };
     this.sessions.set(brief.sessionId, state);
     this.repository.saveSession({
@@ -100,18 +105,19 @@ export class LiveSessionService {
     state.events.push(event);
     this.repository.saveTranscriptEvent(event);
 
-    const runtime = new SessionRuntime({ knowledgeStore: state.knowledgeStore, eventBus: new EventBus() });
-    const result = await runtime.runManual({ brief: state.brief, transcriptEvents: state.events });
-    const newSuggestions = result.suggestions.filter((suggestion) => !state.shownSuggestionIds.has(suggestion.id));
+    const incrementalSuggestions = await state.runtime.ingestFinalEvents(state.runtimeState, [event]);
+    const result = state.runtime.resultFromSessionState(state.runtimeState);
+    const newSuggestions = incrementalSuggestions.filter((suggestion) => !state.shownSuggestionIds.has(suggestion.id));
     for (const suggestion of newSuggestions) {
       state.shownSuggestionIds.add(suggestion.id);
       this.repository.saveSuggestion(suggestion);
     }
-    const snapshotId = sha16(`${sessionId}:${Date.now()}:${JSON.stringify(result.decisionState)}`);
+    const createdAtMs = Date.now();
+    const snapshotId = makeId("decision_snapshot");
     this.repository.saveDecisionSnapshot({
       id: snapshotId,
       sessionId,
-      createdAtMs: Date.now(),
+      createdAtMs,
       decisionState: result.decisionState
     });
     for (const candidate of result.memoryCandidates) this.repository.saveMemoryCandidate(candidate);
@@ -171,7 +177,7 @@ async function handleApi({ request, response, url, service }) {
 }
 
 function createLiveBrief(override = {}) {
-  const sessionId = override.sessionId ?? `live_${Date.now()}`;
+  const sessionId = override.sessionId ?? makeId("live");
   return {
     sessionId,
     projectId: override.projectId ?? "live_default_project",
@@ -226,12 +232,24 @@ function serveStatic({ response, root, pathname }) {
   createReadStream(candidate).pipe(response);
 }
 
-function readJson(request) {
+function readJson(request, { maxBytes = 1024 * 1024 } = {}) {
   return new Promise((resolve, reject) => {
     let data = "";
+    let bytes = 0;
+    let rejected = false;
     request.setEncoding("utf8");
-    request.on("data", (chunk) => data += chunk);
+    request.on("data", (chunk) => {
+      if (rejected) return;
+      bytes += Buffer.byteLength(chunk, "utf8");
+      if (bytes > maxBytes) {
+        rejected = true;
+        reject(new HttpError(413, `JSON body exceeds ${maxBytes} bytes`));
+        return;
+      }
+      data += chunk;
+    });
     request.on("end", () => {
+      if (rejected) return;
       if (!data) {
         resolve({});
         return;
@@ -244,6 +262,13 @@ function readJson(request) {
     });
     request.on("error", reject);
   });
+}
+
+class HttpError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
+  }
 }
 
 function json(response, status, payload) {

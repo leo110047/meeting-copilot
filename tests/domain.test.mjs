@@ -79,3 +79,65 @@ test("DecisionStateReducer preserves owner and blocks unsafe decisions", () => {
   assert.equal(readiness.safeToDecide, false);
   assert.ok(readiness.blockers.some((blocker) => blocker.includes("deadline")));
 });
+
+test("DecisionStateReducer merges option evidence instead of overwriting it", () => {
+  const initial = createDecisionState({ sessionId: "s1" });
+  const first = applyDecisionStatePatch(initial, {
+    addOptions: [{ label: "ship v1", evidenceTranscriptIds: ["t1"] }],
+    updateOptions: [],
+    addRisks: [],
+    addMissingInputs: [],
+    evidenceTranscriptIds: ["t1"]
+  }, "s1");
+  const second = applyDecisionStatePatch(first, {
+    addOptions: [{ label: "ship v1", evidenceTranscriptIds: ["t2"] }],
+    updateOptions: [],
+    addRisks: [],
+    addMissingInputs: [],
+    evidenceTranscriptIds: ["t2"]
+  }, "s1");
+  assert.deepEqual(second.options[0].evidenceTranscriptIds, ["t1", "t2"]);
+});
+
+test("DecisionStateReducer accepts readiness score decreases from patch semantics", () => {
+  const initial = createDecisionState({ sessionId: "s1" });
+  const high = applyDecisionStatePatch(initial, {
+    addOptions: [],
+    updateOptions: [],
+    addRisks: [],
+    addMissingInputs: [],
+    readinessPatch: { score: 0.8, safeToDecide: true },
+    evidenceTranscriptIds: ["t1"]
+  }, "s1");
+  const lowered = applyDecisionStatePatch(high, {
+    addOptions: [],
+    updateOptions: [],
+    addRisks: [],
+    addMissingInputs: [],
+    readinessPatch: { score: 0.2, safeToDecide: false, blockers: ["owner missing"] },
+    evidenceTranscriptIds: ["t2"]
+  }, "s1");
+  assert.equal(lowered.readiness.score, 0.2);
+  assert.equal(lowered.readiness.safeToDecide, false);
+});
+
+test("MeetingStateReducer tolerates legacy items without optional defaults", () => {
+  const initial = createMeetingState({ sessionId: "s1" });
+  initial.risks.push({
+    id: "legacy-risk",
+    kind: "risk",
+    canonicalKey: canonicalKey("risk", "owner missing"),
+    text: "owner missing",
+    status: "open"
+  });
+  const patched = applyMeetingStatePatch(initial, {
+    addItems: [
+      { kind: "risk", text: "owner missing", confidence: 0.7, evidenceTranscriptIds: ["t2"], firstSeenAtMs: 2, lastUpdatedAtMs: 2 }
+    ],
+    updateItems: [],
+    resolveItemIds: []
+  }, "s1");
+  assert.deepEqual(patched.risks[0].evidenceTranscriptIds, ["t2"]);
+  assert.equal(patched.risks[0].firstSeenAtMs, 2);
+  assert.equal(patched.risks[0].lastUpdatedAtMs, 2);
+});

@@ -1,5 +1,7 @@
 import AVFoundation
+import AppKit
 import CoreMedia
+import CoreGraphics
 import Foundation
 import ScreenCaptureKit
 import Speech
@@ -40,6 +42,8 @@ func parseOptions(_ args: [String]) -> CliOptions {
         switch arg {
         case "--health":
             options.mode = "health"
+        case "--request-screen-capture":
+            options.mode = "request-screen-capture"
         case "--language":
             if index + 1 < args.count {
                 options.language = args[index + 1]
@@ -81,6 +85,42 @@ func requestSpeechAuthorization() -> SFSpeechRecognizerAuthorizationStatus {
     }
     semaphore.wait()
     return status
+}
+
+func hasScreenCaptureAccess() -> Bool {
+    if #available(macOS 10.15, *) {
+        return CGPreflightScreenCaptureAccess()
+    }
+    return true
+}
+
+func requestScreenCaptureAccessIfNeeded() -> Bool {
+    if hasScreenCaptureAccess() {
+        return true
+    }
+    if #available(macOS 10.15, *) {
+        return CGRequestScreenCaptureAccess()
+    }
+    return true
+}
+
+func runScreenCaptureAccessRequestApp() -> Never {
+    if hasScreenCaptureAccess() {
+        exit(0)
+    }
+    if #available(macOS 10.15, *) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        app.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async {
+            let granted = CGRequestScreenCaptureAccess()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                exit(granted ? 0 : 7)
+            }
+        }
+        app.run()
+    }
+    exit(0)
 }
 
 final class MicSpeechStreamer {
@@ -184,6 +224,7 @@ final class SystemAudioSpeechStreamer: NSObject, SCStreamDelegate, SCStreamOutpu
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var stream: SCStream?
     private var lastText = ""
+    private var startupError: Error?
 
     init?(options: CliOptions) {
         self.options = options
@@ -219,7 +260,7 @@ final class SystemAudioSpeechStreamer: NSObject, SCStreamDelegate, SCStreamOutpu
             do {
                 try await self.startCapture()
             } catch {
-                fputs("\(error.localizedDescription)\n", stderr)
+                self.startupError = error
                 self.done.signal()
             }
         }
@@ -231,9 +272,15 @@ final class SystemAudioSpeechStreamer: NSObject, SCStreamDelegate, SCStreamOutpu
         }
         done.wait()
         stop()
+        if let startupError {
+            throw startupError
+        }
     }
 
     private func startCapture() async throws {
+        guard requestScreenCaptureAccessIfNeeded() else {
+            throw NSError(domain: "MeetingCopilotSpeech", code: 7, userInfo: [NSLocalizedDescriptionKey: "screen capture permission is required for system audio; grant Screen Recording / Screen & System Audio Recording to Meeting Copilot and restart Meeting Copilot"])
+        }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
             throw NSError(domain: "MeetingCopilotSpeech", code: 6, userInfo: [NSLocalizedDescriptionKey: "no display available for ScreenCaptureKit audio"])
@@ -294,9 +341,16 @@ final class SystemAudioSpeechStreamer: NSObject, SCStreamDelegate, SCStreamOutpu
 let options = parseOptions(Array(CommandLine.arguments.dropFirst()))
 let recognizerAvailable = SFSpeechRecognizer(locale: Locale(identifier: options.language))?.isAvailable ?? false
 
+if options.mode == "request-screen-capture" {
+    runScreenCaptureAccessRequestApp()
+}
+
 if options.mode == "health" {
     let status = requestSpeechAuthorization()
-    let ready = status == .authorized && recognizerAvailable
+    let needsScreenCapture = options.source == "system"
+    let screenCaptureReady = !needsScreenCapture || hasScreenCaptureAccess()
+    let ready = status == .authorized && recognizerAvailable && screenCaptureReady
+    let lastError = ready ? nil : "speech authorization is \(status.rawValue), recognizerAvailable=\(recognizerAvailable), screenCaptureReady=\(screenCaptureReady)"
     writeJson(HealthLine(
         kind: "health",
         providerId: "macos-speech-native",
@@ -304,7 +358,7 @@ if options.mode == "health" {
         supportsStreaming: true,
         supportsDiarization: false,
         supportsSourceHints: true,
-        lastError: ready ? nil : "speech authorization is \(status.rawValue), recognizerAvailable=\(recognizerAvailable)"
+        lastError: lastError
     ))
     exit(ready ? 0 : 2)
 }

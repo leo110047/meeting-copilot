@@ -11,7 +11,7 @@ Meeting Copilot 是一個 native desktop app，用來在會議中即時輔助決
 - npm
 - Rust toolchain
 - 目前 OS 對應的 Tauri build prerequisites
-- macOS native microphone transcription 需要 Speech Recognition / Microphone 權限；system audio 需要 Screen Recording 權限。
+- macOS native transcription 需要授權 `Meeting Copilot` 的 Speech Recognition、Microphone，以及螢幕與系統錄音權限。
 - Windows system audio transcription 需要 Windows audio endpoint 可用，且會使用 WASAPI loopback 與 Windows SpeechRecognition。
 - AI 功能需要透過本機 subscription/OAuth connector 登入 ChatGPT
 
@@ -41,6 +41,14 @@ macOS debug bundle 會產生在：
 target/debug/bundle/macos/Meeting Copilot.app
 ```
 
+macOS TCC 權限會綁定 code-signing identity。若使用預設 ad-hoc 簽名，每次重建後可能需要重新授權螢幕與系統錄音。若本機有固定開發簽名 identity，可用：
+
+```bash
+MEETING_COPILOT_CODESIGN_IDENTITY="Apple Development: ..." \
+MEETING_COPILOT_CODESIGN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db" \
+npm run native:build:mac
+```
+
 Windows debug installer / bundle 使用：
 
 ```bash
@@ -63,7 +71,7 @@ npm run verify         # 執行完整本機驗證流程
 ## 產品流程
 
 1. **會前準備**：登入並啟用 AI，輸入會議背景，也可以拖拉文字檔。支援的拖曳檔案會讀取文字內容，啟用 AI 後作為會議背景送給 AI。
-2. **會議中**：開始會議、選擇音訊來源、調整視窗透明度，需要時展開逐字稿抽屜。macOS 與 Windows 都提供 `我的麥克風` 與 `系統音訊`；Windows 系統音訊走 WASAPI loopback，再交給本機 SpeechRecognition。若音訊或 STT 出錯，錯誤會進 app error log。
+2. **會議中**：開始會議、選擇音訊來源、調整視窗透明度，需要時展開逐字稿抽屜。macOS 與 Windows 都提供 `麥克風 + 系統音訊`、`我的麥克風` 與 `系統音訊`；混合來源會同時啟動 mic 與 system 兩路 native helper，並保留 transcript source。Windows 系統音訊走 WASAPI loopback，再交給本機 SpeechRecognition。若音訊或 STT 出錯，錯誤會進 app error log。
 3. **會後整理**：檢查兩份文件：AI 整理與逐字稿。主要匯出 Markdown/TXT，JSON/PDF 作為次要格式；需要回報 bug 時，可在其他格式中下載錯誤紀錄 JSON。
 
 ## 架構地圖

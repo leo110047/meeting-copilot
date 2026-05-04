@@ -1,32 +1,54 @@
-import { spawnSync } from "node:child_process";
+import Database from "better-sqlite3";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+
+const openDatabases = new Map();
 
 export function migrate(dbPath, schemaPath = new URL("./schema.sql", import.meta.url)) {
   const absoluteDb = resolve(dbPath);
   mkdirSync(dirname(absoluteDb), { recursive: true });
   const schema = readFileSync(schemaPath, "utf8");
-  const result = spawnSync("sqlite3", [absoluteDb], { input: schema, encoding: "utf8" });
-  if (result.status !== 0) {
-    throw new Error(result.stderr || `sqlite3 exited with ${result.status}`);
-  }
+  database(absoluteDb).exec(schema);
   return absoluteDb;
 }
 
 export function listTables(dbPath) {
-  const result = spawnSync("sqlite3", [resolve(dbPath), ".tables"], { encoding: "utf8" });
-  if (result.status !== 0) throw new Error(result.stderr);
-  return result.stdout.trim().split(/\s+/).filter(Boolean);
+  return database(dbPath)
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    .all()
+    .map((row) => row.name);
 }
 
-export function executeSql(dbPath, sql) {
-  const result = spawnSync("sqlite3", [resolve(dbPath)], { input: sql, encoding: "utf8" });
-  if (result.status !== 0) throw new Error(result.stderr || `sqlite3 exited with ${result.status}`);
-  return result.stdout;
+export function executeSql(dbPath, sql, params = []) {
+  const db = database(dbPath);
+  if (!params.length) {
+    db.exec(sql);
+    return "";
+  }
+  db.prepare(sql).run(...params);
+  return "";
 }
 
-export function queryScalar(dbPath, sql) {
-  return executeSql(dbPath, sql).trim();
+export function queryScalar(dbPath, sql, params = []) {
+  const row = database(dbPath).prepare(sql).get(...params);
+  if (!row) return "";
+  const [value] = Object.values(row);
+  return value === null || value === undefined ? "" : String(value);
+}
+
+export function closeDatabase(dbPath) {
+  const absoluteDb = resolve(dbPath);
+  const db = openDatabases.get(absoluteDb);
+  if (!db) return;
+  db.close();
+  openDatabases.delete(absoluteDb);
+}
+
+export function closeAllDatabases() {
+  for (const [absoluteDb, db] of openDatabases.entries()) {
+    db.close();
+    openDatabases.delete(absoluteDb);
+  }
 }
 
 export function sqlString(value) {
@@ -37,4 +59,15 @@ export function sqlString(value) {
 export function sqlNumber(value) {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return "NULL";
   return String(Number(value));
+}
+
+function database(dbPath) {
+  const absoluteDb = resolve(dbPath);
+  let db = openDatabases.get(absoluteDb);
+  if (!db) {
+    mkdirSync(dirname(absoluteDb), { recursive: true });
+    db = new Database(absoluteDb);
+    openDatabases.set(absoluteDb, db);
+  }
+  return db;
 }
