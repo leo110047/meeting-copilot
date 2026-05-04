@@ -43,6 +43,56 @@ mod tests {
     }
 
     #[test]
+    fn codex_command_available_returns_false_for_missing_binary() {
+        let missing = PathBuf::from(format!("meeting-copilot-missing-codex-{}", now_ms()));
+        assert!(!codex_command_available(&missing));
+    }
+
+    #[test]
+    fn start_subscription_oauth_login_rejects_missing_override_before_launch() {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let key = "MEETING_COPILOT_CODEX";
+        let previous = std::env::var_os(key);
+        let missing = std::env::temp_dir().join(format!(
+            "meeting-copilot-missing-codex-login-{}",
+            now_ms()
+        ));
+        unsafe {
+            std::env::set_var(key, &missing);
+        }
+        let result = start_subscription_oauth_login();
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var(key, value);
+            },
+            None => unsafe {
+                std::env::remove_var(key);
+            },
+        }
+        let error = result.expect_err("missing Codex override should fail before launching login");
+        assert!(error.contains("MEETING_COPILOT_CODEX"));
+        assert!(error.contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn windows_pathext_order_is_preserved_for_codex_candidates() {
+        let extensions =
+            windows_executable_extensions_from_pathext(Some(std::ffi::OsStr::new(".BAT;.CMD;.EXE")));
+        assert_eq!(extensions, vec![".bat", ".cmd", ".exe"]);
+        assert_eq!(
+            windows_codex_executable_names(Some(std::ffi::OsStr::new(".BAT;.CMD"))),
+            vec!["codex.bat", "codex.cmd"]
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_codex_fallbacks_keep_usr_local_for_linux_compatibility() {
+        assert!(codex_unix_fallback_candidates().contains(&"/usr/local/bin/codex"));
+    }
+
+    #[test]
     fn oauth_status_parser_does_not_accept_negative_logged_in_text() {
         assert_eq!(
             parse_subscription_oauth_authenticated("Not logged in. Run codex login to use ChatGPT."),

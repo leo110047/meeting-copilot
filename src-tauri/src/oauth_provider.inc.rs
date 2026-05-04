@@ -51,9 +51,10 @@ fn clear_subscription_oauth_status_cache() {
 
 fn subscription_oauth_status_uncached() -> TextProviderStatus {
     let codex = codex_command_path();
-    let mut command = Command::new(&codex);
+    let mut command = codex_command_from_path(&codex);
     configure_codex_oauth_env(&mut command);
-    match command.arg("login").arg("status").output() {
+    command.arg("login").arg("status");
+    match run_command_output_with_timeout(&mut command, 5_000) {
         Ok(output) if output.status.success() => {
             let status_text = format!(
                 "{}{}",
@@ -106,8 +107,16 @@ fn subscription_oauth_status_uncached() -> TextProviderStatus {
             supports_structured_output: true,
             supports_streaming: true,
             active: false,
-            status_label: "找不到 Codex 訂閱 OAuth connector".to_string(),
-            last_error: Some(format!("{}: {error}", codex.display())),
+            status_label: if error.contains("timed out") {
+                "Codex CLI 無回應".to_string()
+            } else {
+                codex_connector_missing_label().to_string()
+            },
+            last_error: Some(format!(
+                "{}：{} ({error})",
+                codex_connector_missing_message(),
+                codex.display()
+            )),
         },
     }
 }
@@ -155,8 +164,12 @@ fn parse_subscription_oauth_authenticated(status_text: &str) -> SubscriptionOAut
 fn start_subscription_oauth_login() -> Result<(), String> {
     clear_subscription_oauth_status_cache();
     let codex = codex_command_path();
-    if !codex.exists() && codex.to_string_lossy() != "codex" {
-        return Err(format!("找不到 Codex connector：{}", codex.display()));
+    if let Err(error) = codex_command_probe(&codex) {
+        return Err(format!(
+            "{}：{} ({error})",
+            codex_connector_missing_message(),
+            codex.display()
+        ));
     }
     #[cfg(target_os = "macos")]
     {
@@ -202,14 +215,43 @@ echo "Login flow finished. You can close this window."
     }
     #[cfg(target_os = "windows")]
     {
+        let script_dir = create_private_oauth_temp_dir()?;
+        let script_path = script_dir.join("login.cmd");
+        let script = format!(
+            r#"@echo off
+setlocal
+echo Meeting Copilot ChatGPT subscription OAuth login
+echo This window was opened by Meeting Copilot. Complete the browser login, then return to the app; Meeting Copilot will refresh the status automatically.
+echo.
+{} login
+set "EXIT_CODE=%ERRORLEVEL%"
+echo.
+if "%EXIT_CODE%"=="0" (
+  echo Login flow finished. You can close this window.
+) else (
+  echo Codex login exited with code %EXIT_CODE%.
+)
+echo.
+pause
+del "%~f0" >nul 2>nul
+for %%I in ("%~dp0.") do rmdir "%%~fI" >nul 2>nul
+exit /b %EXIT_CODE%
+"#,
+            cmd_batch_quote_path(&codex)
+        );
+        fs::write(&script_path, script).map_err(|error| error.to_string())?;
         Command::new("cmd")
             .arg("/C")
             .arg("start")
             .arg("")
-            .arg(codex)
-            .arg("login")
+            .arg(&script_path)
             .spawn()
             .map_err(|error| format!("failed to open login terminal: {error}"))?;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(600));
+            let _ = fs::remove_file(&script_path);
+            let _ = fs::remove_dir(&script_dir);
+        });
         return Ok(());
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -218,24 +260,49 @@ echo "Login flow finished. You can close this window."
     }
 }
 
-#[cfg(target_os = "macos")]
 fn create_private_oauth_temp_dir() -> Result<PathBuf, String> {
-    use std::os::unix::fs::DirBuilderExt;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::DirBuilderExt;
 
-    let mut random_bytes = [0_u8; 16];
-    fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut random_bytes))
-        .map_err(|error| format!("failed to read secure random bytes: {error}"))?;
-    let suffix = random_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let dir = std::env::temp_dir().join(format!("meeting-copilot-codex-login-{suffix}"));
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|error| format!("failed to create private login temp dir: {error}"))?;
-    Ok(dir)
+        let mut random_bytes = [0_u8; 16];
+        fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut random_bytes))
+            .map_err(|error| format!("failed to read secure random bytes: {error}"))?;
+        let suffix = random_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let dir = std::env::temp_dir().join(format!("meeting-copilot-codex-login-{suffix}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|error| format!("failed to create private login temp dir: {error}"))?;
+        Ok(dir)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for attempt in 0..32 {
+            let dir = base.join(format!(
+                "meeting-copilot-codex-login-{}-{pid}-{attempt}",
+                now_ms()
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!("failed to create private login temp dir: {error}"));
+                }
+            }
+        }
+        Err("failed to create private login temp dir after retries".to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("private OAuth temp dir is not implemented for this platform".to_string())
+    }
 }
 
 fn build_ai_summary_prompt(request: &AiSummaryRequest) -> Result<String, String> {
@@ -426,8 +493,10 @@ fn run_codex_oauth_prompt(prompt: &str) -> Result<String, String> {
 fn run_codex_oauth_prompt_with_timeout(prompt: &str, timeout_ms: u64) -> Result<String, String> {
     let output_path =
         std::env::temp_dir().join(format!("meeting-copilot-ai-summary-{}.txt", now_ms()));
-    let mut command = Command::new(codex_command_path());
+    let codex = codex_command_path();
+    let mut command = codex_command_from_path(&codex);
     configure_codex_oauth_env(&mut command);
+    configure_background_command(&mut command);
     let mut child = command
         .arg("exec")
         .arg("--skip-git-repo-check")
@@ -622,13 +691,292 @@ fn reject_nested_full_rewrite(value: &serde_json::Value, path: &str) -> Result<(
 }
 
 fn codex_command_path() -> PathBuf {
-    for candidate in ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"] {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
+    if let Ok(path) = std::env::var("MEETING_COPILOT_CODEX") {
+        let path = PathBuf::from(path);
+        // Return the user-provided path as-is so diagnostics can report the exact override.
+        if !path.as_os_str().is_empty() {
             return path;
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        for candidate in codex_path_candidates_from_path() {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        let pathext = std::env::var_os("PATHEXT");
+        let executable_names = windows_codex_executable_names(pathext.as_deref());
+        if let Ok(app_data) = std::env::var("APPDATA") {
+            for filename in &executable_names {
+                let path = PathBuf::from(&app_data).join("npm").join(filename);
+                if path.exists() {
+                    return path;
+                }
+            }
+        }
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            for relative in [
+                ["Programs", "Codex", "codex.exe"],
+                ["Programs", "OpenAI Codex", "codex.exe"],
+            ] {
+                let path = relative
+                    .iter()
+                    .fold(PathBuf::from(&local_app_data), |base, segment| base.join(segment));
+                if path.exists() {
+                    return path;
+                }
+            }
+        }
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            let path = PathBuf::from(user_profile)
+                .join(".codex")
+                .join("bin")
+                .join("codex.exe");
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for candidate in codex_unix_fallback_candidates() {
+            let path = PathBuf::from(candidate);
+            if path.exists() {
+                return path;
+            }
+        }
+    }
     PathBuf::from("codex")
+}
+
+fn codex_command_probe(codex: &Path) -> Result<(), String> {
+    let mut command = codex_command_from_path(codex);
+    configure_codex_oauth_env(&mut command);
+    command.arg("--version");
+    let output = run_command_output_with_timeout(&mut command, 3_000)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = truncate_for_diagnostic(
+            &format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            400,
+        );
+        Err(if detail.is_empty() {
+            format!("Codex CLI --version exited with {}", output.status)
+        } else {
+            format!(
+                "Codex CLI --version exited with {}: {detail}",
+                output.status
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+fn codex_command_available(codex: &Path) -> bool {
+    codex_command_probe(codex).is_ok()
+}
+
+fn codex_command_from_path(codex: &Path) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        if is_windows_command_shim(codex) {
+            let mut command = Command::new("cmd");
+            command.arg("/C").arg(codex);
+            return command;
+        }
+    }
+    Command::new(codex)
+}
+
+fn run_command_output_with_timeout(
+    command: &mut Command,
+    timeout_ms: u64,
+) -> Result<Output, String> {
+    configure_background_command(command);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout unavailable".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "child stderr unavailable".to_string())?;
+    let stdout_reader = thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        buffer
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr.read_to_end(&mut buffer);
+        buffer
+    });
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let status = loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                if let Err(error) = child.kill() {
+                    let _ = log_app_error_inner(
+                        None,
+                        "command.timeout.kill",
+                        "text_provider",
+                        "warning",
+                        &error.to_string(),
+                        serde_json::json!({"timeoutMs": timeout_ms}),
+                    );
+                }
+                let _ = child.wait();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                let _ = stdout_reader.join();
+                let detail = truncate_for_diagnostic(&String::from_utf8_lossy(&stderr), 400);
+                return Err(if detail.is_empty() {
+                    format!("command timed out after {timeout_ms}ms")
+                } else {
+                    format!("command timed out after {timeout_ms}ms: {detail}")
+                });
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn configure_background_command(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_background_command(_command: &mut Command) {
+}
+
+#[cfg(not(target_os = "windows"))]
+fn codex_unix_fallback_candidates() -> &'static [&'static str] {
+    &["/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
+}
+
+#[cfg(target_os = "windows")]
+fn codex_path_candidates_from_path() -> Vec<PathBuf> {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return vec![];
+    };
+    let pathext = std::env::var_os("PATHEXT");
+    let executable_names = windows_codex_executable_names(pathext.as_deref());
+    std::env::split_paths(&paths)
+        .flat_map(|dir| {
+            executable_names
+                .iter()
+                .map(move |name| dir.join(name))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_codex_executable_names(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
+    windows_executable_extensions_from_pathext(pathext)
+        .into_iter()
+        .map(|extension| format!("codex{extension}"))
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_executable_extensions_from_pathext(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
+    let raw = pathext
+        .map(|value| value.to_string_lossy().to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    let mut extensions = Vec::new();
+    for part in raw.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let extension = if trimmed.starts_with('.') {
+            trimmed.to_ascii_lowercase()
+        } else {
+            format!(".{}", trimmed.to_ascii_lowercase())
+        };
+        if !extensions.contains(&extension) {
+            extensions.push(extension);
+        }
+    }
+    if extensions.is_empty() {
+        extensions.extend([".com", ".exe", ".bat", ".cmd"].map(String::from));
+    }
+    extensions
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_command_shim(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase()),
+        Some(extension) if extension == "cmd" || extension == "bat"
+    )
+}
+
+fn codex_connector_missing_label() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Windows 找不到 Codex CLI"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "找不到 Codex 訂閱 OAuth connector"
+    }
+}
+
+fn codex_connector_missing_message() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Windows 找不到 Codex CLI；請先安裝 Codex CLI，或把 codex.exe 加到 PATH，再重開 Meeting Copilot。也可以設定 MEETING_COPILOT_CODEX 指到 Codex CLI 執行檔。"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "找不到 Codex connector；請確認 codex 在 PATH，或設定 MEETING_COPILOT_CODEX 指到 Codex CLI 執行檔。"
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cmd_batch_quote_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    let mut escaped = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '%' => escaped.push_str("%%"),
+            '^' => escaped.push_str("^^"),
+            '&' => escaped.push_str("^&"),
+            '|' => escaped.push_str("^|"),
+            '<' => escaped.push_str("^<"),
+            '>' => escaped.push_str("^>"),
+            '(' => escaped.push_str("^("),
+            ')' => escaped.push_str("^)"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn configure_codex_oauth_env(command: &mut Command) {
