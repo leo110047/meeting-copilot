@@ -1,27 +1,41 @@
+use crate::decision_logic::{now_ms, stable_id};
+use crate::desktop_types::{
+    AiSummaryRequest, AiSummarySections, LiveStatePatchEnvelope, MeetingBrief, NativeDecisionState,
+    PrepSummaryRequest, TextProviderStatus, TranscriptCleanupRequest, TranscriptEvent,
+};
+use crate::native_storage::{log_app_error_inner, log_provider_failure, log_provider_usage};
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
 #[derive(Clone)]
-struct CachedTextProviderStatus {
+pub(crate) struct CachedTextProviderStatus {
     status: TextProviderStatus,
     checked_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubscriptionOAuthParse {
+pub(crate) enum SubscriptionOAuthParse {
     Authenticated,
     Unauthenticated,
     Unknown,
 }
 
-static SUBSCRIPTION_OAUTH_STATUS_CACHE: OnceLock<Mutex<Option<CachedTextProviderStatus>>> =
-    OnceLock::new();
+pub(crate) static SUBSCRIPTION_OAUTH_STATUS_CACHE: OnceLock<
+    Mutex<Option<CachedTextProviderStatus>>,
+> = OnceLock::new();
 
-fn subscription_oauth_status() -> TextProviderStatus {
+pub(crate) fn subscription_oauth_status() -> TextProviderStatus {
     let cache = SUBSCRIPTION_OAUTH_STATUS_CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock() {
-        if let Some(cached) = guard.as_ref() {
-            if cached.checked_at.elapsed() < subscription_oauth_status_ttl(&cached.status) {
-                return cached.status.clone();
-            }
-        }
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.checked_at.elapsed() < subscription_oauth_status_ttl(&cached.status)
+    {
+        return cached.status.clone();
     }
     let status = subscription_oauth_status_uncached();
     if let Ok(mut guard) = cache.lock() {
@@ -33,7 +47,7 @@ fn subscription_oauth_status() -> TextProviderStatus {
     status
 }
 
-fn subscription_oauth_status_ttl(status: &TextProviderStatus) -> Duration {
+pub(crate) fn subscription_oauth_status_ttl(status: &TextProviderStatus) -> Duration {
     if status.authenticated {
         Duration::from_secs(30)
     } else {
@@ -41,15 +55,15 @@ fn subscription_oauth_status_ttl(status: &TextProviderStatus) -> Duration {
     }
 }
 
-fn clear_subscription_oauth_status_cache() {
-    if let Some(cache) = SUBSCRIPTION_OAUTH_STATUS_CACHE.get() {
-        if let Ok(mut guard) = cache.lock() {
-            *guard = None;
-        }
+pub(crate) fn clear_subscription_oauth_status_cache() {
+    if let Some(cache) = SUBSCRIPTION_OAUTH_STATUS_CACHE.get()
+        && let Ok(mut guard) = cache.lock()
+    {
+        *guard = None;
     }
 }
 
-fn subscription_oauth_status_uncached() -> TextProviderStatus {
+pub(crate) fn subscription_oauth_status_uncached() -> TextProviderStatus {
     let codex = codex_command_path();
     let mut command = codex_command_from_path(&codex);
     configure_codex_oauth_env(&mut command);
@@ -72,7 +86,9 @@ fn subscription_oauth_status_uncached() -> TextProviderStatus {
                 supports_streaming: true,
                 active: authenticated,
                 status_label: match parsed {
-                    SubscriptionOAuthParse::Authenticated => "已登入 ChatGPT 訂閱 OAuth".to_string(),
+                    SubscriptionOAuthParse::Authenticated => {
+                        "已登入 ChatGPT 訂閱 OAuth".to_string()
+                    }
                     SubscriptionOAuthParse::Unauthenticated => {
                         "尚未登入 ChatGPT 訂閱 OAuth".to_string()
                     }
@@ -121,7 +137,7 @@ fn subscription_oauth_status_uncached() -> TextProviderStatus {
     }
 }
 
-fn parse_subscription_oauth_authenticated(status_text: &str) -> SubscriptionOAuthParse {
+pub(crate) fn parse_subscription_oauth_authenticated(status_text: &str) -> SubscriptionOAuthParse {
     let normalized = status_text
         .to_lowercase()
         .split_whitespace()
@@ -161,7 +177,7 @@ fn parse_subscription_oauth_authenticated(status_text: &str) -> SubscriptionOAut
     }
 }
 
-fn start_subscription_oauth_login() -> Result<(), String> {
+pub(crate) fn start_subscription_oauth_login() -> Result<(), String> {
     clear_subscription_oauth_status_cache();
     let codex = codex_command_path();
     if let Err(error) = codex_command_probe(&codex) {
@@ -211,7 +227,7 @@ echo "Login flow finished. You can close this window."
             let _ = fs::remove_file(&script_path);
             let _ = fs::remove_dir(&script_dir);
         });
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "windows")]
     {
@@ -260,7 +276,7 @@ exit /b %EXIT_CODE%
     }
 }
 
-fn create_private_oauth_temp_dir() -> Result<PathBuf, String> {
+pub(crate) fn create_private_oauth_temp_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -305,7 +321,7 @@ fn create_private_oauth_temp_dir() -> Result<PathBuf, String> {
     }
 }
 
-fn build_ai_summary_prompt(request: &AiSummaryRequest) -> Result<String, String> {
+pub(crate) fn build_ai_summary_prompt(request: &AiSummaryRequest) -> Result<String, String> {
     let payload = serde_json::to_string(request).map_err(|error| error.to_string())?;
     Ok(format!(
         r#"You are Meeting Copilot's subscription OAuth text decision provider.
@@ -325,7 +341,7 @@ Meeting payload:
     ))
 }
 
-fn build_prep_summary_prompt(request: &PrepSummaryRequest) -> Result<String, String> {
+pub(crate) fn build_prep_summary_prompt(request: &PrepSummaryRequest) -> Result<String, String> {
     let payload = serde_json::to_string(request).map_err(|error| error.to_string())?;
     Ok(format!(
         r#"You are Meeting Copilot's preparation summarizer.
@@ -345,7 +361,7 @@ Prep payload:
     ))
 }
 
-fn cleanup_transcript_text_oauth_inner(
+pub(crate) fn cleanup_transcript_text_oauth_inner(
     text: &str,
     context: &str,
     audit_session_id: Option<&str>,
@@ -406,7 +422,9 @@ fn cleanup_transcript_text_oauth_inner(
     Ok(cleaned)
 }
 
-fn build_transcript_cleanup_prompt(request: &TranscriptCleanupRequest) -> Result<String, String> {
+pub(crate) fn build_transcript_cleanup_prompt(
+    request: &TranscriptCleanupRequest,
+) -> Result<String, String> {
     let payload = serde_json::to_string(request).map_err(|error| error.to_string())?;
     Ok(format!(
         r#"You are Meeting Copilot's transcript cleanup provider.
@@ -427,7 +445,7 @@ Transcript payload:
     ))
 }
 
-fn build_live_state_patch_prompt(
+pub(crate) fn build_live_state_patch_prompt(
     brief: &MeetingBrief,
     events: &[TranscriptEvent],
     local_state: &NativeDecisionState,
@@ -486,11 +504,14 @@ Meeting payload:
     ))
 }
 
-fn run_codex_oauth_prompt(prompt: &str) -> Result<String, String> {
+pub(crate) fn run_codex_oauth_prompt(prompt: &str) -> Result<String, String> {
     run_codex_oauth_prompt_with_timeout(prompt, 60_000)
 }
 
-fn run_codex_oauth_prompt_with_timeout(prompt: &str, timeout_ms: u64) -> Result<String, String> {
+pub(crate) fn run_codex_oauth_prompt_with_timeout(
+    prompt: &str,
+    timeout_ms: u64,
+) -> Result<String, String> {
     let output_path =
         std::env::temp_dir().join(format!("meeting-copilot-ai-summary-{}.txt", now_ms()));
     let codex = codex_command_path();
@@ -581,11 +602,11 @@ fn run_codex_oauth_prompt_with_timeout(prompt: &str, timeout_ms: u64) -> Result<
     output
 }
 
-fn truncate_for_diagnostic(value: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_for_diagnostic(value: &str, max_chars: usize) -> String {
     value.trim().chars().take(max_chars).collect::<String>()
 }
 
-fn parse_live_state_patch(
+pub(crate) fn parse_live_state_patch(
     raw_output: &str,
 ) -> Result<LiveStatePatchEnvelope, (&'static str, String)> {
     let value = parse_json_object_value(raw_output).map_err(|error| ("malformed_json", error))?;
@@ -593,7 +614,7 @@ fn parse_live_state_patch(
     serde_json::from_value(value).map_err(|error| ("schema_validation", error.to_string()))
 }
 
-fn parse_json_object_value(raw_output: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn parse_json_object_value(raw_output: &str) -> Result<serde_json::Value, String> {
     let trimmed = raw_output.trim();
     match serde_json::from_str(trimmed) {
         Ok(value) => Ok(value),
@@ -609,7 +630,7 @@ fn parse_json_object_value(raw_output: &str) -> Result<serde_json::Value, String
     }
 }
 
-fn validate_live_state_patch_value(value: &serde_json::Value) -> Result<(), String> {
+pub(crate) fn validate_live_state_patch_value(value: &serde_json::Value) -> Result<(), String> {
     let object = value
         .as_object()
         .ok_or_else(|| "patch output must be an object".to_string())?;
@@ -660,7 +681,10 @@ fn validate_live_state_patch_value(value: &serde_json::Value) -> Result<(), Stri
     Ok(())
 }
 
-fn reject_nested_full_rewrite(value: &serde_json::Value, path: &str) -> Result<(), String> {
+pub(crate) fn reject_nested_full_rewrite(
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
     match value {
         serde_json::Value::Object(object) => {
             for (key, nested) in object {
@@ -690,7 +714,7 @@ fn reject_nested_full_rewrite(value: &serde_json::Value, path: &str) -> Result<(
     Ok(())
 }
 
-fn codex_command_path() -> PathBuf {
+pub(crate) fn codex_command_path() -> PathBuf {
     if let Ok(path) = std::env::var("MEETING_COPILOT_CODEX") {
         let path = PathBuf::from(path);
         // Return the user-provided path as-is so diagnostics can report the exact override.
@@ -722,7 +746,9 @@ fn codex_command_path() -> PathBuf {
             ] {
                 let path = relative
                     .iter()
-                    .fold(PathBuf::from(&local_app_data), |base, segment| base.join(segment));
+                    .fold(PathBuf::from(&local_app_data), |base, segment| {
+                        base.join(segment)
+                    });
                 if path.exists() {
                     return path;
                 }
@@ -750,7 +776,7 @@ fn codex_command_path() -> PathBuf {
     PathBuf::from("codex")
 }
 
-fn codex_command_probe(codex: &Path) -> Result<(), String> {
+pub(crate) fn codex_command_probe(codex: &Path) -> Result<(), String> {
     let mut command = codex_command_from_path(codex);
     configure_codex_oauth_env(&mut command);
     command.arg("--version");
@@ -778,11 +804,11 @@ fn codex_command_probe(codex: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-fn codex_command_available(codex: &Path) -> bool {
+pub(crate) fn codex_command_available(codex: &Path) -> bool {
     codex_command_probe(codex).is_ok()
 }
 
-fn codex_command_from_path(codex: &Path) -> Command {
+pub(crate) fn codex_command_from_path(codex: &Path) -> Command {
     #[cfg(target_os = "windows")]
     {
         if is_windows_command_shim(codex) {
@@ -794,7 +820,7 @@ fn codex_command_from_path(codex: &Path) -> Command {
     Command::new(codex)
 }
 
-fn run_command_output_with_timeout(
+pub(crate) fn run_command_output_with_timeout(
     command: &mut Command,
     timeout_ms: u64,
 ) -> Result<Output, String> {
@@ -859,23 +885,22 @@ fn run_command_output_with_timeout(
 }
 
 #[cfg(target_os = "windows")]
-fn configure_background_command(command: &mut Command) {
+pub(crate) fn configure_background_command(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(target_os = "windows"))]
-fn configure_background_command(_command: &mut Command) {
-}
+pub(crate) fn configure_background_command(_command: &mut Command) {}
 
 #[cfg(not(target_os = "windows"))]
-fn codex_unix_fallback_candidates() -> &'static [&'static str] {
+pub(crate) fn codex_unix_fallback_candidates() -> &'static [&'static str] {
     &["/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
 }
 
 #[cfg(target_os = "windows")]
-fn codex_path_candidates_from_path() -> Vec<PathBuf> {
+pub(crate) fn codex_path_candidates_from_path() -> Vec<PathBuf> {
     let Some(paths) = std::env::var_os("PATH") else {
         return vec![];
     };
@@ -892,7 +917,7 @@ fn codex_path_candidates_from_path() -> Vec<PathBuf> {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_codex_executable_names(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
+pub(crate) fn windows_codex_executable_names(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
     windows_executable_extensions_from_pathext(pathext)
         .into_iter()
         .map(|extension| format!("codex{extension}"))
@@ -900,7 +925,9 @@ fn windows_codex_executable_names(pathext: Option<&std::ffi::OsStr>) -> Vec<Stri
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_executable_extensions_from_pathext(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
+pub(crate) fn windows_executable_extensions_from_pathext(
+    pathext: Option<&std::ffi::OsStr>,
+) -> Vec<String> {
     let raw = pathext
         .map(|value| value.to_string_lossy().to_string())
         .filter(|value| !value.trim().is_empty())
@@ -927,7 +954,7 @@ fn windows_executable_extensions_from_pathext(pathext: Option<&std::ffi::OsStr>)
 }
 
 #[cfg(target_os = "windows")]
-fn is_windows_command_shim(path: &Path) -> bool {
+pub(crate) fn is_windows_command_shim(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|extension| extension.to_str())
@@ -936,7 +963,7 @@ fn is_windows_command_shim(path: &Path) -> bool {
     )
 }
 
-fn codex_connector_missing_label() -> &'static str {
+pub(crate) fn codex_connector_missing_label() -> &'static str {
     #[cfg(target_os = "windows")]
     {
         "Windows 找不到 Codex CLI"
@@ -947,7 +974,7 @@ fn codex_connector_missing_label() -> &'static str {
     }
 }
 
-fn codex_connector_missing_message() -> &'static str {
+pub(crate) fn codex_connector_missing_message() -> &'static str {
     #[cfg(target_os = "windows")]
     {
         "Windows 找不到 Codex CLI；請先安裝 Codex CLI，或把 codex.exe 加到 PATH，再重開 Meeting Copilot。也可以設定 MEETING_COPILOT_CODEX 指到 Codex CLI 執行檔。"
@@ -959,7 +986,7 @@ fn codex_connector_missing_message() -> &'static str {
 }
 
 #[cfg(target_os = "windows")]
-fn cmd_batch_quote_path(path: &Path) -> String {
+pub(crate) fn cmd_batch_quote_path(path: &Path) -> String {
     let value = path.display().to_string();
     let mut escaped = String::from("\"");
     for character in value.chars() {
@@ -979,7 +1006,7 @@ fn cmd_batch_quote_path(path: &Path) -> String {
     escaped
 }
 
-fn configure_codex_oauth_env(command: &mut Command) {
+pub(crate) fn configure_codex_oauth_env(command: &mut Command) {
     if let Ok(home) = std::env::var("HOME") {
         command.env("HOME", &home);
         let codex_home = PathBuf::from(&home).join(".codex");
@@ -1000,11 +1027,11 @@ fn configure_codex_oauth_env(command: &mut Command) {
     }
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn parse_ai_summary_sections(raw_output: &str) -> Result<AiSummarySections, String> {
+pub(crate) fn parse_ai_summary_sections(raw_output: &str) -> Result<AiSummarySections, String> {
     let trimmed = raw_output.trim();
     serde_json::from_str(trimmed)
         .or_else(|_| {
@@ -1021,7 +1048,7 @@ fn parse_ai_summary_sections(raw_output: &str) -> Result<AiSummarySections, Stri
         })
 }
 
-fn parse_prep_summary_points(raw_output: &str) -> Result<Vec<String>, String> {
+pub(crate) fn parse_prep_summary_points(raw_output: &str) -> Result<Vec<String>, String> {
     let value = parse_json_object_value(raw_output).map_err(|error| {
         format!("subscription OAuth provider returned invalid prep JSON: {error}")
     })?;
@@ -1038,7 +1065,7 @@ fn parse_prep_summary_points(raw_output: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn parse_transcript_cleanup_text(raw_output: &str) -> Result<String, String> {
+pub(crate) fn parse_transcript_cleanup_text(raw_output: &str) -> Result<String, String> {
     let value = parse_json_object_value(raw_output).map_err(|error| {
         format!("subscription OAuth provider returned invalid cleanup JSON: {error}")
     })?;

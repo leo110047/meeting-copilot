@@ -1,6 +1,36 @@
+use crate::decision_logic::{
+    derive_decision_state, derive_suggestions, detect_language, now_ms, stable_id,
+};
+use crate::desktop_types::{
+    HelperTranscriptLine, IngestTranscriptResponse, NativeTranscriptionErrorEvent,
+    NativeTranscriptionRequest, NativeTranscriptionStartResponse, PersistedSummary,
+    PrepDictationStartResponse, TranscriptEvent, TranscriptInput,
+};
+use crate::macos_speech_bridge::{
+    MACOS_SPEECH_BRIDGES, start_macos_prep_dictation_bridge, start_macos_speech_bridge,
+    stop_macos_prep_dictation_bridge, stop_macos_speech_bridge,
+};
+use crate::native_storage::{
+    ensure_session_exists, insert_decision_snapshot, insert_suggestion, insert_transcript_event,
+    log_app_error_inner, native_speech_helper_path, native_speech_provider_id,
+};
+use crate::oauth_provider::cleanup_transcript_text_oauth_inner;
+use crate::shell_storage::{app_db_path, open_db, set_listening_window_mode, show_main_window};
+use crate::{LIVE_SESSIONS, NATIVE_TRANSCRIBERS, PREP_DICTATION};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+use tauri::Emitter;
+
 #[tauri::command]
 #[cfg(target_os = "macos")]
-fn start_prep_dictation(app: tauri::AppHandle) -> Result<PrepDictationStartResponse, String> {
+pub(crate) fn start_prep_dictation(
+    app: tauri::AppHandle,
+) -> Result<PrepDictationStartResponse, String> {
     stop_prep_dictation()?;
     let language = "zh-TW".to_string();
     start_macos_prep_dictation_bridge(app, &language)?;
@@ -13,7 +43,9 @@ fn start_prep_dictation(app: tauri::AppHandle) -> Result<PrepDictationStartRespo
 
 #[tauri::command]
 #[cfg(not(target_os = "macos"))]
-fn start_prep_dictation(app: tauri::AppHandle) -> Result<PrepDictationStartResponse, String> {
+pub(crate) fn start_prep_dictation(
+    app: tauri::AppHandle,
+) -> Result<PrepDictationStartResponse, String> {
     stop_prep_dictation()?;
     let language = "zh-TW".to_string();
     let helper_path = native_speech_helper_path()?;
@@ -111,40 +143,40 @@ fn start_prep_dictation(app: tauri::AppHandle) -> Result<PrepDictationStartRespo
 }
 
 #[tauri::command]
-fn stop_prep_dictation() -> Result<(), String> {
+pub(crate) fn stop_prep_dictation() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         stop_macos_prep_dictation_bridge()?;
     }
-    if let Some(dictation) = PREP_DICTATION.get() {
-        if let Some(mut child) = dictation.lock().map_err(|error| error.to_string())?.take() {
-            if let Err(error) = child.kill() {
-                let _ = log_app_error_inner(
-                    None,
-                    "prep_dictation.stop.kill",
-                    "native",
-                    "warning",
-                    &error.to_string(),
-                    serde_json::json!({}),
-                );
-            }
-            if let Err(error) = child.wait() {
-                let _ = log_app_error_inner(
-                    None,
-                    "prep_dictation.stop.wait",
-                    "native",
-                    "warning",
-                    &error.to_string(),
-                    serde_json::json!({}),
-                );
-            }
+    if let Some(dictation) = PREP_DICTATION.get()
+        && let Some(mut child) = dictation.lock().map_err(|error| error.to_string())?.take()
+    {
+        if let Err(error) = child.kill() {
+            let _ = log_app_error_inner(
+                None,
+                "prep_dictation.stop.kill",
+                "native",
+                "warning",
+                &error.to_string(),
+                serde_json::json!({}),
+            );
+        }
+        if let Err(error) = child.wait() {
+            let _ = log_app_error_inner(
+                None,
+                "prep_dictation.stop.wait",
+                "native",
+                "warning",
+                &error.to_string(),
+                serde_json::json!({}),
+            );
         }
     }
     Ok(())
 }
 
 #[tauri::command]
-fn start_native_transcription(
+pub(crate) fn start_native_transcription(
     app: tauri::AppHandle,
     session_id: String,
     request: Option<NativeTranscriptionRequest>,
@@ -166,17 +198,14 @@ fn start_native_transcription(
         vec![source.clone()]
     };
     let mut processes = vec![];
-    let mut bridge_sources = vec![];
+    #[cfg(target_os = "macos")]
+    let mut bridge_sources: Vec<String> = vec![];
     for helper_source in requested_sources {
         #[cfg(target_os = "macos")]
         {
             if helper_source == "mic" || helper_source == "system" {
-                match start_macos_speech_bridge(
-                    app.clone(),
-                    &session_id,
-                    &helper_source,
-                    &language,
-                ) {
+                match start_macos_speech_bridge(app.clone(), &session_id, &helper_source, &language)
+                {
                     Ok(()) => {
                         bridge_sources.push(helper_source);
                         continue;
@@ -217,9 +246,12 @@ fn start_native_transcription(
                 let _ = stale_child.kill();
                 let _ = stale_child.wait();
             }
-            transcribers.insert(key, process.child.take().ok_or_else(|| {
-                format!("native speech helper child missing for {}", process.source)
-            })?);
+            transcribers.insert(
+                key,
+                process.child.take().ok_or_else(|| {
+                    format!("native speech helper child missing for {}", process.source)
+                })?,
+            );
         }
     }
     set_listening_window_mode(&app, true);
@@ -237,14 +269,14 @@ fn start_native_transcription(
     })
 }
 
-struct NativeTranscriberProcess {
+pub(crate) struct NativeTranscriberProcess {
     source: String,
     child: Option<Child>,
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
 }
 
-fn spawn_native_speech_helper(
+pub(crate) fn spawn_native_speech_helper(
     helper_path: &PathBuf,
     language: &str,
     source: &str,
@@ -274,7 +306,7 @@ fn spawn_native_speech_helper(
     })
 }
 
-fn stop_spawned_native_processes(processes: Vec<NativeTranscriberProcess>) {
+pub(crate) fn stop_spawned_native_processes(processes: Vec<NativeTranscriberProcess>) {
     for mut process in processes {
         if let Some(mut child) = process.child.take() {
             let _ = child.kill();
@@ -283,7 +315,7 @@ fn stop_spawned_native_processes(processes: Vec<NativeTranscriberProcess>) {
     }
 }
 
-fn install_native_transcriber_io(
+pub(crate) fn install_native_transcriber_io(
     app: tauri::AppHandle,
     session_id: String,
     mut process: NativeTranscriberProcess,
@@ -362,7 +394,7 @@ fn install_native_transcriber_io(
     });
 }
 
-fn handle_native_transcript_line(
+pub(crate) fn handle_native_transcript_line(
     app: &tauri::AppHandle,
     session_id: &str,
     helper_line: HelperTranscriptLine,
@@ -421,11 +453,15 @@ fn handle_native_transcript_line(
     }
 }
 
-fn native_transcriber_key(session_id: &str, source: &str) -> String {
+pub(crate) fn native_transcriber_key(session_id: &str, source: &str) -> String {
     format!("{session_id}::{source}")
 }
 
-fn monitor_native_transcriber_exit(app: tauri::AppHandle, session_id: String, source: String) {
+pub(crate) fn monitor_native_transcriber_exit(
+    app: tauri::AppHandle,
+    session_id: String,
+    source: String,
+) {
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_millis(250));
@@ -481,7 +517,7 @@ fn monitor_native_transcriber_exit(app: tauri::AppHandle, session_id: String, so
     });
 }
 
-fn emit_native_transcriber_exit(
+pub(crate) fn emit_native_transcriber_exit(
     app: &tauri::AppHandle,
     session_id: &str,
     source: &str,
@@ -502,21 +538,16 @@ fn emit_native_transcriber_exit(
     emit_native_transcription_error(app, message, source);
 }
 
-fn emit_native_transcription_error(
+pub(crate) fn emit_native_transcription_error(
     app: &tauri::AppHandle,
     message: impl Into<String>,
     source: &str,
 ) {
     let message = message.into();
-    emit_native_transcription_error_with_code(
-        app,
-        message,
-        source,
-        None,
-    );
+    emit_native_transcription_error_with_code(app, message, source, None);
 }
 
-fn emit_native_transcription_error_with_code(
+pub(crate) fn emit_native_transcription_error_with_code(
     app: &tauri::AppHandle,
     message: impl Into<String>,
     source: &str,
@@ -531,7 +562,7 @@ fn emit_native_transcription_error_with_code(
     let _ = app.emit("native_transcription_error", payload);
 }
 
-fn classify_native_transcription_error(message: &str) -> String {
+pub(crate) fn classify_native_transcription_error(message: &str) -> String {
     let lowered = message.to_lowercase();
     if lowered.contains("no speech detected")
         || message.contains("未偵測到語音")
@@ -552,15 +583,15 @@ fn classify_native_transcription_error(message: &str) -> String {
     "native_transcription_error".to_string()
 }
 
-fn has_active_native_transcribers(session_id: &str) -> bool {
+pub(crate) fn has_active_native_transcribers(session_id: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        if let Some(bridges) = MACOS_SPEECH_BRIDGES.get() {
-            if let Ok(bridges) = bridges.lock() {
-                let prefix = format!("{session_id}::");
-                if bridges.keys().any(|key| key.starts_with(&prefix)) {
-                    return true;
-                }
+        if let Some(bridges) = MACOS_SPEECH_BRIDGES.get()
+            && let Ok(bridges) = bridges.lock()
+        {
+            let prefix = format!("{session_id}::");
+            if bridges.keys().any(|key| key.starts_with(&prefix)) {
+                return true;
             }
         }
     }
@@ -575,13 +606,14 @@ fn has_active_native_transcribers(session_id: &str) -> bool {
 }
 
 #[tauri::command]
-fn stop_native_transcription(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+pub(crate) fn stop_native_transcription(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     stop_macos_speech_bridge(&session_id, None)?;
     if let Some(transcribers) = NATIVE_TRANSCRIBERS.get() {
-        let mut transcribers = transcribers
-            .lock()
-            .map_err(|error| error.to_string())?;
+        let mut transcribers = transcribers.lock().map_err(|error| error.to_string())?;
         let prefix = format!("{session_id}::");
         let keys = transcribers
             .keys()
@@ -620,54 +652,60 @@ fn stop_native_transcription(app: tauri::AppHandle, session_id: String) -> Resul
     Ok(())
 }
 
-fn stop_all_native_transcribers(app: &tauri::AppHandle) {
+pub(crate) fn stop_all_native_transcribers(app: &tauri::AppHandle) {
     let _ = stop_prep_dictation();
     #[cfg(target_os = "macos")]
     {
-        if let Some(bridges) = MACOS_SPEECH_BRIDGES.get() {
-            if let Ok(bridges) = bridges.lock() {
-                let session_ids = bridges
-                    .keys()
-                    .filter_map(|key| key.split_once("::").map(|(session_id, _)| session_id.to_string()))
-                    .collect::<Vec<_>>();
-                drop(bridges);
-                for session_id in session_ids {
-                    let _ = stop_macos_speech_bridge(&session_id, None);
-                }
+        if let Some(bridges) = MACOS_SPEECH_BRIDGES.get()
+            && let Ok(bridges) = bridges.lock()
+        {
+            let session_ids = bridges
+                .keys()
+                .filter_map(|key| {
+                    key.split_once("::")
+                        .map(|(session_id, _)| session_id.to_string())
+                })
+                .collect::<Vec<_>>();
+            drop(bridges);
+            for session_id in session_ids {
+                let _ = stop_macos_speech_bridge(&session_id, None);
             }
         }
     }
-    if let Some(transcribers) = NATIVE_TRANSCRIBERS.get() {
-        if let Ok(mut transcribers) = transcribers.lock() {
-            for (key, mut child) in transcribers.drain() {
-                let session_id = key.split_once("::").map(|(session_id, _)| session_id).unwrap_or(&key);
-                if let Err(error) = child.kill() {
-                    let _ = log_app_error_inner(
-                        Some(session_id),
-                        "native_transcription.stop_all.kill",
-                        "native",
-                        "warning",
-                        &error.to_string(),
-                        serde_json::json!({}),
-                    );
-                }
-                if let Err(error) = child.wait() {
-                    let _ = log_app_error_inner(
-                        Some(session_id),
-                        "native_transcription.stop_all.wait",
-                        "native",
-                        "warning",
-                        &error.to_string(),
-                        serde_json::json!({}),
-                    );
-                }
+    if let Some(transcribers) = NATIVE_TRANSCRIBERS.get()
+        && let Ok(mut transcribers) = transcribers.lock()
+    {
+        for (key, mut child) in transcribers.drain() {
+            let session_id = key
+                .split_once("::")
+                .map(|(session_id, _)| session_id)
+                .unwrap_or(&key);
+            if let Err(error) = child.kill() {
+                let _ = log_app_error_inner(
+                    Some(session_id),
+                    "native_transcription.stop_all.kill",
+                    "native",
+                    "warning",
+                    &error.to_string(),
+                    serde_json::json!({}),
+                );
+            }
+            if let Err(error) = child.wait() {
+                let _ = log_app_error_inner(
+                    Some(session_id),
+                    "native_transcription.stop_all.wait",
+                    "native",
+                    "warning",
+                    &error.to_string(),
+                    serde_json::json!({}),
+                );
             }
         }
     }
     set_listening_window_mode(app, false);
 }
 
-fn ingest_transcript_inner(
+pub(crate) fn ingest_transcript_inner(
     session_id: String,
     input: TranscriptInput,
 ) -> Result<IngestTranscriptResponse, String> {
@@ -682,9 +720,11 @@ fn ingest_transcript_inner(
 
         let source = input.source.unwrap_or_else(|| "mic".to_string());
         let text = input.text;
-        if let Some(existing) = session.events.iter().find(|event| {
-            event.source == source && transcript_text_matches(&event.text, &text)
-        }) {
+        if let Some(existing) = session
+            .events
+            .iter()
+            .find(|event| event.source == source && transcript_text_matches(&event.text, &text))
+        {
             let event = existing.clone();
             let events_snapshot = session.events.clone();
             (event, session.brief.clone(), events_snapshot, false)
@@ -756,33 +796,15 @@ fn ingest_transcript_inner(
     })
 }
 
-fn transcript_text_matches(left: &str, right: &str) -> bool {
+pub(crate) fn transcript_text_matches(left: &str, right: &str) -> bool {
     normalize_transcript_text(left) == normalize_transcript_text(right)
 }
 
-fn normalize_transcript_text(value: &str) -> String {
+pub(crate) fn normalize_transcript_text(value: &str) -> String {
     value
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .trim_matches(|ch: char| ch.is_ascii_punctuation() || "。！？；，、".contains(ch))
         .to_lowercase()
-}
-
-#[tauri::command]
-fn stop_session(session_id: String) -> Result<(), String> {
-    if let Some(sessions) = LIVE_SESSIONS.get() {
-        sessions
-            .lock()
-            .map_err(|error| error.to_string())?
-            .remove(&session_id);
-    }
-    let db_path = app_db_path()?;
-    let conn = open_db(&db_path)?;
-    conn.execute(
-        "UPDATE meeting_sessions SET ended_at = ?1 WHERE id = ?2",
-        params![now_ms_string(), session_id],
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(())
 }

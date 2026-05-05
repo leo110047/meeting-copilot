@@ -1,11 +1,28 @@
+use crate::decision_logic::{now_ms, now_ms_string, stable_id};
+use crate::desktop_types::desktop_shell_plan;
+use crate::desktop_types::{
+    AppErrorLogRecord, HelperHealthLine, MeetingBrief, NativeDecisionState, NativeSuggestion,
+    NativeTranscriberHealth, TranscriptEvent,
+};
+use crate::shell_storage::{app_db_path, open_db};
+use crate::{LIVE_SESSIONS, NATIVE_SPEECH_HELPER};
+use rusqlite::{Connection, params};
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
+
 #[cfg(target_os = "windows")]
-fn app_data_dir() -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
     let app_data = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
     Ok(PathBuf::from(app_data).join("Meeting Copilot"))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn app_data_dir() -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     Ok(PathBuf::from(home)
         .join(".local")
@@ -13,7 +30,7 @@ fn app_data_dir() -> Result<PathBuf, String> {
         .join("meeting-copilot"))
 }
 
-fn ensure_session_exists(session_id: &str) -> Result<(), String> {
+pub(crate) fn ensure_session_exists(session_id: &str) -> Result<(), String> {
     let sessions = LIVE_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
     if sessions
         .lock()
@@ -26,7 +43,7 @@ fn ensure_session_exists(session_id: &str) -> Result<(), String> {
     }
 }
 
-fn native_speech_provider_id() -> &'static str {
+pub(crate) fn native_speech_provider_id() -> &'static str {
     #[cfg(target_os = "macos")]
     {
         "macos-speech-native"
@@ -41,7 +58,7 @@ fn native_speech_provider_id() -> &'static str {
     }
 }
 
-fn native_speech_helper_path() -> Result<PathBuf, String> {
+pub(crate) fn native_speech_helper_path() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let host = rust_host_triple();
     let dev_binary = if cfg!(target_os = "windows") {
@@ -73,7 +90,7 @@ fn native_speech_helper_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_speech_bridge_path() -> Result<PathBuf, String> {
+pub(crate) fn macos_speech_bridge_path() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let dev_bridge = cwd
         .join("src-tauri")
@@ -100,7 +117,7 @@ fn macos_speech_bridge_path() -> Result<PathBuf, String> {
     Err("macOS speech bridge not found".to_string())
 }
 
-fn run_native_transcriber_health_check(
+pub(crate) fn run_native_transcriber_health_check(
     helper_path: &PathBuf,
     source: &str,
 ) -> Result<NativeTranscriberHealth, String> {
@@ -153,13 +170,12 @@ fn run_native_transcriber_health_check(
                 stderr_text.trim()
             )
         })?;
-    let helper_health: HelperHealthLine =
-        serde_json::from_str(health_line).map_err(|error| {
-            format!(
-                "native speech health check returned invalid JSON: {error}; stderr={}",
-                stderr_text.trim()
-            )
-        })?;
+    let helper_health: HelperHealthLine = serde_json::from_str(health_line).map_err(|error| {
+        format!(
+            "native speech health check returned invalid JSON: {error}; stderr={}",
+            stderr_text.trim()
+        )
+    })?;
     let stderr_error = stderr_text.trim();
     let last_error = helper_health.last_error.or_else(|| {
         if stderr_error.is_empty() {
@@ -181,7 +197,7 @@ fn run_native_transcriber_health_check(
     })
 }
 
-fn rust_host_triple() -> &'static str {
+pub(crate) fn rust_host_triple() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         "aarch64-apple-darwin"
@@ -209,7 +225,7 @@ fn rust_host_triple() -> &'static str {
     }
 }
 
-fn insert_session(
+pub(crate) fn insert_session(
     conn: &Connection,
     brief: &MeetingBrief,
     text_provider_enabled: bool,
@@ -240,7 +256,10 @@ fn insert_session(
     Ok(())
 }
 
-fn insert_transcript_event(conn: &Connection, event: &TranscriptEvent) -> Result<(), String> {
+pub(crate) fn insert_transcript_event(
+    conn: &Connection,
+    event: &TranscriptEvent,
+) -> Result<(), String> {
     conn.execute(
         "INSERT OR IGNORE INTO transcript_events
         (id, session_id, source, speaker, speaker_confidence, language, language_segments_json,
@@ -263,7 +282,10 @@ fn insert_transcript_event(conn: &Connection, event: &TranscriptEvent) -> Result
     Ok(())
 }
 
-fn insert_suggestion(conn: &Connection, suggestion: &NativeSuggestion) -> Result<(), String> {
+pub(crate) fn insert_suggestion(
+    conn: &Connection,
+    suggestion: &NativeSuggestion,
+) -> Result<(), String> {
     conn.execute(
         "INSERT OR IGNORE INTO suggestions
         (id, session_id, shown_at, text, reason, trigger_rule_id, confidence, priority, evidence_transcript_ids_json, feedback)
@@ -284,7 +306,7 @@ fn insert_suggestion(conn: &Connection, suggestion: &NativeSuggestion) -> Result
     Ok(())
 }
 
-fn insert_decision_snapshot(
+pub(crate) fn insert_decision_snapshot(
     conn: &Connection,
     snapshot_id: &str,
     session_id: &str,
@@ -293,7 +315,7 @@ fn insert_decision_snapshot(
     insert_decision_snapshot_with_source(conn, snapshot_id, session_id, decision_state, None)
 }
 
-fn insert_decision_snapshot_with_source(
+pub(crate) fn insert_decision_snapshot_with_source(
     conn: &Connection,
     snapshot_id: &str,
     session_id: &str,
@@ -316,32 +338,42 @@ fn insert_decision_snapshot_with_source(
     Ok(())
 }
 
-fn insert_llm_usage_log(
+pub(crate) struct LlmUsageLogInput<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) call_type: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) prompt_version: &'a str,
+    pub(crate) prompt: &'a str,
+    pub(crate) output: &'a str,
+    pub(crate) latency_ms: i64,
+}
+
+pub(crate) fn insert_llm_usage_log(
     conn: &Connection,
-    session_id: &str,
-    call_type: &str,
-    provider: &str,
-    model: &str,
-    prompt_version: &str,
-    prompt: &str,
-    output: &str,
-    latency_ms: i64,
+    input: LlmUsageLogInput<'_>,
 ) -> Result<(), String> {
     conn.execute(
         "INSERT INTO llm_usage_logs
         (id, session_id, call_type, provider, model, prompt_version, prompt_hash, input_tokens, cached_input_tokens, output_tokens, audio_input_tokens, estimated_cost_usd, latency_ms, created_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, NULL, NULL, ?10, ?11)",
         params![
-            stable_id(&format!("usage:{session_id}:{call_type}:{provider}:{}", now_ms())),
-            session_id,
-            call_type,
-            provider,
-            model,
-            prompt_version,
-            stable_id(prompt),
-            estimate_tokens(prompt),
-            estimate_tokens(output),
-            latency_ms,
+            stable_id(&format!(
+                "usage:{}:{}:{}:{}",
+                input.session_id,
+                input.call_type,
+                input.provider,
+                now_ms()
+            )),
+            input.session_id,
+            input.call_type,
+            input.provider,
+            input.model,
+            input.prompt_version,
+            stable_id(input.prompt),
+            estimate_tokens(input.prompt),
+            estimate_tokens(input.output),
+            input.latency_ms,
             now_ms_string()
         ],
     )
@@ -349,7 +381,10 @@ fn insert_llm_usage_log(
     Ok(())
 }
 
-fn insert_app_error_log(conn: &Connection, record: &AppErrorLogRecord) -> Result<(), String> {
+pub(crate) fn insert_app_error_log(
+    conn: &Connection,
+    record: &AppErrorLogRecord,
+) -> Result<(), String> {
     conn.execute(
         "INSERT INTO app_error_logs
         (id, session_id, stage, source, severity, message, detail_json, created_at)
@@ -369,7 +404,7 @@ fn insert_app_error_log(conn: &Connection, record: &AppErrorLogRecord) -> Result
     Ok(())
 }
 
-fn list_app_error_logs(
+pub(crate) fn list_app_error_logs(
     conn: &Connection,
     session_id: Option<&str>,
 ) -> Result<Vec<AppErrorLogRecord>, String> {
@@ -426,7 +461,7 @@ fn list_app_error_logs(
     Ok(records)
 }
 
-fn log_app_error_inner(
+pub(crate) fn log_app_error_inner(
     session_id: Option<&str>,
     stage: &str,
     source: &str,
@@ -457,7 +492,7 @@ fn log_app_error_inner(
     Ok(record.id)
 }
 
-fn log_provider_usage(
+pub(crate) fn log_provider_usage(
     audit_id: &str,
     call_type: &str,
     prompt_version: &str,
@@ -469,18 +504,20 @@ fn log_provider_usage(
     let conn = open_db(&db_path)?;
     insert_llm_usage_log(
         &conn,
-        audit_id,
-        call_type,
-        "codex-chatgpt-oauth",
-        "subscription_oauth",
-        prompt_version,
-        prompt,
-        output,
-        latency_ms,
+        LlmUsageLogInput {
+            session_id: audit_id,
+            call_type,
+            provider: "codex-chatgpt-oauth",
+            model: "subscription_oauth",
+            prompt_version,
+            prompt,
+            output,
+            latency_ms,
+        },
     )
 }
 
-fn log_provider_failure(
+pub(crate) fn log_provider_failure(
     audit_id: &str,
     call_type: &str,
     prompt_version: &str,
@@ -519,7 +556,7 @@ fn log_provider_failure(
     Ok(())
 }
 
-fn log_extraction_failure(
+pub(crate) fn log_extraction_failure(
     session_id: &str,
     failure_kind: &str,
     raw_output_ref: &str,
@@ -554,6 +591,6 @@ fn log_extraction_failure(
     Ok(())
 }
 
-fn estimate_tokens(text: &str) -> i64 {
+pub(crate) fn estimate_tokens(text: &str) -> i64 {
     ((text.chars().count() as f64) / 4.0).ceil() as i64
 }

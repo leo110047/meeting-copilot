@@ -1,10 +1,52 @@
+use crate::commands_audio::ingest_transcript_inner;
+use crate::decision_logic::{
+    apply_live_state_patch, default_brief, derive_decision_state, derive_suggestions, now_ms,
+    now_ms_string, stable_id,
+};
+use crate::desktop_types::desktop_shell_plan;
+use crate::desktop_types::{
+    AiSummaryRequest, AiSummaryResponse, AppErrorLogInput, AppErrorLogRecord, DesktopShellPlan,
+    DroppedContextFile, IngestTranscriptResponse, NativeLiveSession, NativeTranscriberHealth,
+    NativeTranscriberHealthRequest, PersistedSummary, PrepSummaryRequest, PrepSummaryResponse,
+    StartSessionRequest, StartSessionResponse, TextProviderStatus, TranscriptCleanupRequest,
+    TranscriptCleanupResponse, TranscriptInput,
+};
+use crate::macos_speech_bridge::{
+    macos_speech_bridge_health, macos_speech_bridge_status, macos_speech_bridge_status_error,
+    request_macos_speech_bridge_permissions,
+};
+use crate::native_storage::{
+    LlmUsageLogInput, insert_decision_snapshot_with_source, insert_llm_usage_log, insert_session,
+    insert_suggestion, list_app_error_logs, log_app_error_inner, log_extraction_failure,
+    log_provider_failure, log_provider_usage, native_speech_helper_path, native_speech_provider_id,
+    run_native_transcriber_health_check,
+};
+use crate::oauth_provider::{
+    build_ai_summary_prompt, build_live_state_patch_prompt, build_prep_summary_prompt,
+    cleanup_transcript_text_oauth_inner, parse_ai_summary_sections, parse_live_state_patch,
+    parse_prep_summary_points, run_codex_oauth_prompt, run_codex_oauth_prompt_with_timeout,
+    start_subscription_oauth_login, subscription_oauth_status,
+};
+use crate::shell_storage::{
+    app_db_path, open_db, read_dropped_context_file, set_native_window_opacity,
+};
+use crate::{DROP_READ_GRANTS, LIVE_SESSIONS};
+use rusqlite::params;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Mutex;
+
 #[tauri::command]
-fn desktop_shell_plan_command() -> DesktopShellPlan {
+pub(crate) fn desktop_shell_plan_command() -> DesktopShellPlan {
     desktop_shell_plan()
 }
 
 #[tauri::command]
-fn start_session(request: Option<StartSessionRequest>) -> Result<StartSessionResponse, String> {
+pub(crate) fn start_session(
+    request: Option<StartSessionRequest>,
+) -> Result<StartSessionResponse, String> {
     let text_provider_enabled = request
         .as_ref()
         .and_then(|body| body.text_provider_enabled)
@@ -39,7 +81,25 @@ fn start_session(request: Option<StartSessionRequest>) -> Result<StartSessionRes
 }
 
 #[tauri::command]
-fn ingest_transcript(
+pub(crate) fn stop_session(session_id: String) -> Result<(), String> {
+    if let Some(sessions) = LIVE_SESSIONS.get() {
+        sessions
+            .lock()
+            .map_err(|error| error.to_string())?
+            .remove(&session_id);
+    }
+    let db_path = app_db_path()?;
+    let conn = open_db(&db_path)?;
+    conn.execute(
+        "UPDATE meeting_sessions SET ended_at = ?1 WHERE id = ?2",
+        params![now_ms_string(), session_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn ingest_transcript(
     session_id: String,
     input: TranscriptInput,
 ) -> Result<IngestTranscriptResponse, String> {
@@ -47,30 +107,13 @@ fn ingest_transcript(
 }
 
 #[tauri::command]
-fn native_transcriber_health(request: Option<NativeTranscriberHealthRequest>) -> NativeTranscriberHealth {
-    let source = request
-        .and_then(|body| body.source)
-        .unwrap_or_else(|| "mic".to_string());
-    native_transcriber_health_for_source(&source).unwrap_or_else(|error| NativeTranscriberHealth {
-            provider_id: native_speech_provider_id().to_string(),
-            kind: "stt".to_string(),
-            ready: false,
-            supports_streaming: true,
-            supports_diarization: false,
-            supports_source_hints: true,
-            platform: desktop_shell_plan(),
-            last_error: Some(error),
-        })
-}
-
-#[tauri::command]
-fn request_native_audio_permissions(
+pub(crate) fn native_transcriber_health(
     request: Option<NativeTranscriberHealthRequest>,
 ) -> NativeTranscriberHealth {
     let source = request
         .and_then(|body| body.source)
         .unwrap_or_else(|| "mic".to_string());
-    request_native_audio_permissions_for_source(&source).unwrap_or_else(|error| NativeTranscriberHealth {
+    native_transcriber_health_for_source(&source).unwrap_or_else(|error| NativeTranscriberHealth {
         provider_id: native_speech_provider_id().to_string(),
         kind: "stt".to_string(),
         ready: false,
@@ -82,7 +125,30 @@ fn request_native_audio_permissions(
     })
 }
 
-fn native_transcriber_health_for_source(source: &str) -> Result<NativeTranscriberHealth, String> {
+#[tauri::command]
+pub(crate) fn request_native_audio_permissions(
+    request: Option<NativeTranscriberHealthRequest>,
+) -> NativeTranscriberHealth {
+    let source = request
+        .and_then(|body| body.source)
+        .unwrap_or_else(|| "mic".to_string());
+    request_native_audio_permissions_for_source(&source).unwrap_or_else(|error| {
+        NativeTranscriberHealth {
+            provider_id: native_speech_provider_id().to_string(),
+            kind: "stt".to_string(),
+            ready: false,
+            supports_streaming: true,
+            supports_diarization: false,
+            supports_source_hints: true,
+            platform: desktop_shell_plan(),
+            last_error: Some(error),
+        }
+    })
+}
+
+pub(crate) fn native_transcriber_health_for_source(
+    source: &str,
+) -> Result<NativeTranscriberHealth, String> {
     let sources = if source == "mixed" {
         vec!["mic", "system"]
     } else {
@@ -117,7 +183,10 @@ fn native_transcriber_health_for_source(source: &str) -> Result<NativeTranscribe
             }
         }
         let helper_path = native_speech_helper_path()?;
-        checks.push(run_native_transcriber_health_check(&helper_path, helper_source)?);
+        checks.push(run_native_transcriber_health_check(
+            &helper_path,
+            helper_source,
+        )?);
     }
     let mut combined = checks
         .first()
@@ -126,13 +195,7 @@ fn native_transcriber_health_for_source(source: &str) -> Result<NativeTranscribe
     combined.ready = checks.iter().all(|check| check.ready);
     let errors: Vec<String> = checks
         .into_iter()
-        .filter_map(|check| {
-            if check.ready {
-                None
-            } else {
-                check.last_error
-            }
-        })
+        .filter_map(|check| if check.ready { None } else { check.last_error })
         .collect();
     combined.last_error = if combined.ready || errors.is_empty() {
         None
@@ -142,16 +205,16 @@ fn native_transcriber_health_for_source(source: &str) -> Result<NativeTranscribe
     Ok(combined)
 }
 
-fn request_native_audio_permissions_for_source(
+pub(crate) fn request_native_audio_permissions_for_source(
     source: &str,
 ) -> Result<NativeTranscriberHealth, String> {
-    let sources = if source == "mixed" {
-        vec!["mic", "system"]
-    } else {
-        vec![source]
-    };
     #[cfg(target_os = "macos")]
     {
+        let sources = if source == "mixed" {
+            vec!["mic", "system"]
+        } else {
+            vec![source]
+        };
         for helper_source in sources {
             if helper_source == "mic" || helper_source == "system" {
                 let _ = request_macos_speech_bridge_permissions(helper_source, "zh-TW")?;
@@ -162,7 +225,7 @@ fn request_native_audio_permissions_for_source(
 }
 
 #[tauri::command]
-fn request_screen_recording_permission() -> Result<(), String> {
+pub(crate) fn request_screen_recording_permission() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let _ = request_macos_speech_bridge_permissions("system", "zh-TW")?;
@@ -173,7 +236,9 @@ fn request_screen_recording_permission() -> Result<(), String> {
         if status.success() {
             Ok(())
         } else {
-            Err(format!("failed to open Screen Recording settings: {status}"))
+            Err(format!(
+                "failed to open Screen Recording settings: {status}"
+            ))
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -183,17 +248,19 @@ fn request_screen_recording_permission() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn text_provider_status() -> TextProviderStatus {
+pub(crate) fn text_provider_status() -> TextProviderStatus {
     subscription_oauth_status()
 }
 
 #[tauri::command]
-fn start_text_provider_login() -> Result<(), String> {
+pub(crate) fn start_text_provider_login() -> Result<(), String> {
     start_subscription_oauth_login()
 }
 
 #[tauri::command]
-fn generate_ai_summary_oauth(request: AiSummaryRequest) -> Result<AiSummaryResponse, String> {
+pub(crate) fn generate_ai_summary_oauth(
+    request: AiSummaryRequest,
+) -> Result<AiSummaryResponse, String> {
     let status = subscription_oauth_status();
     if !status.authenticated {
         return Err(status
@@ -245,7 +312,9 @@ fn generate_ai_summary_oauth(request: AiSummaryRequest) -> Result<AiSummaryRespo
 }
 
 #[tauri::command]
-fn generate_prep_summary_oauth(request: PrepSummaryRequest) -> Result<PrepSummaryResponse, String> {
+pub(crate) fn generate_prep_summary_oauth(
+    request: PrepSummaryRequest,
+) -> Result<PrepSummaryResponse, String> {
     let status = subscription_oauth_status();
     if !status.authenticated {
         return Err(status
@@ -306,7 +375,7 @@ fn generate_prep_summary_oauth(request: PrepSummaryRequest) -> Result<PrepSummar
 }
 
 #[tauri::command]
-fn cleanup_transcript_text_oauth(
+pub(crate) fn cleanup_transcript_text_oauth(
     request: TranscriptCleanupRequest,
 ) -> Result<TranscriptCleanupResponse, String> {
     let cleaned =
@@ -320,7 +389,7 @@ fn cleanup_transcript_text_oauth(
 }
 
 #[tauri::command]
-fn log_app_error(input: AppErrorLogInput) -> Result<String, String> {
+pub(crate) fn log_app_error(input: AppErrorLogInput) -> Result<String, String> {
     log_app_error_inner(
         input.session_id.as_deref(),
         &input.stage,
@@ -332,14 +401,18 @@ fn log_app_error(input: AppErrorLogInput) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn export_app_error_logs(session_id: Option<String>) -> Result<Vec<AppErrorLogRecord>, String> {
+pub(crate) fn export_app_error_logs(
+    session_id: Option<String>,
+) -> Result<Vec<AppErrorLogRecord>, String> {
     let db_path = app_db_path()?;
     let conn = open_db(&db_path)?;
     list_app_error_logs(&conn, session_id.as_deref())
 }
 
 #[tauri::command]
-fn extract_live_state_patch_oauth(session_id: String) -> Result<IngestTranscriptResponse, String> {
+pub(crate) fn extract_live_state_patch_oauth(
+    session_id: String,
+) -> Result<IngestTranscriptResponse, String> {
     let status = subscription_oauth_status();
     if !status.authenticated {
         return Err(status
@@ -422,14 +495,16 @@ fn extract_live_state_patch_oauth(session_id: String) -> Result<IngestTranscript
     )?;
     insert_llm_usage_log(
         &conn,
-        &session_id,
-        "extract_state_patch",
-        "codex-chatgpt-oauth",
-        "subscription_oauth",
-        "extract_state_patch.oauth.v1",
-        &prompt,
-        &raw_output,
-        now_ms().saturating_sub(started) as i64,
+        LlmUsageLogInput {
+            session_id: &session_id,
+            call_type: "extract_state_patch",
+            provider: "codex-chatgpt-oauth",
+            model: "subscription_oauth",
+            prompt_version: "extract_state_patch.oauth.v1",
+            prompt: &prompt,
+            output: &raw_output,
+            latency_ms: now_ms().saturating_sub(started) as i64,
+        },
     )?;
 
     Ok(IngestTranscriptResponse {
@@ -445,7 +520,7 @@ fn extract_live_state_patch_oauth(session_id: String) -> Result<IngestTranscript
 }
 
 #[tauri::command]
-fn read_dropped_context_files(paths: Vec<String>) -> Vec<DroppedContextFile> {
+pub(crate) fn read_dropped_context_files(paths: Vec<String>) -> Vec<DroppedContextFile> {
     paths
         .into_iter()
         .take(8)
@@ -453,7 +528,7 @@ fn read_dropped_context_files(paths: Vec<String>) -> Vec<DroppedContextFile> {
         .collect()
 }
 
-fn register_drop_read_grants(paths: &[PathBuf]) {
+pub(crate) fn register_drop_read_grants(paths: &[PathBuf]) {
     let mut grants = match DROP_READ_GRANTS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
@@ -469,7 +544,7 @@ fn register_drop_read_grants(paths: &[PathBuf]) {
     }
 }
 
-fn read_granted_dropped_context_file(path: PathBuf) -> DroppedContextFile {
+pub(crate) fn read_granted_dropped_context_file(path: PathBuf) -> DroppedContextFile {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -513,7 +588,7 @@ fn read_granted_dropped_context_file(path: PathBuf) -> DroppedContextFile {
 }
 
 #[tauri::command]
-fn set_window_opacity(app: tauri::AppHandle, percent: u8) -> Result<u8, String> {
+pub(crate) fn set_window_opacity(app: tauri::AppHandle, percent: u8) -> Result<u8, String> {
     let clamped = percent.clamp(10, 100);
     let opacity = clamped as f64 / 100.0;
     set_native_window_opacity(&app, opacity)?;

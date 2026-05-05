@@ -24,14 +24,14 @@ test("Tauri native shell is tray/status-item first", async () => {
     windowsHelper
   ] = await Promise.all([
     readFile(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8"),
-    readFile(new URL("../src-tauri/src/desktop_types.inc.rs", import.meta.url), "utf8"),
-    readFile(new URL("../src-tauri/src/commands_core.inc.rs", import.meta.url), "utf8"),
-    readFile(new URL("../src-tauri/src/commands_audio.inc.rs", import.meta.url), "utf8"),
-    readFile(new URL("../src-tauri/src/shell_storage.inc.rs", import.meta.url), "utf8"),
-    readFile(new URL("../src-tauri/src/oauth_provider.inc.rs", import.meta.url), "utf8"),
-    readFile(new URL("../src-tauri/src/native_storage.inc.rs", import.meta.url), "utf8"),
-    readFile(new URL("../src-tauri/src/decision_logic.inc.rs", import.meta.url), "utf8"),
-    readFile(new URL("../src-tauri/src/macos_speech_bridge.inc.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/desktop_types.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/commands_core.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/commands_audio.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/shell_storage.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/oauth_provider.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/native_storage.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/decision_logic.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/macos_speech_bridge.rs", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/Info.plist", import.meta.url), "utf8"),
@@ -50,7 +50,7 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(cargoToml, /\[target\.'cfg\(target_os = "windows"\)'\.dependencies\]/);
   assert.match(cargoToml, /Win32_UI_WindowsAndMessaging/);
   assert.match(mainRs, /TrayIconBuilder::with_id\("meeting-copilot"\)/);
-  assert.match(mainRs, /#\[serde\(rename_all = "camelCase"\)\]\s*struct DesktopShellPlan/);
+  assert.match(mainRs, /#\[serde\(rename_all = "camelCase"\)\]\s*pub\(crate\) struct DesktopShellPlan/);
   assert.match(mainRs, /start_native_transcription/);
   assert.match(mainRs, /native_transcriber_health/);
   assert.match(mainRs, /request_native_audio_permissions/);

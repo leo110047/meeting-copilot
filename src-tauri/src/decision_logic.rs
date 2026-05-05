@@ -1,6 +1,16 @@
+use crate::desktop_types::{
+    LiveStatePatchEnvelope, MeetingBrief, NativeDecisionState, NativeReadiness, NativeSuggestion,
+    TranscriptEvent,
+};
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 // Fallback heuristic for offline/local operation. Subscription OAuth extraction
 // is the authoritative Layer 3 path when AI is enabled.
-fn derive_decision_state(session_id: &str, events: &[TranscriptEvent]) -> NativeDecisionState {
+pub(crate) fn derive_decision_state(
+    session_id: &str,
+    events: &[TranscriptEvent],
+) -> NativeDecisionState {
     let texts: Vec<String> = events.iter().map(|event| event.text.clone()).collect();
     let joined = texts.join(" ").to_lowercase();
     let mut blockers = vec![];
@@ -53,7 +63,7 @@ fn derive_decision_state(session_id: &str, events: &[TranscriptEvent]) -> Native
     }
 }
 
-fn apply_live_state_patch(
+pub(crate) fn apply_live_state_patch(
     mut state: NativeDecisionState,
     patch: &LiveStatePatchEnvelope,
     events: &[TranscriptEvent],
@@ -198,7 +208,7 @@ fn apply_live_state_patch(
     state
 }
 
-fn push_unique_state_value(
+pub(crate) fn push_unique_state_value(
     target: &mut Vec<serde_json::Value>,
     value: &serde_json::Value,
     max_chars: usize,
@@ -225,7 +235,7 @@ fn push_unique_state_value(
     target.push(normalized);
 }
 
-fn sanitize_evidence(values: &[String], allowed_ids: &HashSet<String>) -> Vec<String> {
+pub(crate) fn sanitize_evidence(values: &[String], allowed_ids: &HashSet<String>) -> Vec<String> {
     values
         .iter()
         .filter(|id| allowed_ids.contains(*id))
@@ -233,7 +243,7 @@ fn sanitize_evidence(values: &[String], allowed_ids: &HashSet<String>) -> Vec<St
         .collect()
 }
 
-fn merge_strings(left: &[String], right: &[String]) -> Vec<String> {
+pub(crate) fn merge_strings(left: &[String], right: &[String]) -> Vec<String> {
     let mut merged = vec![];
     for item in left.iter().chain(right.iter()) {
         if !merged.contains(item) {
@@ -243,7 +253,7 @@ fn merge_strings(left: &[String], right: &[String]) -> Vec<String> {
     merged
 }
 
-fn value_string(value: &serde_json::Value, field: &str) -> String {
+pub(crate) fn value_string(value: &serde_json::Value, field: &str) -> String {
     value
         .get(field)
         .and_then(|value| value.as_str())
@@ -252,7 +262,7 @@ fn value_string(value: &serde_json::Value, field: &str) -> String {
         .to_string()
 }
 
-fn derive_suggestions(
+pub(crate) fn derive_suggestions(
     _brief: &MeetingBrief,
     events: &[TranscriptEvent],
     decision_state: &NativeDecisionState,
@@ -286,7 +296,7 @@ fn derive_suggestions(
     }]
 }
 
-fn default_brief() -> MeetingBrief {
+pub(crate) fn default_brief() -> MeetingBrief {
     MeetingBrief {
         session_id: format!("native_{}", now_ms()),
         project_id: Some("native_default_project".to_string()),
@@ -310,7 +320,7 @@ fn default_brief() -> MeetingBrief {
     }
 }
 
-fn detect_language(text: &str) -> String {
+pub(crate) fn detect_language(text: &str) -> String {
     let has_chinese = text
         .chars()
         .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
@@ -324,23 +334,23 @@ fn detect_language(text: &str) -> String {
     .to_string()
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+pub(crate) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
-fn now_ms() -> u128 {
+pub(crate) fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
 }
 
-fn now_ms_string() -> String {
+pub(crate) fn now_ms_string() -> String {
     // Stable enough for local audit rows without adding a time crate.
     format!("{}", now_ms())
 }
 
-fn stable_id(input: &str) -> String {
+pub(crate) fn stable_id(input: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.as_bytes() {
         hash ^= *byte as u64;

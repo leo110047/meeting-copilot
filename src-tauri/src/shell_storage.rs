@@ -1,4 +1,14 @@
-fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+use crate::commands_audio::{emit_native_transcription_error, stop_all_native_transcribers};
+use crate::desktop_types::DroppedContextFile;
+use crate::{SCHEMA_SQL, TRAY_ICON};
+use rusqlite::Connection;
+use std::fs;
+use std::path::PathBuf;
+use tauri::Manager;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+pub(crate) fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Open Meeting Copilot", true, None::<&str>)?;
     let stop = MenuItem::with_id(app, "stop", "Stop Listening", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -38,7 +48,7 @@ fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn show_main_window(app: &tauri::AppHandle) {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -46,14 +56,17 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-fn set_listening_window_mode(app: &tauri::AppHandle, enabled: bool) {
+pub(crate) fn set_listening_window_mode(app: &tauri::AppHandle, enabled: bool) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_always_on_top(enabled);
     }
 }
 
 #[cfg(target_os = "macos")]
-fn set_native_window_opacity(app: &tauri::AppHandle, opacity: f64) -> Result<(), String> {
+pub(crate) fn set_native_window_opacity(
+    app: &tauri::AppHandle,
+    opacity: f64,
+) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main window not found".to_string())?;
@@ -70,7 +83,10 @@ fn set_native_window_opacity(app: &tauri::AppHandle, opacity: f64) -> Result<(),
 }
 
 #[cfg(target_os = "windows")]
-fn set_native_window_opacity(app: &tauri::AppHandle, opacity: f64) -> Result<(), String> {
+pub(crate) fn set_native_window_opacity(
+    app: &tauri::AppHandle,
+    opacity: f64,
+) -> Result<(), String> {
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetWindowLongW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongW,
@@ -92,12 +108,15 @@ fn set_native_window_opacity(app: &tauri::AppHandle, opacity: f64) -> Result<(),
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn set_native_window_opacity(_app: &tauri::AppHandle, opacity: f64) -> Result<(), String> {
+pub(crate) fn set_native_window_opacity(
+    _app: &tauri::AppHandle,
+    opacity: f64,
+) -> Result<(), String> {
     let _ = opacity;
     Err("native window opacity is not implemented for this platform yet".to_string())
 }
 
-fn open_db(db_path: &PathBuf) -> Result<Connection, String> {
+pub(crate) fn open_db(db_path: &PathBuf) -> Result<Connection, String> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -107,13 +126,13 @@ fn open_db(db_path: &PathBuf) -> Result<Connection, String> {
     Ok(conn)
 }
 
-fn app_db_path() -> Result<PathBuf, String> {
+pub(crate) fn app_db_path() -> Result<PathBuf, String> {
     let base = app_data_dir()?;
     Ok(base.join("meeting-copilot-native.db"))
 }
 
 #[cfg(target_os = "macos")]
-fn app_data_dir() -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     Ok(PathBuf::from(home)
         .join("Library")
@@ -121,7 +140,7 @@ fn app_data_dir() -> Result<PathBuf, String> {
         .join("Meeting Copilot"))
 }
 
-fn read_dropped_context_file(path: PathBuf) -> DroppedContextFile {
+pub(crate) fn read_dropped_context_file(path: PathBuf) -> DroppedContextFile {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())

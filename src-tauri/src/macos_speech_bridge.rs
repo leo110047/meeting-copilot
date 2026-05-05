@@ -1,10 +1,23 @@
-#[cfg(target_os = "macos")]
-type MacosSpeechCallback = unsafe extern "C" fn(*const c_char, *mut c_void);
-#[cfg(target_os = "macos")]
-type MacosSpeechReleaseContext = unsafe extern "C" fn(*mut c_void);
+use crate::commands_audio::{
+    emit_native_transcription_error, emit_native_transcription_error_with_code,
+    handle_native_transcript_line, native_transcriber_key,
+};
+use crate::decision_logic::stable_id;
+use crate::desktop_types::HelperTranscriptLine;
+use crate::native_storage::{log_app_error_inner, macos_speech_bridge_path};
+use crate::oauth_provider::cleanup_transcript_text_oauth_inner;
+use std::collections::HashMap;
+use std::os::raw::{c_char, c_int, c_void};
+use std::sync::{Mutex, OnceLock};
+use tauri::Emitter;
 
 #[cfg(target_os = "macos")]
-type MacosSpeechStartFn = unsafe extern "C" fn(
+pub(crate) type MacosSpeechCallback = unsafe extern "C" fn(*const c_char, *mut c_void);
+#[cfg(target_os = "macos")]
+pub(crate) type MacosSpeechReleaseContext = unsafe extern "C" fn(*mut c_void);
+
+#[cfg(target_os = "macos")]
+pub(crate) type MacosSpeechStartFn = unsafe extern "C" fn(
     *const c_char,
     *const c_char,
     MacosSpeechCallback,
@@ -12,17 +25,18 @@ type MacosSpeechStartFn = unsafe extern "C" fn(
     MacosSpeechReleaseContext,
 ) -> c_int;
 #[cfg(target_os = "macos")]
-type MacosSpeechStopFn = unsafe extern "C" fn(c_int);
+pub(crate) type MacosSpeechStopFn = unsafe extern "C" fn(c_int);
 #[cfg(target_os = "macos")]
-type MacosSpeechHealthFn = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
+pub(crate) type MacosSpeechHealthFn = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
 #[cfg(target_os = "macos")]
-type MacosSpeechStatusFn = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
+pub(crate) type MacosSpeechStatusFn = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
 #[cfg(target_os = "macos")]
-type MacosSpeechRequestPermissionsFn = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
+pub(crate) type MacosSpeechRequestPermissionsFn =
+    unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
-struct MacosSpeechBridgeApi {
+pub(crate) struct MacosSpeechBridgeApi {
     start: MacosSpeechStartFn,
     stop: MacosSpeechStopFn,
     health: MacosSpeechHealthFn,
@@ -32,40 +46,40 @@ struct MacosSpeechBridgeApi {
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
-struct MacosSpeechBridgeStatus {
+pub(crate) struct MacosSpeechBridgeStatus {
     raw: c_int,
 }
 
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_SPEECH_AUTHORIZED: c_int = 1 << 0;
+pub(crate) const MACOS_STATUS_SPEECH_AUTHORIZED: c_int = 1 << 0;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_SPEECH_DENIED: c_int = 1 << 1;
+pub(crate) const MACOS_STATUS_SPEECH_DENIED: c_int = 1 << 1;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_SPEECH_RESTRICTED: c_int = 1 << 2;
+pub(crate) const MACOS_STATUS_SPEECH_RESTRICTED: c_int = 1 << 2;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_SPEECH_NOT_DETERMINED: c_int = 1 << 3;
+pub(crate) const MACOS_STATUS_SPEECH_NOT_DETERMINED: c_int = 1 << 3;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_RECOGNIZER_AVAILABLE: c_int = 1 << 4;
+pub(crate) const MACOS_STATUS_RECOGNIZER_AVAILABLE: c_int = 1 << 4;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_MICROPHONE_AUTHORIZED: c_int = 1 << 5;
+pub(crate) const MACOS_STATUS_MICROPHONE_AUTHORIZED: c_int = 1 << 5;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_MICROPHONE_DENIED: c_int = 1 << 6;
+pub(crate) const MACOS_STATUS_MICROPHONE_DENIED: c_int = 1 << 6;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_MICROPHONE_RESTRICTED: c_int = 1 << 7;
+pub(crate) const MACOS_STATUS_MICROPHONE_RESTRICTED: c_int = 1 << 7;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_MICROPHONE_NOT_DETERMINED: c_int = 1 << 8;
+pub(crate) const MACOS_STATUS_MICROPHONE_NOT_DETERMINED: c_int = 1 << 8;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_SCREEN_CAPTURE_PREFLIGHT: c_int = 1 << 9;
+pub(crate) const MACOS_STATUS_SCREEN_CAPTURE_PREFLIGHT: c_int = 1 << 9;
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_MACOS_13_OR_NEWER: c_int = 1 << 12;
+pub(crate) const MACOS_STATUS_MACOS_13_OR_NEWER: c_int = 1 << 12;
 
 #[cfg(target_os = "macos")]
-struct MacosSpeechBridgeSession {
+pub(crate) struct MacosSpeechBridgeSession {
     handle: c_int,
 }
 
 #[cfg(target_os = "macos")]
-struct MacosSpeechCallbackContext {
+pub(crate) struct MacosSpeechCallbackContext {
     app: tauri::AppHandle,
     session_id: String,
     source: String,
@@ -73,9 +87,10 @@ struct MacosSpeechCallbackContext {
 }
 
 #[cfg(target_os = "macos")]
-static MACOS_SPEECH_BRIDGE_API: OnceLock<Result<MacosSpeechBridgeApi, String>> = OnceLock::new();
+pub(crate) static MACOS_SPEECH_BRIDGE_API: OnceLock<Result<MacosSpeechBridgeApi, String>> =
+    OnceLock::new();
 #[cfg(target_os = "macos")]
-static MACOS_SPEECH_BRIDGES: OnceLock<Mutex<HashMap<String, MacosSpeechBridgeSession>>> =
+pub(crate) static MACOS_SPEECH_BRIDGES: OnceLock<Mutex<HashMap<String, MacosSpeechBridgeSession>>> =
     OnceLock::new();
 
 #[cfg(target_os = "macos")]
@@ -86,23 +101,27 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-const RTLD_NOW: c_int = 0x2;
+pub(crate) const RTLD_NOW: c_int = 0x2;
 
 #[cfg(target_os = "macos")]
-fn macos_speech_bridge_api() -> Result<MacosSpeechBridgeApi, String> {
+pub(crate) fn macos_speech_bridge_api() -> Result<MacosSpeechBridgeApi, String> {
     MACOS_SPEECH_BRIDGE_API
         .get_or_init(load_macos_speech_bridge_api)
         .clone()
 }
 
 #[cfg(target_os = "macos")]
-fn load_macos_speech_bridge_api() -> Result<MacosSpeechBridgeApi, String> {
+pub(crate) fn load_macos_speech_bridge_api() -> Result<MacosSpeechBridgeApi, String> {
     let path = macos_speech_bridge_path()?;
-    let path = std::ffi::CString::new(path.display().to_string()).map_err(|error| error.to_string())?;
+    let path =
+        std::ffi::CString::new(path.display().to_string()).map_err(|error| error.to_string())?;
     unsafe {
         let handle = dlopen(path.as_ptr(), RTLD_NOW);
         if handle.is_null() {
-            return Err(format!("failed to load macOS speech bridge: {}", dlerror_text()));
+            return Err(format!(
+                "failed to load macOS speech bridge: {}",
+                dlerror_text()
+            ));
         }
         Ok(MacosSpeechBridgeApi {
             start: load_symbol(handle, "meeting_copilot_native_speech_start")?,
@@ -125,7 +144,10 @@ where
     let symbol_name = std::ffi::CString::new(name).map_err(|error| error.to_string())?;
     let symbol = unsafe { dlsym(handle, symbol_name.as_ptr()) };
     if symbol.is_null() {
-        return Err(format!("macOS speech bridge symbol missing: {name}: {}", dlerror_text()));
+        return Err(format!(
+            "macOS speech bridge symbol missing: {name}: {}",
+            dlerror_text()
+        ));
     }
     // POSIX dlsym returns a data pointer even for function symbols. This macOS
     // bridge relies on the platform ABI allowing that pointer to be called.
@@ -133,19 +155,21 @@ where
 }
 
 #[cfg(target_os = "macos")]
-fn dlerror_text() -> String {
+pub(crate) fn dlerror_text() -> String {
     unsafe {
         let error = dlerror();
         if error.is_null() {
             "unknown dlopen error".to_string()
         } else {
-            std::ffi::CStr::from_ptr(error).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(error)
+                .to_string_lossy()
+                .into_owned()
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn macos_speech_bridge_health(source: &str, language: &str) -> Result<bool, String> {
+pub(crate) fn macos_speech_bridge_health(source: &str, language: &str) -> Result<bool, String> {
     let api = macos_speech_bridge_api()?;
     let source = std::ffi::CString::new(source).map_err(|error| error.to_string())?;
     let language = std::ffi::CString::new(language).map_err(|error| error.to_string())?;
@@ -153,7 +177,7 @@ fn macos_speech_bridge_health(source: &str, language: &str) -> Result<bool, Stri
 }
 
 #[cfg(target_os = "macos")]
-fn macos_speech_bridge_status(
+pub(crate) fn macos_speech_bridge_status(
     source: &str,
     language: &str,
 ) -> Result<MacosSpeechBridgeStatus, String> {
@@ -213,7 +237,7 @@ impl MacosSpeechBridgeStatus {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_speech_bridge_status_error(
+pub(crate) fn macos_speech_bridge_status_error(
     source: &str,
     language: &str,
     status: MacosSpeechBridgeStatus,
@@ -223,7 +247,9 @@ fn macos_speech_bridge_status_error(
         reasons.push(format!("speechRecognition={}", status.speech_state()));
     }
     if !status.recognizer_available() {
-        reasons.push(format!("speechRecognizerAvailable=false language={language}"));
+        reasons.push(format!(
+            "speechRecognizerAvailable=false language={language}"
+        ));
     }
     if source == "mic" && status.microphone_state() != "authorized" {
         reasons.push(format!("microphone={}", status.microphone_state()));
@@ -245,7 +271,10 @@ fn macos_speech_bridge_status_error(
 }
 
 #[cfg(target_os = "macos")]
-fn request_macos_speech_bridge_permissions(source: &str, language: &str) -> Result<bool, String> {
+pub(crate) fn request_macos_speech_bridge_permissions(
+    source: &str,
+    language: &str,
+) -> Result<bool, String> {
     let api = macos_speech_bridge_api()?;
     let source = std::ffi::CString::new(source).map_err(|error| error.to_string())?;
     let language = std::ffi::CString::new(language).map_err(|error| error.to_string())?;
@@ -253,7 +282,7 @@ fn request_macos_speech_bridge_permissions(source: &str, language: &str) -> Resu
 }
 
 #[cfg(target_os = "macos")]
-fn start_macos_speech_bridge(
+pub(crate) fn start_macos_speech_bridge(
     app: tauri::AppHandle,
     session_id: &str,
     source: &str,
@@ -279,7 +308,9 @@ fn start_macos_speech_bridge(
         )
     };
     if handle <= 0 {
-        return Err(format!("macOS speech bridge failed to start {source}: {handle}"));
+        return Err(format!(
+            "macOS speech bridge failed to start {source}: {handle}"
+        ));
     }
     let key = native_transcriber_key(session_id, source);
     let mut bridges = MACOS_SPEECH_BRIDGES
@@ -291,15 +322,15 @@ fn start_macos_speech_bridge(
             (api.stop)(stale.handle);
         }
     }
-    bridges.insert(
-        key,
-        MacosSpeechBridgeSession { handle },
-    );
+    bridges.insert(key, MacosSpeechBridgeSession { handle });
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn start_macos_prep_dictation_bridge(app: tauri::AppHandle, language: &str) -> Result<(), String> {
+pub(crate) fn start_macos_prep_dictation_bridge(
+    app: tauri::AppHandle,
+    language: &str,
+) -> Result<(), String> {
     let api = macos_speech_bridge_api()?;
     let source_c = std::ffi::CString::new("mic").map_err(|error| error.to_string())?;
     let language_c = std::ffi::CString::new(language).map_err(|error| error.to_string())?;
@@ -320,7 +351,9 @@ fn start_macos_prep_dictation_bridge(app: tauri::AppHandle, language: &str) -> R
         )
     };
     if handle <= 0 {
-        return Err(format!("macOS prep dictation bridge failed to start: {handle}"));
+        return Err(format!(
+            "macOS prep dictation bridge failed to start: {handle}"
+        ));
     }
     let key = "prep_dictation::mic".to_string();
     let mut bridges = MACOS_SPEECH_BRIDGES
@@ -332,15 +365,12 @@ fn start_macos_prep_dictation_bridge(app: tauri::AppHandle, language: &str) -> R
             (api.stop)(stale.handle);
         }
     }
-    bridges.insert(
-        key,
-        MacosSpeechBridgeSession { handle },
-    );
+    bridges.insert(key, MacosSpeechBridgeSession { handle });
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn stop_macos_prep_dictation_bridge() -> Result<(), String> {
+pub(crate) fn stop_macos_prep_dictation_bridge() -> Result<(), String> {
     let api = macos_speech_bridge_api()?;
     let Some(bridges) = MACOS_SPEECH_BRIDGES.get() else {
         return Ok(());
@@ -355,7 +385,10 @@ fn stop_macos_prep_dictation_bridge() -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn stop_macos_speech_bridge(session_id: &str, source: Option<&str>) -> Result<(), String> {
+pub(crate) fn stop_macos_speech_bridge(
+    session_id: &str,
+    source: Option<&str>,
+) -> Result<(), String> {
     let api = macos_speech_bridge_api()?;
     let Some(bridges) = MACOS_SPEECH_BRIDGES.get() else {
         return Ok(());
@@ -383,7 +416,7 @@ fn stop_macos_speech_bridge(session_id: &str, source: Option<&str>) -> Result<()
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn macos_speech_bridge_release_context(context: *mut c_void) {
+pub(crate) unsafe extern "C" fn macos_speech_bridge_release_context(context: *mut c_void) {
     if context.is_null() {
         return;
     }
@@ -393,7 +426,10 @@ unsafe extern "C" fn macos_speech_bridge_release_context(context: *mut c_void) {
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn macos_speech_bridge_callback(line: *const c_char, context: *mut c_void) {
+pub(crate) unsafe extern "C" fn macos_speech_bridge_callback(
+    line: *const c_char,
+    context: *mut c_void,
+) {
     if line.is_null() || context.is_null() {
         return;
     }
@@ -401,28 +437,28 @@ unsafe extern "C" fn macos_speech_bridge_callback(line: *const c_char, context: 
         .to_string_lossy()
         .into_owned();
     let context = unsafe { &*(context as *const MacosSpeechCallbackContext) };
-    if let Ok(error_line) = serde_json::from_str::<serde_json::Value>(&line) {
-        if error_line.get("kind").and_then(|kind| kind.as_str()) == Some("error") {
-            let message = error_line
-                .get("message")
-                .and_then(|message| message.as_str())
-                .unwrap_or("macOS speech bridge error")
-                .to_string();
-            let code = error_line
-                .get("code")
-                .and_then(|code| code.as_str())
-                .map(|code| code.to_string());
-            let _ = log_app_error_inner(
-                Some(&context.session_id),
-                "native_transcription.bridge_error",
-                "macos_speech_bridge",
-                "error",
-                &message,
-                serde_json::json!({"source": context.source}),
-            );
-            emit_native_transcription_error_with_code(&context.app, message, &context.source, code);
-            return;
-        }
+    if let Ok(error_line) = serde_json::from_str::<serde_json::Value>(&line)
+        && error_line.get("kind").and_then(|kind| kind.as_str()) == Some("error")
+    {
+        let message = error_line
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("macOS speech bridge error")
+            .to_string();
+        let code = error_line
+            .get("code")
+            .and_then(|code| code.as_str())
+            .map(|code| code.to_string());
+        let _ = log_app_error_inner(
+            Some(&context.session_id),
+            "native_transcription.bridge_error",
+            "macos_speech_bridge",
+            "error",
+            &message,
+            serde_json::json!({"source": context.source}),
+        );
+        emit_native_transcription_error_with_code(&context.app, message, &context.source, code);
+        return;
     }
     let parsed: Result<HelperTranscriptLine, _> = serde_json::from_str(&line);
     match parsed {
