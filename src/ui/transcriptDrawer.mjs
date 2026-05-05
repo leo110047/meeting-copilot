@@ -30,7 +30,7 @@ export function transcriptSpeakerLabel(event) {
   if (event.speaker) return event.speaker;
   if (event.source === "mic") return "我";
   if (event.source === "system") return "系統音訊";
-  return "未知";
+  return "未標記來源";
 }
 
 function currentTranscriptLines({ transcriptEvents, transcriptLines, currentPartialTranscript, detectUiLanguage }) {
@@ -57,7 +57,7 @@ function currentTranscriptLines({ transcriptEvents, transcriptLines, currentPart
   }
   const lines = transcriptLines.map((text, index) => ({
     text,
-    speaker: "未知",
+    speaker: "未標記來源",
     source: "unknown",
     language: detectUiLanguage(text),
     index

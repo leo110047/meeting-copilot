@@ -235,6 +235,7 @@ pub(crate) struct TextProviderStatus {
 pub(crate) struct AiTranscriptLine {
     pub(crate) id: String,
     pub(crate) text: String,
+    pub(crate) speaker: Option<String>,
     pub(crate) source: String,
     pub(crate) language: String,
 }
@@ -296,6 +297,32 @@ pub(crate) struct TranscriptCleanupResponse {
     pub(crate) provider_id: String,
     pub(crate) model: String,
     pub(crate) text: String,
+    pub(crate) raw_output_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TranscriptRevisionRequest {
+    pub(crate) session_id: String,
+    pub(crate) transcript: Vec<AiTranscriptLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RevisedTranscriptLine {
+    pub(crate) id: String,
+    pub(crate) text: String,
+    pub(crate) speaker: String,
+    pub(crate) source: String,
+    pub(crate) language: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TranscriptRevisionResponse {
+    pub(crate) provider_id: String,
+    pub(crate) model: String,
+    pub(crate) transcript: Vec<RevisedTranscriptLine>,
     pub(crate) raw_output_ref: String,
 }
 

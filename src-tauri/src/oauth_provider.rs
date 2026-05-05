@@ -1,7 +1,8 @@
 use crate::decision_logic::{now_ms, stable_id};
 use crate::desktop_types::{
     AiSummaryRequest, AiSummarySections, LiveStatePatchEnvelope, MeetingBrief, NativeDecisionState,
-    PrepSummaryRequest, TextProviderStatus, TranscriptCleanupRequest, TranscriptEvent,
+    PrepSummaryRequest, RevisedTranscriptLine, TextProviderStatus, TranscriptCleanupRequest,
+    TranscriptEvent, TranscriptRevisionRequest,
 };
 use crate::native_storage::{log_app_error_inner, log_provider_failure, log_provider_usage};
 use std::fs;
@@ -331,6 +332,7 @@ Return ONLY a JSON object with this exact shape:
 Rules:
 - Write Traditional Chinese.
 - Use the transcript, prepContext, and localSummary only.
+- Use transcript speaker labels only to attribute statements or responsibilities that are explicitly supported by the transcript.
 - Do not invent decisions, owners, dates, or commitments.
 - If evidence is insufficient, say that explicitly.
 - Keep each array to 3-6 concise items.
@@ -434,6 +436,7 @@ Return ONLY a JSON object with this exact shape:
 Rules:
 - Preserve the original meaning. Do not summarize.
 - Remove only obvious stutters, repeated starts, filler words, and speech disfluencies.
+- Use context only to disambiguate punctuation, terminology, and short pronouns. Do not import facts from context into the cleaned text.
 - Keep names, numbers, dates, owners, deadlines, scope, technical terms, and mixed English terms.
 - Do not add facts, conclusions, speakers, or punctuation that changes meaning.
 - Write Traditional Chinese when the source is Chinese. Preserve English terms that appear in the source.
@@ -443,6 +446,124 @@ Transcript payload:
 {payload}
 "#
     ))
+}
+
+pub(crate) fn build_transcript_revision_prompt(
+    request: &TranscriptRevisionRequest,
+) -> Result<String, String> {
+    let payload = serde_json::to_string(request).map_err(|error| error.to_string())?;
+    Ok(format!(
+        r#"You are Meeting Copilot's live transcript revision provider.
+Return ONLY a JSON object with this exact shape:
+{{"transcript":[{{"id":"...","speaker":"...","text":"...","source":"...","language":"..."}}]}}
+
+Rules:
+- Write Traditional Chinese. Preserve English technical terms that appear in the source.
+- Preserve every input line id and order. Do not add, remove, merge, split, or reorder lines.
+- Preserve the original meaning. Do not summarize or add facts.
+- Clean obvious ASR errors, repeated starts, filler words, and punctuation when safe.
+- For source="mic", speaker MUST be "我".
+- For source="system", infer remote speaker changes from semantics and conversation flow. Use stable labels "對方 A", "對方 B", "對方 C" only. Reuse the same label when the same remote speaker appears to continue.
+- If an input line already has speaker "對方 A", "對方 B", or "對方 C", keep that speaker unless nearby context strongly contradicts it.
+- If source is missing or unknown, use speaker "未標記來源"; do not use "未知".
+- Keep source and language from the input line.
+- If speaker inference is uncertain, prefer the previous system speaker label over inventing a new speaker.
+
+Transcript payload:
+{payload}
+"#
+    ))
+}
+
+pub(crate) fn parse_transcript_revision_response(
+    raw_output: &str,
+    request: &TranscriptRevisionRequest,
+) -> Result<Vec<RevisedTranscriptLine>, String> {
+    let value = parse_json_object_value(raw_output)?;
+    let transcript = value
+        .get("transcript")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "transcript must be an array".to_string())?;
+    if transcript.len() != request.transcript.len() {
+        return Err("revised transcript must preserve line count".to_string());
+    }
+    let mut lines = Vec::with_capacity(transcript.len());
+    for (index, item) in transcript.iter().enumerate() {
+        let object = item
+            .as_object()
+            .ok_or_else(|| format!("transcript[{index}] must be an object"))?;
+        let input = &request.transcript[index];
+        let id = required_trimmed_string_field(object, "id")?;
+        if id != input.id {
+            return Err(format!("transcript[{index}].id must preserve input order"));
+        }
+        let source = required_trimmed_string_field(object, "source")?;
+        if source != input.source {
+            return Err(format!(
+                "transcript[{index}].source must preserve input source"
+            ));
+        }
+        let language = required_trimmed_string_field(object, "language")?;
+        if language != input.language {
+            return Err(format!(
+                "transcript[{index}].language must preserve input language"
+            ));
+        }
+        let mut speaker = required_trimmed_string_field(object, "speaker")?;
+        if source == "mic" {
+            speaker = "我".to_string();
+        } else if source == "system" && !is_allowed_remote_speaker(&speaker) {
+            return Err(format!(
+                "transcript[{index}].speaker is not an allowed remote label"
+            ));
+        } else if speaker == "未知" || (source != "system" && !is_allowed_remote_speaker(&speaker))
+        {
+            speaker = "未標記來源".to_string();
+        }
+        let text = required_text_field(object, "text")?;
+        if text.trim().is_empty() {
+            return Err(format!("transcript[{index}].text must not be empty"));
+        }
+        lines.push(RevisedTranscriptLine {
+            id,
+            text,
+            speaker,
+            source,
+            language,
+        });
+    }
+    Ok(lines)
+}
+
+fn required_trimmed_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String, String> {
+    object
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{field} is required"))
+}
+
+fn required_text_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String, String> {
+    let value = object
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .ok_or_else(|| format!("{field} is required"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{field} is required"));
+    }
+    Ok(value)
+}
+
+fn is_allowed_remote_speaker(speaker: &str) -> bool {
+    matches!(speaker, "對方 A" | "對方 B" | "對方 C" | "未標記來源")
 }
 
 pub(crate) fn build_live_state_patch_prompt(

@@ -29,7 +29,17 @@ test("transcript export marks locally visible transcript rows that failed persis
     title: "即時會議 逐字稿",
     sessionId: "session_1",
     generatedAt: "2026-05-04T00:00:00.000Z",
-    transcript: [{ text: "最後一句", persistenceStatus: "failed" }]
+    transcript: [{ text: "最後一句", speaker: "我", source: "mic", persistenceStatus: "failed" }]
   });
-  assert.match(text, /最後一句 \[未儲存\]/);
+  assert.match(text, /\[我\] 最後一句 \[未儲存\]/);
+});
+
+test("transcript export falls back to source labels", () => {
+  const text = renderTranscriptText({
+    title: "即時會議 逐字稿",
+    sessionId: "session_1",
+    generatedAt: "2026-05-04T00:00:00.000Z",
+    transcript: [{ text: "我這邊看得到畫面", source: "system" }]
+  });
+  assert.match(text, /\[系統音訊\] 我這邊看得到畫面/);
 });

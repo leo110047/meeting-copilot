@@ -78,6 +78,7 @@ fn main() {
             commands_core::start_text_provider_login,
             commands_core::request_screen_recording_permission,
             commands_core::generate_ai_summary_oauth,
+            commands_core::revise_transcript_oauth,
             commands_core::generate_prep_summary_oauth,
             commands_core::cleanup_transcript_text_oauth,
             commands_core::log_app_error,

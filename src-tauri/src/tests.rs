@@ -1,18 +1,24 @@
-use crate::commands_audio::{classify_native_transcription_error, transcript_text_matches};
+use crate::LIVE_SESSIONS;
+use crate::commands_audio::{
+    classify_native_transcription_error, transcript_cleanup_context, transcript_text_matches,
+};
 use crate::commands_core::{read_granted_dropped_context_file, register_drop_read_grants};
 use crate::decision_logic::{
     apply_live_state_patch, derive_decision_state, now_ms, now_ms_string, value_string,
 };
 use crate::desktop_types::{
-    AppErrorLogRecord, LiveDecisionStatePatch, LiveMeetingStatePatch, LiveStatePatchEnvelope,
-    TranscriptCleanupRequest, TranscriptEvent,
+    AiTranscriptLine, AppErrorLogRecord, HelperTranscriptLine, LiveDecisionStatePatch,
+    LiveMeetingStatePatch, LiveStatePatchEnvelope, NativeLiveSession, TranscriptCleanupRequest,
+    TranscriptEvent, TranscriptRevisionRequest,
 };
 use crate::native_storage::{insert_app_error_log, list_app_error_logs};
 use crate::oauth_provider::{
-    SubscriptionOAuthParse, build_transcript_cleanup_prompt, codex_command_available,
-    codex_unix_fallback_candidates, parse_subscription_oauth_authenticated,
-    parse_transcript_cleanup_text, start_subscription_oauth_login, validate_live_state_patch_value,
-    windows_codex_executable_names, windows_executable_extensions_from_pathext,
+    SubscriptionOAuthParse, build_transcript_cleanup_prompt, build_transcript_revision_prompt,
+    codex_command_available, codex_unix_fallback_candidates,
+    parse_subscription_oauth_authenticated, parse_transcript_cleanup_text,
+    parse_transcript_revision_response, start_subscription_oauth_login,
+    validate_live_state_patch_value, windows_codex_executable_names,
+    windows_executable_extensions_from_pathext,
 };
 use crate::shell_storage::{open_db, read_dropped_context_file};
 use std::fs;
@@ -144,7 +150,109 @@ fn transcript_cleanup_prompt_preserves_meaning_boundary() {
     .expect("build cleanup prompt");
     assert!(prompt.contains("Do not summarize"));
     assert!(prompt.contains("Preserve the original meaning"));
+    assert!(prompt.contains("Use context only to disambiguate"));
     assert!(prompt.contains("names, numbers, dates, owners, deadlines, scope"));
+}
+
+#[test]
+fn transcript_cleanup_context_includes_source_and_recent_lines() {
+    let session_id = format!("cleanup_context_{}", now_ms());
+    LIVE_SESSIONS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("lock live sessions")
+        .insert(
+            session_id.clone(),
+            NativeLiveSession {
+                brief: crate::decision_logic::default_brief(),
+                events: vec![TranscriptEvent {
+                    id: "event_1".to_string(),
+                    session_id: session_id.clone(),
+                    source: "system".to_string(),
+                    speaker: None,
+                    speaker_confidence: 0.7,
+                    language: "zh-TW".to_string(),
+                    started_at_ms: 0,
+                    ended_at_ms: Some(1000),
+                    text: "剛剛客戶說 demo 範圍先不擴大".to_string(),
+                    is_final: true,
+                }],
+                shown_suggestion_ids: std::collections::HashSet::new(),
+            },
+        );
+    let context = transcript_cleanup_context(
+        &session_id,
+        &HelperTranscriptLine {
+            kind: "transcript".to_string(),
+            text: "所以先照這個走".to_string(),
+            is_final: true,
+            confidence: 0.8,
+            language: "zh-TW".to_string(),
+            source: "mic".to_string(),
+            started_at_ms: 1000,
+            ended_at_ms: 2000,
+        },
+    );
+    assert!(context.contains("\"currentSource\":\"mic\""));
+    assert!(context.contains("[系統音訊] 剛剛客戶說 demo 範圍先不擴大"));
+}
+
+#[test]
+fn transcript_revision_prompt_requires_live_speaker_labels() {
+    let request = transcript_revision_request_fixture();
+    let prompt = build_transcript_revision_prompt(&request).expect("build revision prompt");
+    assert!(prompt.contains("對方 A"));
+    assert!(prompt.contains("source=\"mic\", speaker MUST be \"我\""));
+    assert!(prompt.contains("Preserve every input line id and order"));
+    assert!(prompt.contains("keep that speaker unless nearby context strongly contradicts it"));
+}
+
+#[test]
+fn transcript_revision_parser_preserves_order_and_labels() {
+    let request = transcript_revision_request_fixture();
+    let revised = parse_transcript_revision_response(
+        r#"{"transcript":[{"id":"l1","speaker":"我","text":"我先確認 demo 範圍。","source":"mic","language":"zh-TW"},{"id":"l2","speaker":"對方 A","text":"先不要擴大。","source":"system","language":"zh-TW"}]}"#,
+        &request,
+    )
+    .expect("parse revised transcript");
+    assert_eq!(revised[0].speaker, "我");
+    assert_eq!(revised[1].speaker, "對方 A");
+}
+
+#[test]
+fn transcript_revision_parser_sanitizes_unknown_source_speaker() {
+    let mut request = transcript_revision_request_fixture();
+    request.transcript[1].source = "unknown".to_string();
+    request.transcript[1].speaker = Some("未標記來源".to_string());
+    let revised = parse_transcript_revision_response(
+        r#"{"transcript":[{"id":"l1","speaker":"我","text":"我先確認 demo 範圍。","source":"mic","language":"zh-TW"},{"id":"l2","speaker":"Alice","text":" 先不要擴大 ","source":"unknown","language":"zh-TW"}]}"#,
+        &request,
+    )
+    .expect("parse revised transcript");
+    assert_eq!(revised[1].speaker, "未標記來源");
+    assert_eq!(revised[1].text, " 先不要擴大 ");
+}
+
+fn transcript_revision_request_fixture() -> TranscriptRevisionRequest {
+    TranscriptRevisionRequest {
+        session_id: "session_1".to_string(),
+        transcript: vec![
+            AiTranscriptLine {
+                id: "l1".to_string(),
+                text: "呃我先確認 demo 範圍".to_string(),
+                speaker: Some("我".to_string()),
+                source: "mic".to_string(),
+                language: "zh-TW".to_string(),
+            },
+            AiTranscriptLine {
+                id: "l2".to_string(),
+                text: "先不要擴大".to_string(),
+                speaker: Some("系統音訊".to_string()),
+                source: "system".to_string(),
+                language: "zh-TW".to_string(),
+            },
+        ],
+    }
 }
 
 #[test]

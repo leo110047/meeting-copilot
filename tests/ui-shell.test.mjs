@@ -135,6 +135,18 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /extract_live_state_patch_oauth/);
   assert.match(js, /maybeRunLiveAiExtraction/);
   assert.match(js, /liveAiExtractionRunning/);
+  assert.match(js, /revise_transcript_oauth/);
+  assert.match(js, /scheduleLiveTranscriptRevision/);
+  assert.match(js, /TRANSCRIPT_REVISION_WINDOW_SIZE/);
+  assert.match(js, /buildTranscriptRevisionSnapshot/);
+  assert.match(js, /lastTranscriptRevisionEventCount = revisionSnapshot\.endCount/);
+  assert.match(js, /transcriptEvents\.length > eventCount\) scheduleLiveTranscriptRevision/);
+  assert.doesNotMatch(js, /lastTranscriptRevisionEventCount = transcriptEvents\.length/);
+  assert.match(js, /displayedTranscriptEvents/);
+  assert.match(js, /aiActivityMessages/);
+  assert.match(js, /setAiActivity/);
+  assert.match(js, /clearAiActivity/);
+  assert.match(js, /對方 A|未標記來源/);
   assert.match(js, /Math\.max\(0, lastAiExtractionEventCount - 1\)/);
   assert.match(js, /lastAiExtractionEventCount/);
   assert.match(js, /AI 正在判斷是否需要提醒/);

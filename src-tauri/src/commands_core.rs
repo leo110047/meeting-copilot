@@ -9,7 +9,8 @@ use crate::desktop_types::{
     DroppedContextFile, IngestTranscriptResponse, NativeLiveSession, NativeTranscriberHealth,
     NativeTranscriberHealthRequest, PersistedSummary, PrepSummaryRequest, PrepSummaryResponse,
     StartSessionRequest, StartSessionResponse, TextProviderStatus, TranscriptCleanupRequest,
-    TranscriptCleanupResponse, TranscriptInput,
+    TranscriptCleanupResponse, TranscriptInput, TranscriptRevisionRequest,
+    TranscriptRevisionResponse,
 };
 use crate::macos_speech_bridge::{
     macos_speech_bridge_health, macos_speech_bridge_status, macos_speech_bridge_status_error,
@@ -23,9 +24,10 @@ use crate::native_storage::{
 };
 use crate::oauth_provider::{
     build_ai_summary_prompt, build_live_state_patch_prompt, build_prep_summary_prompt,
-    cleanup_transcript_text_oauth_inner, parse_ai_summary_sections, parse_live_state_patch,
-    parse_prep_summary_points, run_codex_oauth_prompt, run_codex_oauth_prompt_with_timeout,
-    start_subscription_oauth_login, subscription_oauth_status,
+    build_transcript_revision_prompt, cleanup_transcript_text_oauth_inner,
+    parse_ai_summary_sections, parse_live_state_patch, parse_prep_summary_points,
+    parse_transcript_revision_response, run_codex_oauth_prompt,
+    run_codex_oauth_prompt_with_timeout, start_subscription_oauth_login, subscription_oauth_status,
 };
 use crate::shell_storage::{
     app_db_path, open_db, read_dropped_context_file, set_native_window_opacity,
@@ -307,6 +309,68 @@ pub(crate) fn generate_ai_summary_oauth(
         provider_id: "codex-chatgpt-oauth".to_string(),
         model: "subscription_oauth".to_string(),
         summary,
+        raw_output_ref: stable_id(&raw_output),
+    })
+}
+
+#[tauri::command]
+pub(crate) fn revise_transcript_oauth(
+    request: TranscriptRevisionRequest,
+) -> Result<TranscriptRevisionResponse, String> {
+    if request.transcript.is_empty() {
+        return Ok(TranscriptRevisionResponse {
+            provider_id: "codex-chatgpt-oauth".to_string(),
+            model: "subscription_oauth".to_string(),
+            transcript: vec![],
+            raw_output_ref: stable_id("empty-transcript-revision"),
+        });
+    }
+    let status = subscription_oauth_status();
+    if !status.authenticated {
+        return Err(status
+            .last_error
+            .unwrap_or_else(|| "subscription OAuth provider is not authenticated".to_string()));
+    }
+    let prompt = build_transcript_revision_prompt(&request)?;
+    let started = now_ms();
+    let raw_output = match run_codex_oauth_prompt_with_timeout(&prompt, 18_000) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = log_provider_failure(
+                &request.session_id,
+                "revise_transcript",
+                "revise_transcript.oauth.v1",
+                "timeout_or_api_error",
+                &error,
+            );
+            return Err(error);
+        }
+    };
+    let transcript = match parse_transcript_revision_response(&raw_output, &request) {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            let _ = log_provider_failure(
+                &request.session_id,
+                "revise_transcript",
+                "revise_transcript.oauth.v1",
+                "schema_validation",
+                &format!("{error}: {}", stable_id(&raw_output)),
+            );
+            return Err(error);
+        }
+    };
+    let _ = log_provider_usage(
+        &request.session_id,
+        "revise_transcript",
+        "revise_transcript.oauth.v1",
+        &prompt,
+        &raw_output,
+        now_ms().saturating_sub(started) as i64,
+    );
+    Ok(TranscriptRevisionResponse {
+        provider_id: "codex-chatgpt-oauth".to_string(),
+        model: "subscription_oauth".to_string(),
+        transcript,
         raw_output_ref: stable_id(&raw_output),
     })
 }

@@ -102,7 +102,7 @@ export function renderTranscriptText(document) {
     `Generated: ${document.generatedAt}`,
     "",
     ...(document.transcript.length > 0
-      ? document.transcript.map((line, index) => `${index + 1}. ${line.text}${line.persistenceStatus === "failed" ? " [未儲存]" : ""}`)
+      ? document.transcript.map((line, index) => `${index + 1}. [${transcriptLineSpeaker(line)}] ${line.text}${line.persistenceStatus === "failed" ? " [未儲存]" : ""}`)
       : ["本場沒有收到逐字稿。"])
   ].join("\n");
 }
@@ -135,13 +135,20 @@ function renderAiSummaryHtml(document) {
 
 function renderTranscriptHtml(document) {
   const lines = document.transcript.length > 0
-    ? document.transcript.map((line, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(line.text)}${line.persistenceStatus === "failed" ? " <em>未儲存</em>" : ""}</p>`).join("")
+    ? document.transcript.map((line, index) => `<p><strong>${index + 1}. ${escapeHtml(transcriptLineSpeaker(line))}</strong> ${escapeHtml(line.text)}${line.persistenceStatus === "failed" ? " <em>未儲存</em>" : ""}</p>`).join("")
     : "<p>本場沒有收到逐字稿。</p>";
   return [
     `<h1>${escapeHtml(document.title)}</h1>`,
     `<p>Session: ${escapeHtml(document.sessionId)}<br />Generated: ${escapeHtml(document.generatedAt)}</p>`,
     `<section>${lines}</section>`
   ].join("");
+}
+
+function transcriptLineSpeaker(line) {
+  if (line.speaker) return line.speaker;
+  if (line.source === "mic") return "我";
+  if (line.source === "system") return "系統音訊";
+  return "未標記來源";
 }
 
 function openPrintableDocument({ title, filenameHint, bodyHtml, downloadState, logAppError }) {

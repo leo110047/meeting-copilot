@@ -47,6 +47,7 @@ const AI_ENABLED_STORAGE_KEY = "meetingCopilot.aiEnabled";
 let recognition;
 let transcriptLines = [];
 let transcriptEvents = [];
+let revisedTranscriptEvents = [];
 let currentPartialTranscript;
 let suggestionHistory = [];
 let latestDecisionState;
@@ -60,6 +61,10 @@ let nativeListenersInstalled = false;
 let transcriptDrawerOpen = false;
 let liveAiExtractionRunning = false;
 let lastAiExtractionEventCount = 0;
+let transcriptRevisionRunning = false;
+let lastTranscriptRevisionEventCount = 0;
+let transcriptRevisionTimer;
+const aiActivityMessages = new Map();
 let platformShellPlan;
 let browserErrorLogs = [];
 let textProviderRefreshTimers = [];
@@ -68,6 +73,8 @@ let reviewFinalized = false;
 let postMeetingAiSummaryStarted = false;
 let activeCaptureSource;
 const TRANSCRIPT_STALL_MS = 12000;
+const TRANSCRIPT_REVISION_DEBOUNCE_MS = 3500;
+const TRANSCRIPT_REVISION_WINDOW_SIZE = 18;
 const NO_REVIEW_CONTENT_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料。請確認音訊來源或加入會議背景後再開始下一場。";
 const NO_REVIEW_AI_SKIP_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料；不會送出空內容給 ChatGPT。";
 const nativeInvoke = window.__TAURI__?.core?.invoke;
@@ -137,11 +144,15 @@ startButton.addEventListener("click", async () => {
   }
   transcriptLines = [];
   transcriptEvents = [];
+  revisedTranscriptEvents = [];
   suggestionHistory = [];
   latestDecisionState = undefined;
   transcriptIndex = 0;
   lastAiExtractionEventCount = 0;
   liveAiExtractionRunning = false;
+  lastTranscriptRevisionEventCount = 0;
+  transcriptRevisionRunning = false;
+  resetAiActivityState();
   activeCaptureSource = undefined;
   startedAt = performance.now();
   resetListeningSurface();
@@ -270,6 +281,7 @@ enableOAuthProviderButton.addEventListener("click", () => {
 async function startNativeListening() {
   transcriptLines = [];
   transcriptEvents = [];
+  revisedTranscriptEvents = [];
   currentPartialTranscript = undefined;
   suggestionHistory = [];
   latestDecisionState = undefined;
@@ -277,6 +289,9 @@ async function startNativeListening() {
   transcriptIndex = 0;
   lastAiExtractionEventCount = 0;
   liveAiExtractionRunning = false;
+  lastTranscriptRevisionEventCount = 0;
+  transcriptRevisionRunning = false;
+  resetAiActivityState();
   startedAt = performance.now();
   reviewFinalized = false;
   postMeetingAiSummaryStarted = false;
@@ -351,6 +366,7 @@ async function installNativeListeners() {
       clearTranscriptStallMonitor();
       currentPartialTranscript = undefined;
       renderRuntimePayload(payload);
+      scheduleLiveTranscriptRevision();
       maybeRunLiveAiExtraction();
     });
     await nativeListen("native_transcript_preview", (event) => {
@@ -441,6 +457,7 @@ async function sendTranscript(text) {
       payload = await response.json();
     }
     renderRuntimePayload(payload);
+    scheduleLiveTranscriptRevision();
     maybeRunLiveAiExtraction();
   } catch (error) {
     logAppError("transcript.ingest", error, { sessionId: activeSessionId }, "error");
@@ -501,6 +518,7 @@ async function promoteCurrentPartialTranscript(reason) {
     });
     if (payload.event) payload.event.persistenceStatus = "saved";
     renderRuntimePayload(payload);
+    scheduleLiveTranscriptRevision();
   } catch (error) {
     markTranscriptPersistence(promotedEvent.id, "failed");
     logAppError("native.promote_partial_transcript_failed", error, { sessionId: activeSessionId, reason }, "error");
@@ -543,7 +561,7 @@ function renderSuggestionCard(item) {
 
 function renderEvidenceLines(ids) {
   const lines = ids
-    .map((id) => transcriptEvents.find((event) => event.id === id))
+    .map((id) => displayedTranscriptEvents().find((event) => event.id === id))
     .filter(Boolean)
     .slice(0, 4);
   if (lines.length === 0) return "";
@@ -572,19 +590,144 @@ async function maybeRunLiveAiExtraction() {
   if (eventCount === lastAiExtractionEventCount) return;
   if (lastAiExtractionEventCount > 0 && eventCount - lastAiExtractionEventCount < 2) return;
   liveAiExtractionRunning = true;
-  providerState.textContent = "AI 正在判斷是否需要提醒...";
+  setAiActivity("live_state", "AI 正在判斷是否需要提醒");
   try {
     const payload = await nativeInvoke("extract_live_state_patch_oauth", { sessionId: activeSessionId });
     lastAiExtractionEventCount = transcriptEvents.length;
     renderRuntimePayload(payload);
-    providerState.textContent = "AI 已更新會議判斷。";
+    clearAiActivity("live_state", "AI 已更新會議判斷。");
   } catch (error) {
     logAppError("ai.live_state_patch", error, { sessionId: activeSessionId, eventCount }, "error");
     lastAiExtractionEventCount = Math.max(0, lastAiExtractionEventCount - 1);
-    providerState.textContent = `AI 暫時無法更新，已保留本機判斷：${formatError(error)}`;
+    clearAiActivity("live_state", `AI 暫時無法更新，已保留本機判斷：${formatError(error)}`);
   } finally {
     liveAiExtractionRunning = false;
   }
+}
+
+function scheduleLiveTranscriptRevision() {
+  if (!nativeInvoke || !oauthAiEnabled || !textProviderStatus?.authenticated || !activeSessionId) return;
+  if (document.body.dataset.state !== "listening") return;
+  if (transcriptEvents.length < 2) return;
+  if (transcriptRevisionTimer) clearTimeout(transcriptRevisionTimer);
+  transcriptRevisionTimer = setTimeout(() => {
+    transcriptRevisionTimer = undefined;
+    maybeRunLiveTranscriptRevision();
+  }, TRANSCRIPT_REVISION_DEBOUNCE_MS);
+}
+
+async function maybeRunLiveTranscriptRevision({ allowReview = false, force = false } = {}) {
+  if (!nativeInvoke || !oauthAiEnabled || !textProviderStatus?.authenticated || !activeSessionId) return;
+  const appState = document.body.dataset.state;
+  if (appState !== "listening" && !(allowReview && appState === "review")) return;
+  const eventCount = transcriptEvents.length;
+  if (eventCount < 2 || transcriptRevisionRunning) return;
+  if (!force && eventCount === lastTranscriptRevisionEventCount) return;
+  const revisionSnapshot = buildTranscriptRevisionSnapshot();
+  if (revisionSnapshot.transcript.length === 0) return;
+  transcriptRevisionRunning = true;
+  setAiActivity("transcript_revision", "AI 正在修正逐字稿與判斷說話者");
+  try {
+    const response = await nativeInvoke("revise_transcript_oauth", {
+      request: {
+        sessionId: revisionSnapshot.sessionId,
+        transcript: revisionSnapshot.transcript
+      }
+    });
+    if (activeSessionId !== revisionSnapshot.sessionId) {
+      clearAiActivity("transcript_revision");
+      return;
+    }
+    if (!Array.isArray(response?.transcript)) throw new Error("transcript revision response missing transcript");
+    applyRevisedTranscript(response.transcript);
+    lastTranscriptRevisionEventCount = revisionSnapshot.endCount;
+    renderTranscriptDrawer();
+    if (document.body.dataset.state === "review") renderPostMeetingReview();
+    clearAiActivity("transcript_revision", "AI 已更新逐字稿說話者。");
+  } catch (error) {
+    logAppError("ai.live_transcript_revision", error, { sessionId: activeSessionId, eventCount }, "warning");
+    clearAiActivity("transcript_revision", `AI 暫時無法修正逐字稿，已保留目前版本：${formatError(error)}`);
+  } finally {
+    transcriptRevisionRunning = false;
+    if (transcriptEvents.length > eventCount) scheduleLiveTranscriptRevision();
+  }
+}
+
+function buildTranscriptRevisionSnapshot() {
+  const endCount = transcriptEvents.length;
+  const startIndex = Math.max(0, endCount - TRANSCRIPT_REVISION_WINDOW_SIZE);
+  const revisedById = new Map(revisedTranscriptEvents.map((event) => [event.id, event]));
+  return {
+    sessionId: activeSessionId,
+    startIndex,
+    endCount,
+    transcript: transcriptEvents.slice(startIndex, endCount).map((event) => transcriptRevisionLine(event, revisedById))
+  };
+}
+
+function transcriptRevisionLine(event, revisedById) {
+  const revised = revisedById.get(event.id);
+  return {
+    id: event.id,
+    text: event.text,
+    speaker: revised?.speaker ?? transcriptSpeakerLabel(event),
+    source: event.source ?? "unknown",
+    language: event.language ?? detectUiLanguage(event.text)
+  };
+}
+
+function applyRevisedTranscript(lines) {
+  const mergedRevisions = new Map(revisedTranscriptEvents.map((event) => [event.id, event]));
+  const rawById = new Map(transcriptEvents.map((event) => [event.id, event]));
+  for (const revised of lines) {
+    if (!revised?.id) continue;
+    const event = rawById.get(revised.id);
+    if (!event) continue;
+    mergedRevisions.set(revised.id, {
+      ...event,
+      text: revised.text,
+      speaker: revised.speaker,
+      source: revised.source ?? event.source,
+      language: revised.language ?? event.language,
+      revisedByAi: true
+    });
+  }
+  revisedTranscriptEvents = transcriptEvents.map((event) => mergedRevisions.get(event.id) ?? event);
+}
+
+function displayedTranscriptEvents() {
+  if (revisedTranscriptEvents.length === 0) return transcriptEvents;
+  const revisedById = new Map(revisedTranscriptEvents.map((event) => [event.id, event]));
+  return transcriptEvents.map((event) => revisedById.get(event.id) ?? event);
+}
+
+function clearLiveTranscriptRevisionTimer() {
+  if (!transcriptRevisionTimer) return;
+  clearTimeout(transcriptRevisionTimer);
+  transcriptRevisionTimer = undefined;
+}
+
+function setAiActivity(key, message) {
+  aiActivityMessages.set(key, message);
+  renderAiActivityState();
+}
+
+function clearAiActivity(key, fallbackMessage) {
+  aiActivityMessages.delete(key);
+  if (aiActivityMessages.size > 0) {
+    renderAiActivityState();
+  } else if (fallbackMessage) {
+    providerState.textContent = fallbackMessage;
+  }
+}
+
+function resetAiActivityState() {
+  aiActivityMessages.clear();
+}
+
+function renderAiActivityState() {
+  if (aiActivityMessages.size === 0) return;
+  providerState.textContent = Array.from(aiActivityMessages.values()).join("；");
 }
 
 function setProviderUnavailable() {
@@ -611,12 +754,16 @@ function initializeSetupState() {
   activeSessionId = undefined;
   transcriptLines = [];
   transcriptEvents = [];
+  revisedTranscriptEvents = [];
   currentPartialTranscript = undefined;
   suggestionHistory = [];
   latestDecisionState = undefined;
   aiSummaryOverride = undefined;
   lastAiExtractionEventCount = 0;
   liveAiExtractionRunning = false;
+  lastTranscriptRevisionEventCount = 0;
+  transcriptRevisionRunning = false;
+  resetAiActivityState();
   activeCaptureSource = undefined;
   reviewFinalized = false;
   postMeetingAiSummaryStarted = false;
@@ -628,6 +775,7 @@ function initializeSetupState() {
 }
 
 function resetListeningSurface() {
+  clearLiveTranscriptRevisionTimer();
   transcriptDrawerOpen = false;
   currentPartialTranscript = undefined;
   hideAudioPermissionAction({ includeSetup: false });
@@ -833,7 +981,7 @@ function renderPostMeetingReview() {
     renderReviewList("建議動作", artifact.summary.suggestedActions)
   ].join("");
   postMeetingTranscript.innerHTML = artifact.transcript.length > 0
-    ? artifact.transcript.map((line, index) => `<p><strong>${index + 1}.</strong> ${escapeHtml(line.text)}${line.persistenceStatus === "failed" ? " <em>未儲存</em>" : ""}</p>`).join("")
+    ? artifact.transcript.map((line, index) => `<p><strong>${index + 1}. ${escapeHtml(line.speaker ?? "未標記來源")}</strong> ${escapeHtml(line.text)}${line.persistenceStatus === "failed" ? " <em>未儲存</em>" : ""}</p>`).join("")
     : `<p class="empty-line">本場沒有收到逐字稿。</p>`;
   downloadState.textContent = artifact.transcript.length > 0
     ? `已整理 ${artifact.transcript.length} 段逐字稿。建議先下載 AI 整理 Markdown 與逐字稿 TXT。`
@@ -887,10 +1035,33 @@ function renderReviewList(title, items) {
 }
 
 function buildMeetingArtifact() {
-  const transcript = transcriptEvents.length > 0
-    ? transcriptEvents.map((event) => ({ id: event.id, text: event.text, source: event.source, language: event.language, persistenceStatus: event.persistenceStatus ?? "saved" }))
-    : transcriptLines.map((text, index) => ({ id: `line_${index + 1}`, text, source: "unknown", language: detectUiLanguage(text) }));
+  const visibleTranscriptEvents = displayedTranscriptEvents();
+  const transcript = visibleTranscriptEvents.length > 0
+    ? visibleTranscriptEvents.map((event) => ({
+        id: event.id,
+        text: event.text,
+        speaker: transcriptSpeakerLabel(event),
+        source: event.source ?? "unknown",
+        language: event.language,
+        revisedByAi: Boolean(event.revisedByAi),
+        persistenceStatus: event.persistenceStatus ?? "saved"
+      }))
+    : transcriptLines.map((text, index) => ({
+        id: `line_${index + 1}`,
+        text,
+        speaker: "未標記來源",
+        source: "unknown",
+        language: detectUiLanguage(text)
+      }));
   const transcriptText = transcript.map((line) => line.text).join("\n");
+  const rawTranscript = transcriptEvents.map((event) => ({
+    id: event.id,
+    text: event.text,
+    speaker: transcriptSpeakerLabel(event),
+    source: event.source ?? "unknown",
+    language: event.language,
+    persistenceStatus: event.persistenceStatus ?? "saved"
+  }));
   const prepContext = setupController.combinedPrepContext();
   const contextDiagnostics = setupController.contextDiagnostics();
   const localSummary = {
@@ -908,6 +1079,7 @@ function buildMeetingArtifact() {
     localSummary,
     summaryProvider: aiSummaryOverride ? "codex-chatgpt-oauth" : "local-rule",
     transcript,
+    rawTranscript,
     contextDiagnostics,
     suggestions: suggestionHistory,
     decisionState: latestDecisionState ?? null
@@ -1038,6 +1210,7 @@ function scheduleTextProviderRefresh() {
 async function generateOAuthSummaryIfEnabled(sessionId = activeSessionId) {
   if (!nativeInvoke || !oauthAiEnabled || !textProviderStatus?.authenticated) return;
   if (!isCurrentReviewSession(sessionId)) return;
+  await maybeRunLiveTranscriptRevision({ allowReview: true, force: true });
   const artifact = buildMeetingArtifact();
   if (!hasReviewContent(artifact)) {
     renderPostMeetingReview();
@@ -1047,6 +1220,7 @@ async function generateOAuthSummaryIfEnabled(sessionId = activeSessionId) {
   }
   downloadState.textContent = "正在用 ChatGPT 產生 AI 整理。";
   reviewStatus.textContent = "本機文件已可檢查；ChatGPT 正在更新 AI 整理。";
+  setAiActivity("post_meeting_summary", "ChatGPT 正在更新 AI 整理");
   try {
     const response = await nativeInvoke("generate_ai_summary_oauth", {
       request: {
@@ -1058,18 +1232,26 @@ async function generateOAuthSummaryIfEnabled(sessionId = activeSessionId) {
         transcript: artifact.transcript
       }
     });
-    if (!isCurrentReviewSession(sessionId)) return;
+    if (!isCurrentReviewSession(sessionId)) {
+      clearAiActivity("post_meeting_summary");
+      return;
+    }
     aiSummaryOverride = response.summary;
     renderPostMeetingReview();
     reviewStatus.textContent = "AI 整理已更新，可以檢查文件並下載。";
     downloadState.textContent = "AI 整理已更新，可下載 Markdown、JSON 或 PDF。";
+    clearAiActivity("post_meeting_summary", "AI 整理已更新，可以檢查文件並下載。");
   } catch (error) {
     logAppError("ai.post_meeting_summary", error, { sessionId }, "error");
-    if (!isCurrentReviewSession(sessionId)) return;
+    if (!isCurrentReviewSession(sessionId)) {
+      clearAiActivity("post_meeting_summary");
+      return;
+    }
     aiSummaryOverride = undefined;
     renderPostMeetingReview();
     reviewStatus.textContent = "ChatGPT 整理暫時失敗；已保留本機整理，可以先下載。";
     downloadState.textContent = `AI 整理暫時失敗，已保留本機整理：${formatError(error)}`;
+    clearAiActivity("post_meeting_summary", "ChatGPT 整理暫時失敗；已保留本機整理。");
   }
 }
 
@@ -1124,7 +1306,7 @@ function renderTranscriptDrawer() {
   renderTranscriptDrawerView({
     elements: { liveTranscript, transcriptDrawerToggle, transcriptDrawerCount, transcriptPreview, transcriptFull },
     transcriptDrawerOpen,
-    transcriptEvents,
+    transcriptEvents: displayedTranscriptEvents(),
     transcriptLines,
     currentPartialTranscript,
     escapeHtml,

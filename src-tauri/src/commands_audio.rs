@@ -399,9 +399,10 @@ pub(crate) fn handle_native_transcript_line(
     session_id: &str,
     helper_line: HelperTranscriptLine,
 ) {
+    let cleanup_context = transcript_cleanup_context(session_id, &helper_line);
     let cleaned_text = match cleanup_transcript_text_oauth_inner(
         &helper_line.text,
-        "live_transcript",
+        &cleanup_context,
         Some(session_id),
     ) {
         Ok(cleaned_text) => cleaned_text,
@@ -450,6 +451,47 @@ pub(crate) fn handle_native_transcript_line(
             );
             emit_native_transcription_error(app, error, &event_source);
         }
+    }
+}
+
+pub(crate) fn transcript_cleanup_context(
+    session_id: &str,
+    helper_line: &HelperTranscriptLine,
+) -> String {
+    let mut recent_lines = Vec::new();
+    if let Some(sessions) = LIVE_SESSIONS.get()
+        && let Ok(sessions) = sessions.lock()
+        && let Some(session) = sessions.get(session_id)
+    {
+        recent_lines = session
+            .events
+            .iter()
+            .rev()
+            .take(6)
+            .map(|event| {
+                format!(
+                    "[{}] {}",
+                    transcript_source_label(&event.source),
+                    event.text.replace('\n', " ")
+                )
+            })
+            .collect::<Vec<_>>();
+        recent_lines.reverse();
+    }
+    serde_json::json!({
+        "mode": "live_transcript_cleanup",
+        "currentSource": helper_line.source,
+        "currentSourceLabel": transcript_source_label(&helper_line.source),
+        "recentFinalTranscript": recent_lines
+    })
+    .to_string()
+}
+
+fn transcript_source_label(source: &str) -> &'static str {
+    match source {
+        "mic" => "我",
+        "system" => "系統音訊",
+        _ => "未標記來源",
     }
 }
 
