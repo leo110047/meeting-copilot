@@ -4,7 +4,10 @@ use crate::desktop_types::{
     NativeSuggestion, PrepSummaryRequest, RevisedTranscriptLine, TextProviderStatus,
     TranscriptCleanupRequest, TranscriptEvent, TranscriptRevisionRequest,
 };
-use crate::native_storage::{log_app_error_inner, log_provider_failure, log_provider_usage};
+use crate::native_storage::{
+    log_app_error_inner, log_provider_failure_for, log_provider_usage_for,
+};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +16,16 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
+
+pub(crate) const CODEX_TEXT_PROVIDER_ID: &str = "codex-chatgpt-oauth";
+pub(crate) const CLAUDE_TEXT_PROVIDER_ID: &str = "claude-code-oauth";
+pub(crate) const TEXT_PROVIDER_KIND: &str = "subscription_oauth";
+
+pub(crate) struct TextProviderRun {
+    pub(crate) provider_id: &'static str,
+    pub(crate) model: &'static str,
+    pub(crate) output: String,
+}
 
 #[derive(Clone)]
 pub(crate) struct CachedTextProviderStatus {
@@ -27,29 +40,82 @@ pub(crate) enum SubscriptionOAuthParse {
     Unknown,
 }
 
-pub(crate) static SUBSCRIPTION_OAUTH_STATUS_CACHE: OnceLock<
-    Mutex<Option<CachedTextProviderStatus>>,
+pub(crate) static TEXT_PROVIDER_STATUS_CACHE: OnceLock<
+    Mutex<HashMap<String, CachedTextProviderStatus>>,
 > = OnceLock::new();
 
-pub(crate) fn subscription_oauth_status() -> TextProviderStatus {
-    let cache = SUBSCRIPTION_OAUTH_STATUS_CACHE.get_or_init(|| Mutex::new(None));
+pub(crate) fn normalize_text_provider_id(provider_id: Option<&str>) -> &'static str {
+    match provider_id {
+        Some(CLAUDE_TEXT_PROVIDER_ID) => CLAUDE_TEXT_PROVIDER_ID,
+        _ => CODEX_TEXT_PROVIDER_ID,
+    }
+}
+
+pub(crate) fn text_provider_summary(provider_id: Option<&str>) -> (&'static str, &'static str) {
+    (normalize_text_provider_id(provider_id), TEXT_PROVIDER_KIND)
+}
+
+#[cfg(test)]
+pub(crate) fn cached_text_provider_count_for_tests() -> usize {
+    TEXT_PROVIDER_STATUS_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok().map(|guard| guard.len()))
+        .unwrap_or(0)
+}
+
+pub(crate) fn text_provider_status_for(provider_id: Option<&str>) -> TextProviderStatus {
+    let normalized = normalize_text_provider_id(provider_id);
+    let cache = TEXT_PROVIDER_STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.as_ref()
-        && cached.checked_at.elapsed() < subscription_oauth_status_ttl(&cached.status)
+        && let Some(cached) = guard.get(normalized)
+        && cached.checked_at.elapsed() < text_provider_status_ttl(&cached.status)
     {
         return cached.status.clone();
     }
-    let status = subscription_oauth_status_uncached();
+    let status = match normalized {
+        CLAUDE_TEXT_PROVIDER_ID => claude_subscription_status_uncached(),
+        _ => subscription_oauth_status_uncached(),
+    };
     if let Ok(mut guard) = cache.lock() {
-        *guard = Some(CachedTextProviderStatus {
-            status: status.clone(),
-            checked_at: Instant::now(),
-        });
+        guard.insert(
+            normalized.to_string(),
+            CachedTextProviderStatus {
+                status: status.clone(),
+                checked_at: Instant::now(),
+            },
+        );
     }
     status
 }
 
-pub(crate) fn subscription_oauth_status_ttl(status: &TextProviderStatus) -> Duration {
+pub(crate) fn start_text_provider_login_for(provider_id: Option<&str>) -> Result<(), String> {
+    clear_text_provider_status_cache(provider_id);
+    match normalize_text_provider_id(provider_id) {
+        CLAUDE_TEXT_PROVIDER_ID => start_claude_subscription_login(),
+        _ => start_subscription_oauth_login(),
+    }
+}
+
+pub(crate) fn run_text_provider_prompt_with_timeout(
+    provider_id: Option<&str>,
+    prompt: &str,
+    timeout_ms: u64,
+) -> Result<TextProviderRun, String> {
+    match normalize_text_provider_id(provider_id) {
+        CLAUDE_TEXT_PROVIDER_ID => Ok(TextProviderRun {
+            provider_id: CLAUDE_TEXT_PROVIDER_ID,
+            model: TEXT_PROVIDER_KIND,
+            output: run_claude_subscription_prompt_with_timeout(prompt, timeout_ms)?,
+        }),
+        _ => Ok(TextProviderRun {
+            provider_id: CODEX_TEXT_PROVIDER_ID,
+            model: TEXT_PROVIDER_KIND,
+            output: run_codex_oauth_prompt_with_timeout(prompt, timeout_ms)?,
+        }),
+    }
+}
+
+pub(crate) fn text_provider_status_ttl(status: &TextProviderStatus) -> Duration {
     if status.authenticated {
         Duration::from_secs(30)
     } else {
@@ -57,11 +123,12 @@ pub(crate) fn subscription_oauth_status_ttl(status: &TextProviderStatus) -> Dura
     }
 }
 
-pub(crate) fn clear_subscription_oauth_status_cache() {
-    if let Some(cache) = SUBSCRIPTION_OAUTH_STATUS_CACHE.get()
+pub(crate) fn clear_text_provider_status_cache(provider_id: Option<&str>) {
+    let normalized = normalize_text_provider_id(provider_id);
+    if let Some(cache) = TEXT_PROVIDER_STATUS_CACHE.get()
         && let Ok(mut guard) = cache.lock()
     {
-        *guard = None;
+        guard.remove(normalized);
     }
 }
 
@@ -180,7 +247,6 @@ pub(crate) fn parse_subscription_oauth_authenticated(status_text: &str) -> Subsc
 }
 
 pub(crate) fn start_subscription_oauth_login() -> Result<(), String> {
-    clear_subscription_oauth_status_cache();
     let codex = codex_command_path();
     if let Err(error) = codex_command_probe(&codex) {
         return Err(format!(
@@ -201,14 +267,23 @@ cleanup() {{
   rm -f -- "$0"
   rmdir -- "$(dirname "$0")" 2>/dev/null || true
 }}
-trap cleanup EXIT
 export HOME="${{HOME:-/Users/$USER}}"
 export CODEX_HOME="${{CODEX_HOME:-$HOME/.codex}}"
 echo "Meeting Copilot ChatGPT subscription OAuth login"
 echo "This window was opened by Meeting Copilot. Complete the browser login, then return to the app; Meeting Copilot will refresh the status automatically."
 {} login
+EXIT_CODE=$?
 echo
-echo "Login flow finished. You can close this window."
+if [ "$EXIT_CODE" -eq 0 ]; then
+  echo "Login flow finished. You can close this window."
+else
+  echo "Codex login exited with code $EXIT_CODE."
+fi
+echo
+printf "Press Return to close this window..."
+read -r _
+cleanup
+exit "$EXIT_CODE"
 "#,
             shell_quote(&codex.display().to_string())
         );
@@ -275,6 +350,203 @@ exit /b %EXIT_CODE%
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Err("subscription OAuth login launcher is not implemented for this platform".to_string())
+    }
+}
+
+pub(crate) fn claude_subscription_status_uncached() -> TextProviderStatus {
+    let claude = claude_command_path();
+    let mut command = claude_command_from_path(&claude);
+    configure_claude_subscription_env(&mut command);
+    command.arg("auth").arg("status");
+    match run_command_output_with_timeout(&mut command, 5_000) {
+        Ok(output) => {
+            let status_text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            match parse_claude_auth_status(&status_text) {
+                Some((authenticated, label)) => TextProviderStatus {
+                    provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
+                    kind: TEXT_PROVIDER_KIND.to_string(),
+                    authenticated,
+                    can_refresh_token: authenticated,
+                    supports_structured_output: true,
+                    supports_streaming: true,
+                    active: authenticated,
+                    status_label: label,
+                    last_error: if authenticated {
+                        None
+                    } else {
+                        Some(truncate_for_diagnostic(status_text.trim(), 800))
+                    },
+                },
+                None => TextProviderStatus {
+                    provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
+                    kind: TEXT_PROVIDER_KIND.to_string(),
+                    authenticated: false,
+                    can_refresh_token: false,
+                    supports_structured_output: true,
+                    supports_streaming: true,
+                    active: false,
+                    status_label: "無法解析 Claude Code 登入狀態".to_string(),
+                    last_error: Some(truncate_for_diagnostic(status_text.trim(), 800)),
+                },
+            }
+        }
+        Err(error) => TextProviderStatus {
+            provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
+            kind: TEXT_PROVIDER_KIND.to_string(),
+            authenticated: false,
+            can_refresh_token: false,
+            supports_structured_output: true,
+            supports_streaming: true,
+            active: false,
+            status_label: if error.contains("timed out") {
+                "Claude Code CLI 無回應".to_string()
+            } else {
+                claude_connector_missing_label().to_string()
+            },
+            last_error: Some(format!(
+                "{}：{} ({error})",
+                claude_connector_missing_message(),
+                claude.display()
+            )),
+        },
+    }
+}
+
+pub(crate) fn parse_claude_auth_status(status_text: &str) -> Option<(bool, String)> {
+    let value: serde_json::Value = serde_json::from_str(status_text.trim()).ok().or_else(|| {
+        status_text.lines().find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('{') {
+                serde_json::from_str(trimmed).ok()
+            } else {
+                None
+            }
+        })
+    })?;
+    let logged_in = value.get("loggedIn").and_then(|value| value.as_bool())?;
+    let auth_method = value
+        .get("authMethod")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let api_provider = value
+        .get("apiProvider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let label = if logged_in {
+        format!("已登入 Claude Code（{auth_method}/{api_provider}）")
+    } else {
+        "尚未登入 Claude Code".to_string()
+    };
+    Some((logged_in, label))
+}
+
+pub(crate) fn start_claude_subscription_login() -> Result<(), String> {
+    let claude = claude_command_path();
+    if let Err(error) = claude_command_probe(&claude) {
+        return Err(format!(
+            "{}：{} ({error})",
+            claude_connector_missing_message(),
+            claude.display()
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_dir = create_private_oauth_temp_dir()?;
+        let script_path = script_dir.join("login.command");
+        let script = format!(
+            r#"#!/bin/zsh
+cleanup() {{
+  rm -f -- "$0"
+  rmdir -- "$(dirname "$0")" 2>/dev/null || true
+}}
+export HOME="${{HOME:-/Users/$USER}}"
+echo "Meeting Copilot Claude Code subscription login"
+echo "This window was opened by Meeting Copilot. Complete the browser login, then return to the app; Meeting Copilot will refresh the status automatically."
+{} auth login
+EXIT_CODE=$?
+echo
+if [ "$EXIT_CODE" -eq 0 ]; then
+  echo "Login flow finished. You can close this window."
+else
+  echo "Claude Code login exited with code $EXIT_CODE."
+fi
+echo
+printf "Press Return to close this window..."
+read -r _
+cleanup
+exit "$EXIT_CODE"
+"#,
+            shell_quote(&claude.display().to_string())
+        );
+        fs::write(&script_path, script).map_err(|error| error.to_string())?;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+        let open_result = Command::new("open")
+            .arg(&script_path)
+            .spawn()
+            .map_err(|error| format!("failed to open Claude login terminal: {error}"));
+        if open_result.is_err() {
+            let _ = fs::remove_file(&script_path);
+            let _ = fs::remove_dir(&script_dir);
+        }
+        open_result?;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(600));
+            let _ = fs::remove_file(&script_path);
+            let _ = fs::remove_dir(&script_dir);
+        });
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script_dir = create_private_oauth_temp_dir()?;
+        let script_path = script_dir.join("login.cmd");
+        let script = format!(
+            r#"@echo off
+setlocal
+echo Meeting Copilot Claude Code subscription login
+echo This window was opened by Meeting Copilot. Complete the browser login, then return to the app; Meeting Copilot will refresh the status automatically.
+echo.
+{} auth login
+set "EXIT_CODE=%ERRORLEVEL%"
+echo.
+if "%EXIT_CODE%"=="0" (
+  echo Login flow finished. You can close this window.
+) else (
+  echo Claude Code login exited with code %EXIT_CODE%.
+)
+echo.
+pause
+del "%~f0" >nul 2>nul
+for %%I in ("%~dp0.") do rmdir "%%~fI" >nul 2>nul
+exit /b %EXIT_CODE%
+"#,
+            cmd_batch_quote_path(&claude)
+        );
+        fs::write(&script_path, script).map_err(|error| error.to_string())?;
+        Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(&script_path)
+            .spawn()
+            .map_err(|error| format!("failed to open Claude login terminal: {error}"))?;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(600));
+            let _ = fs::remove_file(&script_path);
+            let _ = fs::remove_dir(&script_dir);
+        });
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("Claude Code login launcher is not implemented for this platform".to_string())
     }
 }
 
@@ -364,7 +636,8 @@ Prep payload:
     ))
 }
 
-pub(crate) fn cleanup_transcript_text_oauth_inner(
+pub(crate) fn cleanup_transcript_text_with_provider_inner(
+    provider_id: Option<&str>,
     text: &str,
     context: &str,
     audit_session_id: Option<&str>,
@@ -373,13 +646,14 @@ pub(crate) fn cleanup_transcript_text_oauth_inner(
     if trimmed.is_empty() {
         return Ok(String::new());
     }
-    let status = subscription_oauth_status();
+    let status = text_provider_status_for(provider_id);
     if !status.authenticated {
         return Err(status
             .last_error
             .unwrap_or_else(|| "subscription OAuth provider is not authenticated".to_string()));
     }
     let request = TranscriptCleanupRequest {
+        text_provider_id: provider_id.map(ToString::to_string),
         text: trimmed.to_string(),
         context: context.to_string(),
     };
@@ -388,10 +662,12 @@ pub(crate) fn cleanup_transcript_text_oauth_inner(
         .map(|value| stable_id(&format!("cleanup:{value}:{}", request.text)))
         .unwrap_or_else(|| stable_id(&format!("cleanup:{}", request.text)));
     let started = now_ms();
-    let raw_output = match run_codex_oauth_prompt_with_timeout(&prompt, 12_000) {
-        Ok(output) => output,
+    let run = match run_text_provider_prompt_with_timeout(provider_id, &prompt, 12_000) {
+        Ok(run) => run,
         Err(error) => {
-            let _ = log_provider_failure(
+            let (provider, _) = text_provider_summary(provider_id);
+            let _ = log_provider_failure_for(
+                provider,
                 &audit_id,
                 "cleanup_transcript_text",
                 "cleanup_transcript_text.oauth.v1",
@@ -401,10 +677,12 @@ pub(crate) fn cleanup_transcript_text_oauth_inner(
             return Err(error);
         }
     };
+    let raw_output = run.output;
     let cleaned = match parse_transcript_cleanup_text(&raw_output) {
         Ok(value) => value,
         Err(error) => {
-            let _ = log_provider_failure(
+            let _ = log_provider_failure_for(
+                run.provider_id,
                 &audit_id,
                 "cleanup_transcript_text",
                 "cleanup_transcript_text.oauth.v1",
@@ -414,7 +692,9 @@ pub(crate) fn cleanup_transcript_text_oauth_inner(
             return Err(error);
         }
     };
-    let _ = log_provider_usage(
+    let _ = log_provider_usage_for(
+        run.provider_id,
+        run.model,
         &audit_id,
         "cleanup_transcript_text",
         "cleanup_transcript_text.oauth.v1",
@@ -670,10 +950,6 @@ Meeting payload:
     ))
 }
 
-pub(crate) fn run_codex_oauth_prompt(prompt: &str) -> Result<String, String> {
-    run_codex_oauth_prompt_with_timeout(prompt, 60_000)
-}
-
 pub(crate) fn run_codex_oauth_prompt_with_timeout(
     prompt: &str,
     timeout_ms: u64,
@@ -766,6 +1042,115 @@ pub(crate) fn run_codex_oauth_prompt_with_timeout(
         .map_err(|error| format!("subscription OAuth provider output unavailable: {error}"));
     let _ = fs::remove_file(&output_path);
     output
+}
+
+pub(crate) fn run_claude_subscription_prompt_with_timeout(
+    prompt: &str,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let claude = claude_command_path();
+    let mut command = claude_command_from_path(&claude);
+    configure_claude_subscription_env(&mut command);
+    configure_background_command(&mut command);
+    let mut child = command
+        .arg("-p")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--tools")
+        .arg("")
+        .arg("--no-session-persistence")
+        .arg("--no-chrome")
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start Claude Code provider: {error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Claude Code provider stdout unavailable".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Claude Code provider stderr unavailable".to_string())?;
+    let stdout_reader = thread::spawn(move || {
+        let mut buffer = String::new();
+        let _ = stdout.read_to_string(&mut buffer);
+        buffer
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buffer = String::new();
+        let _ = stderr.read_to_string(&mut buffer);
+        buffer
+    });
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Claude Code provider stdin unavailable".to_string())?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .map_err(|error| error.to_string())?;
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let status = loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                if let Err(error) = child.kill() {
+                    let _ = log_app_error_inner(
+                        None,
+                        "text_provider.timeout.kill",
+                        "text_provider",
+                        "warning",
+                        &error.to_string(),
+                        serde_json::json!({"provider": CLAUDE_TEXT_PROVIDER_ID, "timeoutMs": timeout_ms}),
+                    );
+                }
+                let _ = child.wait();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                let _ = stdout_reader.join();
+                let detail = truncate_for_diagnostic(&stderr, 800);
+                return Err(if detail.is_empty() {
+                    "Claude Code provider timeout".to_string()
+                } else {
+                    format!("Claude Code provider timeout: {detail}")
+                });
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        let detail = truncate_for_diagnostic(&stderr, 1200);
+        return Err(if detail.is_empty() {
+            format!("Claude Code provider exited with {status}")
+        } else {
+            format!("Claude Code provider exited with {status}: {detail}")
+        });
+    }
+    parse_claude_print_result(&stdout)
+}
+
+pub(crate) fn parse_claude_print_result(stdout: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("Claude Code provider returned invalid JSON wrapper: {error}"))?;
+    if value
+        .get("is_error")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "Claude Code provider returned an error result: {}",
+            truncate_for_diagnostic(stdout, 800)
+        ));
+    }
+    value
+        .get("result")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| "Claude Code provider JSON wrapper missing result".to_string())
 }
 
 pub(crate) fn truncate_for_diagnostic(value: &str, max_chars: usize) -> String {
@@ -1112,6 +1497,60 @@ pub(crate) fn codex_command_path() -> PathBuf {
     PathBuf::from("codex")
 }
 
+pub(crate) fn claude_command_path() -> PathBuf {
+    if let Ok(path) = std::env::var("MEETING_COPILOT_CLAUDE") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let pathext = std::env::var_os("PATHEXT");
+        let executable_names = windows_command_executable_names("claude", pathext.as_deref());
+        for candidate in command_path_candidates_from_path(&executable_names) {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        if let Ok(app_data) = std::env::var("APPDATA") {
+            for filename in &executable_names {
+                let path = PathBuf::from(&app_data).join("npm").join(filename);
+                if path.exists() {
+                    return path;
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for candidate in [
+            "~/.local/bin/claude",
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+        ] {
+            let path = if let Some(rest) = candidate.strip_prefix("~/") {
+                if let Ok(home) = std::env::var("HOME") {
+                    PathBuf::from(home).join(rest)
+                } else {
+                    PathBuf::from(candidate)
+                }
+            } else {
+                PathBuf::from(candidate)
+            };
+            if path.exists() {
+                return path;
+            }
+        }
+        for candidate in command_path_candidates_from_path(&["claude".to_string()]) {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("claude")
+}
+
 pub(crate) fn codex_command_probe(codex: &Path) -> Result<(), String> {
     let mut command = codex_command_from_path(codex);
     configure_codex_oauth_env(&mut command);
@@ -1139,6 +1578,33 @@ pub(crate) fn codex_command_probe(codex: &Path) -> Result<(), String> {
     }
 }
 
+pub(crate) fn claude_command_probe(claude: &Path) -> Result<(), String> {
+    let mut command = claude_command_from_path(claude);
+    configure_claude_subscription_env(&mut command);
+    command.arg("--version");
+    let output = run_command_output_with_timeout(&mut command, 3_000)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = truncate_for_diagnostic(
+            &format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            400,
+        );
+        Err(if detail.is_empty() {
+            format!("Claude Code --version exited with {}", output.status)
+        } else {
+            format!(
+                "Claude Code --version exited with {}: {detail}",
+                output.status
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn codex_command_available(codex: &Path) -> bool {
     codex_command_probe(codex).is_ok()
@@ -1154,6 +1620,18 @@ pub(crate) fn codex_command_from_path(codex: &Path) -> Command {
         }
     }
     Command::new(codex)
+}
+
+pub(crate) fn claude_command_from_path(claude: &Path) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        if is_windows_command_shim(claude) {
+            let mut command = Command::new("cmd");
+            command.arg("/C").arg(claude);
+            return command;
+        }
+    }
+    Command::new(claude)
 }
 
 pub(crate) fn run_command_output_with_timeout(
@@ -1242,6 +1720,13 @@ pub(crate) fn codex_path_candidates_from_path() -> Vec<PathBuf> {
     };
     let pathext = std::env::var_os("PATHEXT");
     let executable_names = windows_codex_executable_names(pathext.as_deref());
+    command_path_candidates_from_path(&executable_names)
+}
+
+pub(crate) fn command_path_candidates_from_path(executable_names: &[String]) -> Vec<PathBuf> {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return vec![];
+    };
     std::env::split_paths(&paths)
         .flat_map(|dir| {
             executable_names
@@ -1249,6 +1734,17 @@ pub(crate) fn codex_path_candidates_from_path() -> Vec<PathBuf> {
                 .map(move |name| dir.join(name))
                 .collect::<Vec<_>>()
         })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_command_executable_names(
+    command_name: &str,
+    pathext: Option<&std::ffi::OsStr>,
+) -> Vec<String> {
+    windows_executable_extensions_from_pathext(pathext)
+        .into_iter()
+        .map(|extension| format!("{command_name}{extension}"))
         .collect()
 }
 
@@ -1321,6 +1817,28 @@ pub(crate) fn codex_connector_missing_message() -> &'static str {
     }
 }
 
+pub(crate) fn claude_connector_missing_label() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Windows 找不到 Claude Code CLI"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "找不到 Claude Code connector"
+    }
+}
+
+pub(crate) fn claude_connector_missing_message() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Windows 找不到 Claude Code CLI；請先安裝 Claude Code，或把 claude.exe / claude.cmd 加到 PATH，再重開 Meeting Copilot。若你用 Volta、fnm、nvm 等工具安裝，請設定 MEETING_COPILOT_CLAUDE 指到 Claude Code 執行檔。"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "找不到 Claude Code connector；請確認 claude 在 PATH，或設定 MEETING_COPILOT_CLAUDE 指到 Claude Code 執行檔。"
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn cmd_batch_quote_path(path: &Path) -> String {
     let value = path.display().to_string();
@@ -1359,6 +1877,17 @@ pub(crate) fn configure_codex_oauth_env(command: &mut Command) {
             if codex_home.exists() {
                 command.env("CODEX_HOME", codex_home);
             }
+        }
+    }
+}
+
+pub(crate) fn configure_claude_subscription_env(command: &mut Command) {
+    if let Ok(home) = std::env::var("HOME") {
+        command.env("HOME", &home);
+    } else if let Ok(user) = std::env::var("USER") {
+        let home = PathBuf::from("/Users").join(user);
+        if home.exists() {
+            command.env("HOME", home);
         }
     }
 }

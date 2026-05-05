@@ -214,10 +214,22 @@ pub(crate) fn insert_session(
     conn: &Connection,
     brief: &MeetingBrief,
     text_provider_enabled: bool,
+    text_provider_id: Option<&str>,
 ) -> Result<(), String> {
+    let current_provider = text_provider_id.unwrap_or("codex-chatgpt-oauth");
     let disclosure = serde_json::json!({
         "sttProvider": native_speech_provider_id(),
-        "llmProvider": if text_provider_enabled { "codex-chatgpt-oauth" } else { "disabled" },
+        "llmProvider": if text_provider_enabled { current_provider } else { "disabled" },
+        "llmProviders": if text_provider_enabled {
+            serde_json::json!([current_provider])
+        } else {
+            serde_json::json!([])
+        },
+        "providerChanges": if text_provider_enabled {
+            serde_json::json!([{ "provider": current_provider, "changedAt": brief.started_at }])
+        } else {
+            serde_json::json!([])
+        },
         "sentAudioToCloud": false,
         "sentTranscriptToCloud": text_provider_enabled,
         "sentMemoryToCloud": text_provider_enabled,
@@ -236,6 +248,74 @@ pub(crate) fn insert_session(
             serde_json::to_string(brief).map_err(|error| error.to_string())?,
             disclosure.to_string()
         ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn record_session_text_provider(
+    conn: &Connection,
+    session_id: &str,
+    provider_id: &str,
+) -> Result<(), String> {
+    let (disclosure_text, started_at): (String, String) = conn
+        .query_row(
+            "SELECT processing_disclosure_json, started_at FROM meeting_sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut disclosure: serde_json::Value =
+        serde_json::from_str(&disclosure_text).unwrap_or_else(|_| serde_json::json!({}));
+    let previous_provider = disclosure
+        .get("llmProvider")
+        .and_then(|value| value.as_str())
+        .filter(|value| *value != "disabled")
+        .map(str::to_string);
+    disclosure["llmProvider"] = serde_json::Value::String(provider_id.to_string());
+    disclosure["textProviderKind"] = serde_json::Value::String("subscription_oauth".to_string());
+    disclosure["sentTranscriptToCloud"] = serde_json::Value::Bool(true);
+    disclosure["sentMemoryToCloud"] = serde_json::Value::Bool(true);
+    let mut providers = disclosure
+        .get("llmProviders")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_else(|| {
+            previous_provider
+                .as_ref()
+                .map(|value| vec![serde_json::Value::String(value.to_string())])
+                .unwrap_or_default()
+        });
+    if !providers
+        .iter()
+        .any(|value| value.as_str() == Some(provider_id))
+    {
+        providers.push(serde_json::Value::String(provider_id.to_string()));
+    }
+    disclosure["llmProviders"] = serde_json::Value::Array(providers);
+    let change = serde_json::json!({
+        "provider": provider_id,
+        "changedAt": now_ms_string(),
+    });
+    let mut changes = disclosure
+        .get("providerChanges")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if changes.is_empty()
+        && let Some(previous) = previous_provider.as_deref()
+        && previous != provider_id
+    {
+        changes.push(serde_json::json!({
+            "provider": previous,
+            "changedAt": started_at
+        }));
+    }
+    changes.push(change);
+    disclosure["providerChanges"] = serde_json::Value::Array(changes);
+    conn.execute(
+        "UPDATE meeting_sessions SET processing_disclosure_json = ?1 WHERE id = ?2",
+        params![disclosure.to_string(), session_id],
     )
     .map_err(|error| error.to_string())?;
     Ok(())
@@ -478,7 +558,9 @@ pub(crate) fn log_app_error_inner(
     Ok(record.id)
 }
 
-pub(crate) fn log_provider_usage(
+pub(crate) fn log_provider_usage_for(
+    provider: &str,
+    model: &str,
     audit_id: &str,
     call_type: &str,
     prompt_version: &str,
@@ -493,8 +575,8 @@ pub(crate) fn log_provider_usage(
         LlmUsageLogInput {
             session_id: audit_id,
             call_type,
-            provider: "codex-chatgpt-oauth",
-            model: "subscription_oauth",
+            provider,
+            model,
             prompt_version,
             prompt,
             output,
@@ -503,7 +585,8 @@ pub(crate) fn log_provider_usage(
     )
 }
 
-pub(crate) fn log_provider_failure(
+pub(crate) fn log_provider_failure_for(
+    provider: &str,
     audit_id: &str,
     call_type: &str,
     prompt_version: &str,
@@ -515,12 +598,13 @@ pub(crate) fn log_provider_failure(
     conn.execute(
         "INSERT INTO ai_provider_failure_logs
         (id, audit_id, call_type, prompt_version, provider, failure_kind, raw_output_ref, created_at)
-        VALUES (?1, ?2, ?3, ?4, 'codex-chatgpt-oauth', ?5, ?6, ?7)",
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             stable_id(&format!("provider-failure:{audit_id}:{call_type}:{failure_kind}:{raw_output_ref}:{}", now_ms())),
             audit_id,
             call_type,
             prompt_version,
+            provider,
             failure_kind,
             stable_id(raw_output_ref),
             now_ms_string()
@@ -535,15 +619,16 @@ pub(crate) fn log_provider_failure(
         failure_kind,
         serde_json::json!({
             "promptVersion": prompt_version,
-            "provider": "codex-chatgpt-oauth",
+            "provider": provider,
             "rawOutputRef": stable_id(raw_output_ref)
         }),
     );
     Ok(())
 }
 
-pub(crate) fn log_extraction_failure(
+pub(crate) fn log_extraction_failure_for(
     session_id: &str,
+    provider: &str,
     failure_kind: &str,
     raw_output_ref: &str,
 ) -> Result<(), String> {
@@ -552,10 +637,11 @@ pub(crate) fn log_extraction_failure(
     conn.execute(
         "INSERT INTO extraction_failure_logs
         (id, session_id, call_type, prompt_version, provider, failure_kind, raw_output_ref, created_at)
-        VALUES (?1, ?2, 'extract_state_patch', 'extract_state_patch.oauth.v1', 'codex-chatgpt-oauth', ?3, ?4, ?5)",
+        VALUES (?1, ?2, 'extract_state_patch', 'extract_state_patch.oauth.v1', ?3, ?4, ?5, ?6)",
         params![
             stable_id(&format!("failure:{session_id}:{failure_kind}:{raw_output_ref}:{}", now_ms())),
             session_id,
+            provider,
             failure_kind,
             raw_output_ref,
             now_ms_string()
@@ -570,7 +656,7 @@ pub(crate) fn log_extraction_failure(
         failure_kind,
         serde_json::json!({
             "promptVersion": "extract_state_patch.oauth.v1",
-            "provider": "codex-chatgpt-oauth",
+            "provider": provider,
             "rawOutputRef": raw_output_ref
         }),
     );

@@ -5,6 +5,8 @@ export function createSetupController({
   canStartWithAi,
   syncStartButtonAvailability,
   textProviderAuthenticated,
+  selectedTextProviderId,
+  selectedTextProviderLabel,
   logAppError,
   formatError,
   escapeHtml
@@ -99,7 +101,7 @@ export function createSetupController({
       syncStartButtonAvailability();
       setupContextMeta.textContent = textProviderAuthenticated()
         ? "請先啟用 AI，才能使用語音輸入。"
-        : "請先登入 ChatGPT，才能使用語音輸入。";
+        : `請先登入 ${selectedTextProviderLabel()}，才能使用語音輸入。`;
       return;
     }
     prepDictationButton.disabled = true;
@@ -109,7 +111,7 @@ export function createSetupController({
         setPrepDictating(false);
         setupContextMeta.textContent = "語音輸入已停止。";
       } else {
-        await nativeInvoke("start_prep_dictation");
+        await nativeInvoke("start_prep_dictation", { providerId: selectedTextProviderId() });
         setPrepDictating(true);
         setupContextMeta.textContent = "正在記錄你補充的會議背景。說完後會自動加入文字欄。";
       }
@@ -286,6 +288,7 @@ export function createSetupController({
     try {
       const response = await nativeInvoke("generate_prep_summary_oauth", {
         request: {
+          textProviderId: selectedTextProviderId(),
           context,
           fileCount: droppedContextChunks.length
         }

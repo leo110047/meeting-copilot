@@ -78,6 +78,7 @@ fn main() {
             commands_core::read_dropped_context_files,
             commands_core::text_provider_status,
             commands_core::start_text_provider_login,
+            commands_core::set_session_text_provider,
             commands_core::request_screen_recording_permission,
             commands_core::generate_ai_summary_oauth,
             commands_core::revise_transcript_oauth,

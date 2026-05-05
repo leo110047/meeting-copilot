@@ -43,7 +43,23 @@ const textProviderDetail = document.querySelector("#textProviderDetail");
 const loginTextProviderButton = document.querySelector("#loginTextProvider");
 const enableOAuthProviderButton = document.querySelector("#enableOAuthProvider");
 const providerSettings = document.querySelector(".provider-settings");
+const textProviderChoices = document.querySelectorAll("[data-text-provider-choice]");
 const AI_ENABLED_STORAGE_KEY = "meetingCopilot.aiEnabled";
+const TEXT_PROVIDER_STORAGE_KEY = "meetingCopilot.textProvider";
+const TEXT_PROVIDERS = {
+  "codex-chatgpt-oauth": {
+    label: "ChatGPT",
+    loginLabel: "登入 ChatGPT",
+    unavailableStatus: "瀏覽器預覽無法登入 ChatGPT",
+    missingLogin: "請先登入 ChatGPT"
+  },
+  "claude-code-oauth": {
+    label: "Claude Code",
+    loginLabel: "登入 Claude Code",
+    unavailableStatus: "瀏覽器預覽無法登入 Claude Code",
+    missingLogin: "請先登入 Claude Code"
+  }
+};
 let recognition;
 let transcriptLines = [];
 let transcriptEvents = [];
@@ -74,6 +90,7 @@ let transcriptStallTimer;
 let reviewFinalized = false;
 let postMeetingAiSummaryStarted = false;
 let activeCaptureSource;
+let selectedTextProviderId = readTextProviderPreference();
 const TRANSCRIPT_STALL_MS = 12000;
 const TRANSCRIPT_REVISION_DEBOUNCE_MS = 3500;
 const TRANSCRIPT_REVISION_CONTEXT_WINDOW_SIZE = 30;
@@ -84,7 +101,7 @@ const TRANSCRIPT_REVISION_STABLE_AFTER_REVISIONS = 2;
 const TRANSCRIPT_REVISION_STABLE_AFTER_TRAILING_EVENTS = 4;
 const TRANSCRIPT_REVISION_META_PRUNE_THRESHOLD = 200;
 const NO_REVIEW_CONTENT_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料。請確認音訊來源或加入會議背景後再開始下一場。";
-const NO_REVIEW_AI_SKIP_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料；不會送出空內容給 ChatGPT。";
+const NO_REVIEW_AI_SKIP_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料；不會送出空內容給 AI。";
 const nativeInvoke = window.__TAURI__?.core?.invoke;
 const nativeListen = window.__TAURI__?.event?.listen;
 const setupController = createSetupController({
@@ -101,16 +118,24 @@ const setupController = createSetupController({
   canStartWithAi,
   syncStartButtonAvailability,
   textProviderAuthenticated: () => Boolean(textProviderStatus?.authenticated),
+  selectedTextProviderId: () => selectedTextProviderId,
+  selectedTextProviderLabel,
   logAppError,
   formatError,
   escapeHtml
 });
+syncTextProviderChoiceControls();
 initializeSetupState();
 setupController.install();
 installOpacityControl();
 refreshPlatformShellPlan();
 refreshTextProviderStatus();
 refreshNativeAudioReadiness("startup");
+for (const choice of textProviderChoices) {
+  choice.addEventListener("change", () => {
+    setSelectedTextProvider(choice.value, { keepEnabledIfAuthenticated: oauthAiEnabled });
+  });
+}
 captureSource?.addEventListener("change", () => {
   refreshNativeAudioReadiness("source_change");
 });
@@ -120,7 +145,7 @@ startButton.addEventListener("click", async () => {
     syncStartButtonAvailability();
     textProviderDetail.textContent = textProviderStatus?.authenticated
       ? "請先啟用 AI，Meeting Copilot 才能開始會議。"
-      : "請先登入 ChatGPT，Meeting Copilot 才能開始會議。";
+      : `${providerMissingLoginCopy()}，Meeting Copilot 才能開始會議。`;
     return;
   }
   startButton.disabled = true;
@@ -259,11 +284,11 @@ loginTextProviderButton.addEventListener("click", async () => {
   }
   loginTextProviderButton.disabled = true;
   try {
-    await nativeInvoke("start_text_provider_login");
-    textProviderDetail.textContent = "已開啟 ChatGPT 登入視窗；登入完成後會自動更新狀態。";
+    await nativeInvoke("start_text_provider_login", { providerId: selectedTextProviderId });
+    textProviderDetail.textContent = `已開啟 ${selectedTextProviderLabel()} 登入視窗；登入完成後會自動更新狀態。`;
     scheduleTextProviderRefresh();
   } catch (error) {
-    logAppError("ai.login", error, {}, "error");
+    logAppError("ai.login", error, { providerId: selectedTextProviderId }, "error");
     textProviderDetail.textContent = `無法開啟登入：${formatError(error)}`;
   } finally {
     loginTextProviderButton.disabled = false;
@@ -271,8 +296,8 @@ loginTextProviderButton.addEventListener("click", async () => {
 });
 enableOAuthProviderButton.addEventListener("click", () => {
   if (!textProviderStatus?.authenticated) {
-    logAppError("ai.enable_without_auth", "AI enable was requested without authenticated subscription OAuth", {}, "warning");
-    textProviderDetail.textContent = "尚未登入 ChatGPT，無法啟用 AI。";
+    logAppError("ai.enable_without_auth", "AI enable was requested without authenticated subscription OAuth", { providerId: selectedTextProviderId }, "warning");
+    textProviderDetail.textContent = `尚未登入 ${selectedTextProviderLabel()}，無法啟用 AI。`;
     return;
   }
   setAiEnabledPreference(true);
@@ -397,7 +422,11 @@ async function installNativeListeners() {
 }
 
 async function createLiveSession() {
-  const request = { brief: createBriefFromSetupContext(), textProviderEnabled: canStartWithAi() };
+  const request = {
+    brief: createBriefFromSetupContext(),
+    textProviderEnabled: canStartWithAi(),
+    textProviderId: selectedTextProviderId
+  };
   if (nativeInvoke) {
     const payload = await nativeInvoke("start_session", { request });
     providerState.textContent = "會議已建立。";
@@ -640,6 +669,7 @@ async function maybeRunLiveTranscriptRevision({ allowReview = false, force = fal
     const response = await nativeInvoke("revise_transcript_oauth", {
       request: {
         sessionId: revisionSnapshot.sessionId,
+        textProviderId: selectedTextProviderId,
         transcript: revisionSnapshot.transcript
       }
     });
@@ -1030,7 +1060,7 @@ function finalizeMeetingReview({ statusText, runAiSummary = true, allowNewMeetin
     ? NO_REVIEW_CONTENT_MESSAGE
     : oauthAiEnabled && textProviderStatus?.authenticated
     ? runAiSummary
-      ? "本機文件已整理完成，正在用 ChatGPT 更新 AI 整理。"
+      ? `本機文件已整理完成，正在用 ${selectedTextProviderLabel()} 更新 AI 整理。`
       : "本機文件已先整理完成，錄音正在背景收尾。"
     : "整理完成，可以檢查文件並下載。";
   reviewStatus.textContent = readyText;
@@ -1166,7 +1196,7 @@ function buildMeetingArtifact() {
     prepContext,
     summary,
     localSummary,
-    summaryProvider: aiSummaryOverride ? "codex-chatgpt-oauth" : "local-rule",
+    summaryProvider: aiSummaryOverride ? selectedTextProviderId : "local-rule",
     transcript,
     rawTranscript,
     contextDiagnostics,
@@ -1176,32 +1206,36 @@ function buildMeetingArtifact() {
 }
 
 async function refreshTextProviderStatus() {
+  const requestedProviderId = selectedTextProviderId;
   if (!nativeInvoke) {
     textProviderStatus = {
       providerId: "browser-local-rule",
       kind: "local",
       authenticated: false,
       active: false,
-      statusLabel: "瀏覽器預覽無法登入 ChatGPT"
+      statusLabel: providerConfig().unavailableStatus
     };
     renderTextProviderStatus();
     return;
   }
-  textProviderDetail.textContent = "正在檢查 ChatGPT 登入狀態。";
+  textProviderDetail.textContent = `正在檢查 ${selectedTextProviderLabel()} 登入狀態。`;
   try {
-    textProviderStatus = await nativeInvoke("text_provider_status");
+    const status = await nativeInvoke("text_provider_status", { providerId: requestedProviderId });
+    if (requestedProviderId !== selectedTextProviderId) return;
+    textProviderStatus = status;
   } catch (error) {
-    logAppError("ai.text_provider_status", error, {}, "error");
+    if (requestedProviderId !== selectedTextProviderId) return;
+    logAppError("ai.text_provider_status", error, { providerId: selectedTextProviderId }, "error");
     textProviderStatus = {
-      providerId: "codex-chatgpt-oauth",
+      providerId: selectedTextProviderId,
       kind: "subscription_oauth",
       authenticated: false,
       active: false,
-      statusLabel: "無法檢查 ChatGPT 登入",
+      statusLabel: `無法檢查 ${selectedTextProviderLabel()} 登入`,
       lastError: formatError(error)
     };
   } finally {
-    renderTextProviderStatus();
+    if (requestedProviderId === selectedTextProviderId) renderTextProviderStatus();
   }
 }
 
@@ -1232,15 +1266,16 @@ function renderTextProviderStatus() {
   const authenticated = Boolean(textProviderStatus?.authenticated);
   providerSettings.classList.toggle("enabled", authenticated && oauthAiEnabled);
   textProviderName.textContent = oauthAiEnabled && authenticated
-    ? "ChatGPT 已啟用"
+    ? `${selectedTextProviderLabel()} 已啟用`
     : "AI 尚未啟用";
   textProviderDetail.textContent = oauthAiEnabled && authenticated
-    ? "會議背景整理、即時提醒與會後整理會送到 ChatGPT；語音辨識會分開處理。"
+    ? `會議背景整理、即時提醒與會後整理會送到 ${selectedTextProviderLabel()}；語音辨識會分開處理。`
     : authenticated
-      ? "已偵測到 ChatGPT 登入；按啟用後才會把會議內容送去 AI 整理。"
-      : `${textProviderStatus?.statusLabel ?? "尚未登入 ChatGPT"}；目前不會傳送會議內容。`;
+      ? `已偵測到 ${selectedTextProviderLabel()} 登入；按啟用後才會把會議內容送去 AI 整理。`
+      : `${textProviderStatus?.statusLabel ?? `尚未登入 ${selectedTextProviderLabel()}`}；目前不會傳送會議內容。`;
   enableOAuthProviderButton.disabled = !authenticated || oauthAiEnabled;
   enableOAuthProviderButton.textContent = oauthAiEnabled && authenticated ? "AI 已啟用" : "啟用 AI";
+  loginTextProviderButton.textContent = providerConfig().loginLabel;
   loginTextProviderButton.hidden = authenticated;
   syncStartButtonAvailability();
   setupController.renderPrepSummary();
@@ -1266,7 +1301,7 @@ function updateStartButtonCopy(ready) {
       ? "開始記錄會議音訊"
       : textProviderStatus?.authenticated
         ? "請先按左側啟用 AI"
-        : "請先登入 ChatGPT";
+        : providerMissingLoginCopy();
   }
 }
 
@@ -1285,6 +1320,75 @@ function setAiEnabledPreference(enabled) {
   } catch {
     // Local storage is only for restoring the user's opt-in after restart.
   }
+}
+
+function normalizeTextProviderId(providerId) {
+  return Object.prototype.hasOwnProperty.call(TEXT_PROVIDERS, providerId) ? providerId : "codex-chatgpt-oauth";
+}
+
+function providerConfig(providerId = selectedTextProviderId) {
+  return TEXT_PROVIDERS[normalizeTextProviderId(providerId)];
+}
+
+function selectedTextProviderLabel() {
+  return providerConfig().label;
+}
+
+function providerMissingLoginCopy() {
+  return providerConfig().missingLogin;
+}
+
+function readTextProviderPreference() {
+  try {
+    return normalizeTextProviderId(window.localStorage?.getItem(TEXT_PROVIDER_STORAGE_KEY));
+  } catch {
+    return "codex-chatgpt-oauth";
+  }
+}
+
+function writeTextProviderPreference(providerId) {
+  try {
+    window.localStorage?.setItem(TEXT_PROVIDER_STORAGE_KEY, providerId);
+  } catch {
+    // Local storage only restores the user's selected AI provider.
+  }
+}
+
+function syncTextProviderChoiceControls() {
+  for (const choice of textProviderChoices) {
+    choice.value = selectedTextProviderId;
+  }
+}
+
+async function setSelectedTextProvider(providerId, { keepEnabledIfAuthenticated = false } = {}) {
+  const nextProviderId = normalizeTextProviderId(providerId);
+  if (nextProviderId === selectedTextProviderId) {
+    syncTextProviderChoiceControls();
+    return;
+  }
+  selectedTextProviderId = nextProviderId;
+  writeTextProviderPreference(selectedTextProviderId);
+  syncTextProviderChoiceControls();
+  textProviderStatus = undefined;
+  if (!keepEnabledIfAuthenticated) setAiEnabledPreference(false);
+  renderTextProviderStatus();
+  if (nativeInvoke && activeSessionId && document.body.dataset.state === "listening") {
+    try {
+      await nativeInvoke("set_session_text_provider", {
+        sessionId: activeSessionId,
+        providerId: selectedTextProviderId
+      });
+    } catch (error) {
+      logAppError("ai.set_session_text_provider", error, { sessionId: activeSessionId, providerId: selectedTextProviderId }, "error");
+    }
+  }
+  await refreshTextProviderStatus();
+  if (nextProviderId !== selectedTextProviderId) return;
+  if (keepEnabledIfAuthenticated && !textProviderStatus?.authenticated) {
+    setAiEnabledPreference(false);
+    renderTextProviderStatus();
+  }
+  if (oauthAiEnabled) setupController.schedulePrepSummaryGeneration();
 }
 
 function scheduleTextProviderRefresh() {
@@ -1307,12 +1411,13 @@ async function generateOAuthSummaryIfEnabled(sessionId = activeSessionId) {
     downloadState.textContent = "沒有可整理內容；可下載錯誤紀錄協助排查。";
     return;
   }
-  downloadState.textContent = "正在用 ChatGPT 產生 AI 整理。";
-  reviewStatus.textContent = "本機文件已可檢查；ChatGPT 正在更新 AI 整理。";
-  setAiActivity("post_meeting_summary", "ChatGPT 正在更新 AI 整理");
+  downloadState.textContent = `正在用 ${selectedTextProviderLabel()} 產生 AI 整理。`;
+  reviewStatus.textContent = `本機文件已可檢查；${selectedTextProviderLabel()} 正在更新 AI 整理。`;
+  setAiActivity("post_meeting_summary", `${selectedTextProviderLabel()} 正在更新 AI 整理`);
   try {
     const response = await nativeInvoke("generate_ai_summary_oauth", {
       request: {
+        textProviderId: selectedTextProviderId,
         title: artifact.title,
         sessionId: artifact.sessionId,
         generatedAt: artifact.generatedAt,
@@ -1338,9 +1443,9 @@ async function generateOAuthSummaryIfEnabled(sessionId = activeSessionId) {
     }
     aiSummaryOverride = undefined;
     renderPostMeetingReview();
-    reviewStatus.textContent = "ChatGPT 整理暫時失敗；已保留本機整理，可以先下載。";
+    reviewStatus.textContent = `${selectedTextProviderLabel()} 整理暫時失敗；已保留本機整理，可以先下載。`;
     downloadState.textContent = `AI 整理暫時失敗，已保留本機整理：${formatError(error)}`;
-    clearAiActivity("post_meeting_summary", "ChatGPT 整理暫時失敗；已保留本機整理。");
+    clearAiActivity("post_meeting_summary", `${selectedTextProviderLabel()} 整理暫時失敗；已保留本機整理。`);
   }
 }
 

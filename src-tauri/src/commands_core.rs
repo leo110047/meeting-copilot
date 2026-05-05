@@ -13,16 +13,17 @@ use crate::desktop_types::{
 };
 use crate::native_storage::{
     LlmUsageLogInput, insert_decision_snapshot_with_source, insert_llm_usage_log, insert_session,
-    insert_suggestion, list_app_error_logs, log_app_error_inner, log_extraction_failure,
-    log_provider_failure, log_provider_usage, native_speech_helper_path, native_speech_provider_id,
-    run_native_transcriber_health_check,
+    insert_suggestion, list_app_error_logs, log_app_error_inner, log_extraction_failure_for,
+    log_provider_failure_for, log_provider_usage_for, native_speech_helper_path,
+    native_speech_provider_id, record_session_text_provider, run_native_transcriber_health_check,
 };
 use crate::oauth_provider::{
     build_ai_summary_prompt, build_live_state_patch_prompt, build_prep_summary_prompt,
-    build_transcript_revision_prompt, cleanup_transcript_text_oauth_inner,
+    build_transcript_revision_prompt, cleanup_transcript_text_with_provider_inner,
     parse_ai_summary_sections, parse_live_coaching_suggestions, parse_live_state_patch,
-    parse_prep_summary_points, parse_transcript_revision_response, run_codex_oauth_prompt,
-    run_codex_oauth_prompt_with_timeout, start_subscription_oauth_login, subscription_oauth_status,
+    parse_prep_summary_points, parse_transcript_revision_response,
+    run_text_provider_prompt_with_timeout, start_text_provider_login_for, text_provider_status_for,
+    text_provider_summary,
 };
 use crate::shell_storage::{
     app_db_path, open_db, read_dropped_context_file, set_native_window_opacity,
@@ -53,6 +54,9 @@ pub(crate) fn start_session(
         .as_ref()
         .and_then(|body| body.text_provider_enabled)
         .unwrap_or(false);
+    let text_provider_id = request
+        .as_ref()
+        .and_then(|body| body.text_provider_id.clone());
     let mut brief = request
         .and_then(|body| body.brief)
         .unwrap_or_else(default_brief);
@@ -61,7 +65,13 @@ pub(crate) fn start_session(
     }
     let db_path = app_db_path()?;
     let conn = open_db(&db_path)?;
-    insert_session(&conn, &brief, text_provider_enabled)?;
+    let (session_text_provider, _) = text_provider_summary(text_provider_id.as_deref());
+    insert_session(
+        &conn,
+        &brief,
+        text_provider_enabled,
+        Some(session_text_provider),
+    )?;
     LIVE_SESSIONS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -70,6 +80,7 @@ pub(crate) fn start_session(
             brief.session_id.clone(),
             NativeLiveSession {
                 brief: brief.clone(),
+                text_provider_id,
                 events: vec![],
                 shown_suggestion_ids: HashSet::new(),
             },
@@ -250,20 +261,42 @@ pub(crate) fn request_screen_recording_permission() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn text_provider_status() -> TextProviderStatus {
-    subscription_oauth_status()
+pub(crate) fn text_provider_status(provider_id: Option<String>) -> TextProviderStatus {
+    text_provider_status_for(provider_id.as_deref())
 }
 
 #[tauri::command]
-pub(crate) fn start_text_provider_login() -> Result<(), String> {
-    start_subscription_oauth_login()
+pub(crate) fn start_text_provider_login(provider_id: Option<String>) -> Result<(), String> {
+    start_text_provider_login_for(provider_id.as_deref())
+}
+
+#[tauri::command]
+pub(crate) fn set_session_text_provider(
+    session_id: String,
+    provider_id: Option<String>,
+) -> Result<(), String> {
+    let mut sessions = LIVE_SESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    let normalized = text_provider_summary(provider_id.as_deref()).0.to_string();
+    session.text_provider_id = Some(normalized.clone());
+    drop(sessions);
+    let db_path = app_db_path()?;
+    let conn = open_db(&db_path)?;
+    record_session_text_provider(&conn, &session_id, &normalized)?;
+    Ok(())
 }
 
 #[tauri::command]
 pub(crate) fn generate_ai_summary_oauth(
     request: AiSummaryRequest,
 ) -> Result<AiSummaryResponse, String> {
-    let status = subscription_oauth_status();
+    let provider_id = request.text_provider_id.as_deref();
+    let status = text_provider_status_for(provider_id);
     if !status.authenticated {
         return Err(status
             .last_error
@@ -271,10 +304,12 @@ pub(crate) fn generate_ai_summary_oauth(
     }
     let prompt = build_ai_summary_prompt(&request)?;
     let started = now_ms();
-    let raw_output = match run_codex_oauth_prompt(&prompt) {
-        Ok(output) => output,
+    let run = match run_text_provider_prompt_with_timeout(provider_id, &prompt, 60_000) {
+        Ok(run) => run,
         Err(error) => {
-            let _ = log_provider_failure(
+            let (provider, _) = text_provider_summary(provider_id);
+            let _ = log_provider_failure_for(
+                provider,
                 &request.session_id,
                 "generate_ai_summary",
                 "generate_ai_summary.oauth.v1",
@@ -284,10 +319,12 @@ pub(crate) fn generate_ai_summary_oauth(
             return Err(error);
         }
     };
+    let raw_output = run.output;
     let summary = match parse_ai_summary_sections(&raw_output) {
         Ok(summary) => summary,
         Err(error) => {
-            let _ = log_provider_failure(
+            let _ = log_provider_failure_for(
+                run.provider_id,
                 &request.session_id,
                 "generate_ai_summary",
                 "generate_ai_summary.oauth.v1",
@@ -297,7 +334,9 @@ pub(crate) fn generate_ai_summary_oauth(
             return Err(error);
         }
     };
-    let _ = log_provider_usage(
+    let _ = log_provider_usage_for(
+        run.provider_id,
+        run.model,
         &request.session_id,
         "generate_ai_summary",
         "generate_ai_summary.oauth.v1",
@@ -306,8 +345,8 @@ pub(crate) fn generate_ai_summary_oauth(
         now_ms().saturating_sub(started) as i64,
     );
     Ok(AiSummaryResponse {
-        provider_id: "codex-chatgpt-oauth".to_string(),
-        model: "subscription_oauth".to_string(),
+        provider_id: run.provider_id.to_string(),
+        model: run.model.to_string(),
         summary,
         raw_output_ref: stable_id(&raw_output),
     })
@@ -317,15 +356,17 @@ pub(crate) fn generate_ai_summary_oauth(
 pub(crate) fn revise_transcript_oauth(
     request: TranscriptRevisionRequest,
 ) -> Result<TranscriptRevisionResponse, String> {
+    let provider_id = request.text_provider_id.as_deref();
+    let (empty_provider, empty_model) = text_provider_summary(provider_id);
     if request.transcript.is_empty() {
         return Ok(TranscriptRevisionResponse {
-            provider_id: "codex-chatgpt-oauth".to_string(),
-            model: "subscription_oauth".to_string(),
+            provider_id: empty_provider.to_string(),
+            model: empty_model.to_string(),
             transcript: vec![],
             raw_output_ref: stable_id("empty-transcript-revision"),
         });
     }
-    let status = subscription_oauth_status();
+    let status = text_provider_status_for(provider_id);
     if !status.authenticated {
         return Err(status
             .last_error
@@ -333,10 +374,12 @@ pub(crate) fn revise_transcript_oauth(
     }
     let prompt = build_transcript_revision_prompt(&request)?;
     let started = now_ms();
-    let raw_output = match run_codex_oauth_prompt_with_timeout(&prompt, 18_000) {
-        Ok(output) => output,
+    let run = match run_text_provider_prompt_with_timeout(provider_id, &prompt, 18_000) {
+        Ok(run) => run,
         Err(error) => {
-            let _ = log_provider_failure(
+            let (provider, _) = text_provider_summary(provider_id);
+            let _ = log_provider_failure_for(
+                provider,
                 &request.session_id,
                 "revise_transcript",
                 "revise_transcript.oauth.v1",
@@ -346,10 +389,12 @@ pub(crate) fn revise_transcript_oauth(
             return Err(error);
         }
     };
+    let raw_output = run.output;
     let transcript = match parse_transcript_revision_response(&raw_output, &request) {
         Ok(transcript) => transcript,
         Err(error) => {
-            let _ = log_provider_failure(
+            let _ = log_provider_failure_for(
+                run.provider_id,
                 &request.session_id,
                 "revise_transcript",
                 "revise_transcript.oauth.v1",
@@ -359,7 +404,9 @@ pub(crate) fn revise_transcript_oauth(
             return Err(error);
         }
     };
-    let _ = log_provider_usage(
+    let _ = log_provider_usage_for(
+        run.provider_id,
+        run.model,
         &request.session_id,
         "revise_transcript",
         "revise_transcript.oauth.v1",
@@ -368,8 +415,8 @@ pub(crate) fn revise_transcript_oauth(
         now_ms().saturating_sub(started) as i64,
     );
     Ok(TranscriptRevisionResponse {
-        provider_id: "codex-chatgpt-oauth".to_string(),
-        model: "subscription_oauth".to_string(),
+        provider_id: run.provider_id.to_string(),
+        model: run.model.to_string(),
         transcript,
         raw_output_ref: stable_id(&raw_output),
     })
@@ -379,16 +426,18 @@ pub(crate) fn revise_transcript_oauth(
 pub(crate) fn generate_prep_summary_oauth(
     request: PrepSummaryRequest,
 ) -> Result<PrepSummaryResponse, String> {
-    let status = subscription_oauth_status();
+    let provider_id = request.text_provider_id.as_deref();
+    let status = text_provider_status_for(provider_id);
     if !status.authenticated {
         return Err(status
             .last_error
             .unwrap_or_else(|| "subscription OAuth provider is not authenticated".to_string()));
     }
+    let (empty_provider, empty_model) = text_provider_summary(provider_id);
     if request.context.trim().is_empty() {
         return Ok(PrepSummaryResponse {
-            provider_id: "codex-chatgpt-oauth".to_string(),
-            model: "subscription_oauth".to_string(),
+            provider_id: empty_provider.to_string(),
+            model: empty_model.to_string(),
             key_points: vec![],
             raw_output_ref: stable_id("empty-prep-summary"),
         });
@@ -396,10 +445,12 @@ pub(crate) fn generate_prep_summary_oauth(
     let prompt = build_prep_summary_prompt(&request)?;
     let audit_id = stable_id(&format!("prep:{}:{}", request.file_count, request.context));
     let started = now_ms();
-    let raw_output = match run_codex_oauth_prompt_with_timeout(&prompt, 25_000) {
-        Ok(output) => output,
+    let run = match run_text_provider_prompt_with_timeout(provider_id, &prompt, 25_000) {
+        Ok(run) => run,
         Err(error) => {
-            let _ = log_provider_failure(
+            let (provider, _) = text_provider_summary(provider_id);
+            let _ = log_provider_failure_for(
+                provider,
                 &audit_id,
                 "generate_prep_summary",
                 "generate_prep_summary.oauth.v1",
@@ -409,10 +460,12 @@ pub(crate) fn generate_prep_summary_oauth(
             return Err(error);
         }
     };
+    let raw_output = run.output;
     let key_points = match parse_prep_summary_points(&raw_output) {
         Ok(points) => points,
         Err(error) => {
-            let _ = log_provider_failure(
+            let _ = log_provider_failure_for(
+                run.provider_id,
                 &audit_id,
                 "generate_prep_summary",
                 "generate_prep_summary.oauth.v1",
@@ -422,7 +475,9 @@ pub(crate) fn generate_prep_summary_oauth(
             return Err(error);
         }
     };
-    let _ = log_provider_usage(
+    let _ = log_provider_usage_for(
+        run.provider_id,
+        run.model,
         &audit_id,
         "generate_prep_summary",
         "generate_prep_summary.oauth.v1",
@@ -431,8 +486,8 @@ pub(crate) fn generate_prep_summary_oauth(
         now_ms().saturating_sub(started) as i64,
     );
     Ok(PrepSummaryResponse {
-        provider_id: "codex-chatgpt-oauth".to_string(),
-        model: "subscription_oauth".to_string(),
+        provider_id: run.provider_id.to_string(),
+        model: run.model.to_string(),
         key_points,
         raw_output_ref: stable_id(&raw_output),
     })
@@ -442,11 +497,17 @@ pub(crate) fn generate_prep_summary_oauth(
 pub(crate) fn cleanup_transcript_text_oauth(
     request: TranscriptCleanupRequest,
 ) -> Result<TranscriptCleanupResponse, String> {
-    let cleaned =
-        cleanup_transcript_text_oauth_inner(&request.text, &request.context, Some("ui_cleanup"))?;
+    let provider_id = request.text_provider_id.as_deref();
+    let (provider, model) = text_provider_summary(provider_id);
+    let cleaned = cleanup_transcript_text_with_provider_inner(
+        provider_id,
+        &request.text,
+        &request.context,
+        Some("ui_cleanup"),
+    )?;
     Ok(TranscriptCleanupResponse {
-        provider_id: "codex-chatgpt-oauth".to_string(),
-        model: "subscription_oauth".to_string(),
+        provider_id: provider.to_string(),
+        model: model.to_string(),
         raw_output_ref: stable_id(&cleaned),
         text: cleaned,
     })
@@ -477,7 +538,19 @@ pub(crate) fn export_app_error_logs(
 pub(crate) fn extract_live_state_patch_oauth(
     session_id: String,
 ) -> Result<IngestTranscriptResponse, String> {
-    let status = subscription_oauth_status();
+    let provider_id = {
+        let sessions = LIVE_SESSIONS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|error| error.to_string())?;
+        sessions
+            .get(&session_id)
+            .ok_or_else(|| "session not found".to_string())?
+            .text_provider_id
+            .clone()
+    };
+    let provider_id_ref = provider_id.as_deref();
+    let status = text_provider_status_for(provider_id_ref);
     if !status.authenticated {
         return Err(status
             .last_error
@@ -500,20 +573,23 @@ pub(crate) fn extract_live_state_patch_oauth(
     let local_state = derive_decision_state(&session_id, &events);
     let prompt = build_live_state_patch_prompt(&brief, &events, &local_state)?;
     let started = now_ms();
-    let raw_output = match run_codex_oauth_prompt_with_timeout(&prompt, 25_000) {
-        Ok(output) => output,
+    let run = match run_text_provider_prompt_with_timeout(provider_id_ref, &prompt, 25_000) {
+        Ok(run) => run,
         Err(error) => {
-            log_extraction_failure(&session_id, "timeout_or_api_error", &error)?;
+            let (provider, _) = text_provider_summary(provider_id_ref);
+            log_extraction_failure_for(&session_id, provider, "timeout_or_api_error", &error)?;
             return Err(format!(
                 "subscription OAuth live extraction failed: {error}"
             ));
         }
     };
+    let raw_output = run.output;
     let patch = match parse_live_state_patch(&raw_output) {
         Ok(patch) => patch,
         Err((failure_kind, error)) => {
-            log_extraction_failure(
+            log_extraction_failure_for(
                 &session_id,
+                run.provider_id,
                 failure_kind,
                 &format!("{error}: {}", stable_id(&raw_output)),
             )?;
@@ -534,7 +610,7 @@ pub(crate) fn extract_live_state_patch_oauth(
                 "info",
                 &error,
                 serde_json::json!({
-                    "provider": "codex-chatgpt-oauth",
+                    "provider": run.provider_id,
                     "promptVersion": "extract_state_patch.oauth.v1",
                     "rawOutputRef": stable_id(&raw_output)
                 }),
@@ -543,8 +619,9 @@ pub(crate) fn extract_live_state_patch_oauth(
             vec![]
         }
         Err((failure_kind, error)) => {
-            log_extraction_failure(
+            log_extraction_failure_for(
                 &session_id,
+                run.provider_id,
                 failure_kind,
                 &format!(
                     "live coaching rejected: {error}: {}",
@@ -593,8 +670,8 @@ pub(crate) fn extract_live_state_patch_oauth(
         LlmUsageLogInput {
             session_id: &session_id,
             call_type: "extract_state_patch",
-            provider: "codex-chatgpt-oauth",
-            model: "subscription_oauth",
+            provider: run.provider_id,
+            model: run.model,
             prompt_version: "extract_state_patch.oauth.v1",
             prompt: &prompt,
             output: &raw_output,

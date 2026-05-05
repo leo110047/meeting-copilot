@@ -5,7 +5,7 @@ use crate::commands_audio::{
 use crate::decision_logic::stable_id;
 use crate::desktop_types::HelperTranscriptLine;
 use crate::native_storage::{log_app_error_inner, macos_speech_bridge_path};
-use crate::oauth_provider::cleanup_transcript_text_oauth_inner;
+use crate::oauth_provider::cleanup_transcript_text_with_provider_inner;
 use std::collections::HashMap;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::{Mutex, OnceLock};
@@ -84,6 +84,7 @@ pub(crate) struct MacosSpeechCallbackContext {
     session_id: String,
     source: String,
     purpose: String,
+    text_provider_id: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -296,6 +297,7 @@ pub(crate) fn start_macos_speech_bridge(
         session_id: session_id.to_string(),
         source: source.to_string(),
         purpose: "live".to_string(),
+        text_provider_id: None,
     });
     let context_ptr = Box::into_raw(context);
     let handle = unsafe {
@@ -330,6 +332,7 @@ pub(crate) fn start_macos_speech_bridge(
 pub(crate) fn start_macos_prep_dictation_bridge(
     app: tauri::AppHandle,
     language: &str,
+    text_provider_id: Option<String>,
 ) -> Result<(), String> {
     let api = macos_speech_bridge_api()?;
     let source_c = std::ffi::CString::new("mic").map_err(|error| error.to_string())?;
@@ -339,6 +342,7 @@ pub(crate) fn start_macos_prep_dictation_bridge(
         session_id: "prep_dictation".to_string(),
         source: "mic".to_string(),
         purpose: "prep".to_string(),
+        text_provider_id,
     });
     let context_ptr = Box::into_raw(context);
     let handle = unsafe {
@@ -495,7 +499,8 @@ pub(crate) unsafe extern "C" fn macos_speech_bridge_callback(
                 && helper_line.kind == "transcript"
                 && helper_line.is_final =>
         {
-            let cleaned_text = match cleanup_transcript_text_oauth_inner(
+            let cleaned_text = match cleanup_transcript_text_with_provider_inner(
+                context.text_provider_id.as_deref(),
                 &helper_line.text,
                 "prep_dictation",
                 Some("prep_dictation_cleanup"),

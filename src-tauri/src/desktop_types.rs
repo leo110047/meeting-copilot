@@ -43,6 +43,7 @@ pub(crate) fn desktop_shell_plan() -> DesktopShellPlan {
 #[derive(Debug)]
 pub(crate) struct NativeLiveSession {
     pub(crate) brief: MeetingBrief,
+    pub(crate) text_provider_id: Option<String>,
     pub(crate) events: Vec<TranscriptEvent>,
     pub(crate) shown_suggestion_ids: HashSet<String>,
 }
@@ -68,6 +69,9 @@ pub(crate) struct MeetingBrief {
 pub(crate) struct StartSessionRequest {
     pub(crate) brief: Option<MeetingBrief>,
     pub(crate) text_provider_enabled: Option<bool>,
+    // Provider routing only. Provider IDs are logged in dedicated audit columns, not echoed into prompt payload JSON.
+    #[serde(default, skip_serializing)]
+    pub(crate) text_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +265,9 @@ pub(crate) struct AiSummarySections {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AiSummaryRequest {
+    // Provider routing only. Provider IDs are logged in dedicated audit columns, not echoed into prompt payload JSON.
+    #[serde(default, skip_serializing)]
+    pub(crate) text_provider_id: Option<String>,
     pub(crate) title: String,
     pub(crate) session_id: String,
     pub(crate) generated_at: String,
@@ -281,6 +288,9 @@ pub(crate) struct AiSummaryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PrepSummaryRequest {
+    // Provider routing only. Provider IDs are logged in dedicated audit columns, not echoed into prompt payload JSON.
+    #[serde(default, skip_serializing)]
+    pub(crate) text_provider_id: Option<String>,
     pub(crate) context: String,
     pub(crate) file_count: usize,
 }
@@ -297,6 +307,9 @@ pub(crate) struct PrepSummaryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TranscriptCleanupRequest {
+    // Provider routing only. Provider IDs are logged in dedicated audit columns, not echoed into prompt payload JSON.
+    #[serde(default, skip_serializing)]
+    pub(crate) text_provider_id: Option<String>,
     pub(crate) text: String,
     pub(crate) context: String,
 }
@@ -314,6 +327,9 @@ pub(crate) struct TranscriptCleanupResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TranscriptRevisionRequest {
     pub(crate) session_id: String,
+    // Provider routing only. Provider IDs are logged in dedicated audit columns, not echoed into prompt payload JSON.
+    #[serde(default, skip_serializing)]
+    pub(crate) text_provider_id: Option<String>,
     pub(crate) transcript: Vec<AiTranscriptLine>,
 }
 

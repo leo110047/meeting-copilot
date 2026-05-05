@@ -11,14 +11,19 @@ use crate::desktop_types::{
     LiveMeetingStatePatch, LiveStatePatchEnvelope, NativeLiveSession, TranscriptCleanupRequest,
     TranscriptEvent, TranscriptRevisionRequest,
 };
-use crate::native_storage::{insert_app_error_log, list_app_error_logs};
+use crate::native_storage::{
+    insert_app_error_log, insert_session, list_app_error_logs, record_session_text_provider,
+};
 #[cfg(not(target_os = "windows"))]
 use crate::oauth_provider::codex_unix_fallback_candidates;
 use crate::oauth_provider::{
-    SubscriptionOAuthParse, build_live_state_patch_prompt, build_transcript_cleanup_prompt,
-    build_transcript_revision_prompt, codex_command_available, parse_live_coaching_suggestions,
+    CLAUDE_TEXT_PROVIDER_ID, CODEX_TEXT_PROVIDER_ID, SubscriptionOAuthParse,
+    build_live_state_patch_prompt, build_transcript_cleanup_prompt,
+    build_transcript_revision_prompt, cached_text_provider_count_for_tests, claude_command_path,
+    codex_command_available, normalize_text_provider_id, parse_claude_auth_status,
+    parse_claude_print_result, parse_live_coaching_suggestions,
     parse_subscription_oauth_authenticated, parse_transcript_cleanup_text,
-    parse_transcript_revision_response, start_subscription_oauth_login,
+    parse_transcript_revision_response, start_subscription_oauth_login, text_provider_summary,
     validate_live_state_patch_value, windows_codex_executable_names,
     windows_executable_extensions_from_pathext,
 };
@@ -136,6 +141,119 @@ fn oauth_status_parser_does_not_accept_negative_logged_in_text() {
 }
 
 #[test]
+fn text_provider_id_normalization_defaults_to_codex_and_accepts_claude() {
+    assert_eq!(normalize_text_provider_id(None), CODEX_TEXT_PROVIDER_ID);
+    assert_eq!(
+        normalize_text_provider_id(Some("unknown-provider")),
+        CODEX_TEXT_PROVIDER_ID
+    );
+    assert_eq!(
+        normalize_text_provider_id(Some(CLAUDE_TEXT_PROVIDER_ID)),
+        CLAUDE_TEXT_PROVIDER_ID
+    );
+    assert_eq!(
+        text_provider_summary(Some(CLAUDE_TEXT_PROVIDER_ID)),
+        (CLAUDE_TEXT_PROVIDER_ID, "subscription_oauth")
+    );
+}
+
+#[test]
+fn text_provider_status_cache_is_provider_keyed() {
+    crate::oauth_provider::clear_text_provider_status_cache(Some(CODEX_TEXT_PROVIDER_ID));
+    crate::oauth_provider::clear_text_provider_status_cache(Some(CLAUDE_TEXT_PROVIDER_ID));
+    assert_eq!(cached_text_provider_count_for_tests(), 0);
+}
+
+#[test]
+fn claude_cli_probe_flags_are_supported_when_binary_exists() {
+    let claude = claude_command_path();
+    let output = std::process::Command::new(&claude).arg("--help").output();
+    let Ok(output) = output else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for expected in [
+        "auth",
+        "--tools",
+        "--no-session-persistence",
+        "--no-chrome",
+        "--output-format",
+    ] {
+        assert!(
+            help.contains(expected),
+            "Claude Code help is missing expected flag or command: {expected}"
+        );
+    }
+    let auth_output = std::process::Command::new(&claude)
+        .arg("auth")
+        .arg("--help")
+        .output()
+        .expect("run claude auth --help");
+    assert!(auth_output.status.success());
+    let auth_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&auth_output.stdout),
+        String::from_utf8_lossy(&auth_output.stderr)
+    );
+    assert!(auth_help.contains("login"));
+    assert!(auth_help.contains("status"));
+
+    let flag_probe = std::process::Command::new(&claude)
+        .arg("-p")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--tools")
+        .arg("")
+        .arg("--no-session-persistence")
+        .arg("--no-chrome")
+        .arg("--help")
+        .output()
+        .expect("run claude print flag probe");
+    assert!(
+        flag_probe.status.success(),
+        "Claude Code did not accept Meeting Copilot's print-mode flags: {}{}",
+        String::from_utf8_lossy(&flag_probe.stdout),
+        String::from_utf8_lossy(&flag_probe.stderr)
+    );
+}
+
+#[test]
+fn claude_auth_status_parser_reads_json_status() {
+    assert_eq!(
+        parse_claude_auth_status(
+            r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}"#
+        ),
+        Some((
+            true,
+            "已登入 Claude Code（claude.ai/firstParty）".to_string()
+        ))
+    );
+    assert_eq!(
+        parse_claude_auth_status(
+            r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#
+        ),
+        Some((false, "尚未登入 Claude Code".to_string()))
+    );
+}
+
+#[test]
+fn claude_print_parser_extracts_result_wrapper() {
+    assert_eq!(
+        parse_claude_print_result(r#"{"type":"result","is_error":false,"result":"{\"ok\":true}"}"#)
+            .expect("parse claude print result"),
+        r#"{"ok":true}"#
+    );
+    assert!(parse_claude_print_result(r#"{"is_error":true,"result":"failed"}"#).is_err());
+}
+
+#[test]
 fn transcript_cleanup_parser_accepts_text_only_shape() {
     let cleaned =
         parse_transcript_cleanup_text(r#"{"text":"這場只確認 demo 範圍，不承諾正式版時程。"}"#)
@@ -146,6 +264,7 @@ fn transcript_cleanup_parser_accepts_text_only_shape() {
 #[test]
 fn transcript_cleanup_prompt_preserves_meaning_boundary() {
     let prompt = build_transcript_cleanup_prompt(&TranscriptCleanupRequest {
+        text_provider_id: None,
         text: "呃我們就是先確認 demo scope 然後不承諾 deadline".to_string(),
         context: "test".to_string(),
     })
@@ -167,6 +286,7 @@ fn transcript_cleanup_context_includes_source_and_recent_lines() {
             session_id.clone(),
             NativeLiveSession {
                 brief: crate::decision_logic::default_brief(),
+                text_provider_id: Some("codex-chatgpt-oauth".to_string()),
                 events: vec![TranscriptEvent {
                     id: "event_1".to_string(),
                     session_id: session_id.clone(),
@@ -253,6 +373,7 @@ fn transcript_revision_parser_sanitizes_unknown_source_speaker() {
 fn transcript_revision_request_fixture() -> TranscriptRevisionRequest {
     TranscriptRevisionRequest {
         session_id: "session_1".to_string(),
+        text_provider_id: None,
         transcript: vec![
             AiTranscriptLine {
                 id: "l1".to_string(),
@@ -298,6 +419,40 @@ fn app_error_log_round_trips_diagnostic_detail() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].stage, "native_transcription.stderr");
     assert_eq!(records[0].detail_json["platform"], "test");
+}
+
+#[test]
+fn session_disclosure_records_provider_switch_history() {
+    let db_path = std::env::temp_dir().join(format!(
+        "meeting-copilot-provider-disclosure-{}.db",
+        now_ms()
+    ));
+    let conn = open_db(&db_path).expect("open temp db");
+    let mut brief = crate::decision_logic::default_brief();
+    brief.session_id = format!("provider_disclosure_{}", now_ms());
+    insert_session(&conn, &brief, true, Some(CODEX_TEXT_PROVIDER_ID)).expect("insert session");
+    record_session_text_provider(&conn, &brief.session_id, CLAUDE_TEXT_PROVIDER_ID)
+        .expect("record provider switch");
+    let disclosure_text: String = conn
+        .query_row(
+            "SELECT processing_disclosure_json FROM meeting_sessions WHERE id = ?1",
+            rusqlite::params![brief.session_id],
+            |row| row.get(0),
+        )
+        .expect("read disclosure");
+    let _ = fs::remove_file(db_path);
+    let disclosure: serde_json::Value =
+        serde_json::from_str(&disclosure_text).expect("parse disclosure");
+    assert_eq!(disclosure["llmProvider"], CLAUDE_TEXT_PROVIDER_ID);
+    assert_eq!(disclosure["llmProviders"][0], CODEX_TEXT_PROVIDER_ID);
+    assert_eq!(disclosure["llmProviders"][1], CLAUDE_TEXT_PROVIDER_ID);
+    assert_eq!(
+        disclosure["providerChanges"]
+            .as_array()
+            .expect("provider changes")
+            .len(),
+        2
+    );
 }
 
 #[test]

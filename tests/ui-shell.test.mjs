@@ -29,6 +29,9 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(html, /setupContext/);
   assert.match(html, /provider-settings/);
   assert.match(html, /textProviderName/);
+  assert.match(html, /textProviderChoice/);
+  assert.match(html, /liveTextProviderChoice/);
+  assert.match(html, /claude-code-oauth/);
   assert.match(html, /loginTextProvider/);
   assert.match(html, /enableOAuthProvider/);
   assert.match(html, /AI 狀態/);
@@ -126,6 +129,10 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /clearTimeout\(timer\)/);
   assert.match(js, /text_provider_status/);
   assert.match(js, /start_text_provider_login/);
+  assert.match(js, /set_session_text_provider/);
+  assert.match(js, /TEXT_PROVIDER_STORAGE_KEY/);
+  assert.match(js, /selectedTextProviderId/);
+  assert.match(js, /claude-code-oauth/);
   assert.match(js, /generate_ai_summary_oauth/);
   assert.match(js, /generate_prep_summary_oauth/);
   assert.match(js, /schedulePrepSummaryGeneration/);
@@ -170,9 +177,13 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /開始記錄會議音訊/);
   assert.match(js, /請先按左側啟用 AI/);
   assert.match(js, /textProviderEnabled: canStartWithAi\(\)/);
+  assert.match(js, /textProviderId: selectedTextProviderId/);
+  assert.match(js, /document\.body\.dataset\.state === "listening"/);
+  assert.doesNotMatch(js, /ai\.set_session_text_provider[\s\S]{0,260}setAiEnabledPreference\(false\)/);
+  assert.match(js, /if \(nextProviderId !== selectedTextProviderId\) return/);
   assert.match(js, /syncStartButtonAvailability/);
   assert.match(js, /請先啟用 AI/);
-  assert.match(js, /ChatGPT 已啟用/);
+  assert.match(js, /selectedTextProviderLabel\(\)\} 已啟用/);
   assert.match(js, /installOpacityControl/);
   assert.match(js, /clamp\(Number\(curtainOpacity\.value\), 10, 100\)/);
   assert.match(js, /set_window_opacity/);
@@ -213,6 +224,7 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /installPrepDictationListeners/);
   assert.match(js, /請先啟用 AI，才能使用語音輸入/);
   assert.match(js, /start_prep_dictation/);
+  assert.match(js, /start_prep_dictation", \{ providerId: selectedTextProviderId\(\) \}/);
   assert.match(js, /stop_prep_dictation/);
   assert.match(js, /prep_dictation_text/);
   assert.match(js, /droppedContextChunks/);
@@ -246,7 +258,7 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /hasReviewContent/);
   assert.match(js, /renderNoReviewInput/);
   assert.match(js, /syncReviewDownloadButtons/);
-  assert.match(js, /不會送出空內容給 ChatGPT/);
+  assert.match(js, /不會送出空內容給 AI/);
   assert.match(js, /沒有收到逐字稿，也沒有可整理的會前資料/);
   assert.match(js, /本機文件已整理完成/);
   assert.match(js, /AI 整理已更新/);

@@ -8,7 +8,7 @@ use crate::native_storage::{
     ensure_session_exists, insert_decision_snapshot, insert_transcript_event, log_app_error_inner,
     native_speech_helper_path, native_speech_provider_id,
 };
-use crate::oauth_provider::cleanup_transcript_text_oauth_inner;
+use crate::oauth_provider::cleanup_transcript_text_with_provider_inner;
 use crate::shell_storage::{app_db_path, open_db, set_listening_window_mode, show_main_window};
 use crate::{LIVE_SESSIONS, NATIVE_TRANSCRIBERS, PREP_DICTATION};
 use std::collections::HashMap;
@@ -30,10 +30,11 @@ use crate::macos_speech_bridge::{
 #[cfg(target_os = "macos")]
 pub(crate) fn start_prep_dictation(
     app: tauri::AppHandle,
+    provider_id: Option<String>,
 ) -> Result<PrepDictationStartResponse, String> {
     stop_prep_dictation()?;
     let language = "zh-TW".to_string();
-    start_macos_prep_dictation_bridge(app, &language)?;
+    start_macos_prep_dictation_bridge(app, &language, provider_id)?;
     Ok(PrepDictationStartResponse {
         provider_id: native_speech_provider_id().to_string(),
         language,
@@ -45,6 +46,7 @@ pub(crate) fn start_prep_dictation(
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn start_prep_dictation(
     app: tauri::AppHandle,
+    provider_id: Option<String>,
 ) -> Result<PrepDictationStartResponse, String> {
     stop_prep_dictation()?;
     let language = "zh-TW".to_string();
@@ -78,7 +80,8 @@ pub(crate) fn start_prep_dictation(
             let parsed: Result<HelperTranscriptLine, _> = serde_json::from_str(&line);
             match parsed {
                 Ok(helper_line) if helper_line.kind == "transcript" && helper_line.is_final => {
-                    let cleaned_text = match cleanup_transcript_text_oauth_inner(
+                    let cleaned_text = match cleanup_transcript_text_with_provider_inner(
+                        provider_id.as_deref(),
                         &helper_line.text,
                         "prep_dictation",
                         Some("prep_dictation_cleanup"),
@@ -400,7 +403,16 @@ pub(crate) fn handle_native_transcript_line(
     helper_line: HelperTranscriptLine,
 ) {
     let cleanup_context = transcript_cleanup_context(session_id, &helper_line);
-    let cleaned_text = match cleanup_transcript_text_oauth_inner(
+    let text_provider_id = LIVE_SESSIONS
+        .get()
+        .and_then(|sessions| sessions.lock().ok())
+        .and_then(|sessions| {
+            sessions
+                .get(session_id)
+                .and_then(|session| session.text_provider_id.clone())
+        });
+    let cleaned_text = match cleanup_transcript_text_with_provider_inner(
+        text_provider_id.as_deref(),
         &helper_line.text,
         &cleanup_context,
         Some(session_id),

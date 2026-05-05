@@ -13,7 +13,8 @@ Meeting Copilot 是一個 native desktop app，用來在會議中即時輔助決
 - 目前 OS 對應的 Tauri build prerequisites
 - macOS native transcription 需要授權 `Meeting Copilot` 的 Speech Recognition、Microphone，以及螢幕與系統錄音權限。
 - Windows system audio transcription 需要 Windows audio endpoint 可用，且會使用 WASAPI loopback 與 Windows SpeechRecognition。
-- AI 功能需要透過本機 subscription/OAuth connector 登入 ChatGPT
+- AI 功能需要透過本機 subscription/OAuth connector 登入 ChatGPT（Codex CLI）或 Claude Code；app 內可切換使用哪個 provider。
+- Claude Code provider 目前以 Claude Code CLI `2.1.128` 驗證；需要支援 `claude auth status`、`claude auth login` 與 `claude -p --output-format json --tools "" --no-session-persistence --no-chrome`。
 
 ## 安裝
 

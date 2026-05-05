@@ -25,10 +25,17 @@
           <div>
             <p>AI 狀態</p>
             <strong id="textProviderName">尚未啟用</strong>
-            <small id="textProviderDetail">正在檢查 ChatGPT 登入狀態。</small>
+            <small id="textProviderDetail">正在檢查 AI 登入狀態。</small>
           </div>
           <div class="provider-actions">
-            <button id="loginTextProvider" type="button">登入 ChatGPT</button>
+            <label class="provider-choice" for="textProviderChoice">
+              <span>AI</span>
+              <select id="textProviderChoice" data-text-provider-choice>
+                <option value="codex-chatgpt-oauth">ChatGPT</option>
+                <option value="claude-code-oauth">Claude Code</option>
+              </select>
+            </label>
+            <button id="loginTextProvider" type="button">登入 AI</button>
             <button id="enableOAuthProvider" type="button" disabled>啟用 AI</button>
           </div>
         </section>
@@ -85,6 +92,11 @@
             <button id="openAudioPermissions" class="permission-action" type="button" hidden>開啟權限設定</button>
           </div>
           <div class="curtain-actions">
+            <label for="liveTextProviderChoice">AI</label>
+            <select id="liveTextProviderChoice" data-text-provider-choice>
+              <option value="codex-chatgpt-oauth">ChatGPT</option>
+              <option value="claude-code-oauth">Claude Code</option>
+            </select>
             <label for="captureSource">音訊</label>
             <select id="captureSource">
               <option value="mixed">麥克風 + 系統音訊</option>
