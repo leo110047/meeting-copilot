@@ -12,10 +12,6 @@ use crate::desktop_types::{
     TranscriptCleanupResponse, TranscriptInput, TranscriptRevisionRequest,
     TranscriptRevisionResponse,
 };
-use crate::macos_speech_bridge::{
-    macos_speech_bridge_health, macos_speech_bridge_status, macos_speech_bridge_status_error,
-    request_macos_speech_bridge_permissions,
-};
 use crate::native_storage::{
     LlmUsageLogInput, insert_decision_snapshot_with_source, insert_llm_usage_log, insert_session,
     insert_suggestion, list_app_error_logs, log_app_error_inner, log_extraction_failure,
@@ -37,8 +33,13 @@ use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Mutex;
+
+#[cfg(target_os = "macos")]
+use crate::macos_speech_bridge::{
+    macos_speech_bridge_health, macos_speech_bridge_status, macos_speech_bridge_status_error,
+    request_macos_speech_bridge_permissions,
+};
 
 #[tauri::command]
 pub(crate) fn desktop_shell_plan_command() -> DesktopShellPlan {
@@ -231,7 +232,7 @@ pub(crate) fn request_screen_recording_permission() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let _ = request_macos_speech_bridge_permissions("system", "zh-TW")?;
-        let status = Command::new("open")
+        let status = std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
             .status()
             .map_err(|error| format!("failed to open Screen Recording settings: {error}"))?;

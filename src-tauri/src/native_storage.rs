@@ -15,21 +15,6 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "windows")]
-pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
-    let app_data = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
-    Ok(PathBuf::from(app_data).join("Meeting Copilot"))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("meeting-copilot"))
-}
-
 pub(crate) fn ensure_session_exists(session_id: &str) -> Result<(), String> {
     let sessions = LIVE_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
     if sessions

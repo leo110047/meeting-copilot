@@ -10,6 +10,8 @@ mod commands_audio;
 mod commands_core;
 mod decision_logic;
 mod desktop_types;
+// macOS-only native Speech and ScreenCaptureKit bridge.
+#[cfg(target_os = "macos")]
 mod macos_speech_bridge;
 mod native_storage;
 mod oauth_provider;

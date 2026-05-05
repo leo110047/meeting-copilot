@@ -140,6 +140,21 @@ pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
         .join("Meeting Copilot"))
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
+    let app_data = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
+    Ok(PathBuf::from(app_data).join("Meeting Copilot"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("meeting-copilot"))
+}
+
 pub(crate) fn read_dropped_context_file(path: PathBuf) -> DroppedContextFile {
     let name = path
         .file_name()

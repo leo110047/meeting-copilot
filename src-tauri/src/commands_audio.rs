@@ -6,10 +6,6 @@ use crate::desktop_types::{
     NativeTranscriptionRequest, NativeTranscriptionStartResponse, PersistedSummary,
     PrepDictationStartResponse, TranscriptEvent, TranscriptInput,
 };
-use crate::macos_speech_bridge::{
-    MACOS_SPEECH_BRIDGES, start_macos_prep_dictation_bridge, start_macos_speech_bridge,
-    stop_macos_prep_dictation_bridge, stop_macos_speech_bridge,
-};
 use crate::native_storage::{
     ensure_session_exists, insert_decision_snapshot, insert_suggestion, insert_transcript_event,
     log_app_error_inner, native_speech_helper_path, native_speech_provider_id,
@@ -25,6 +21,12 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use tauri::Emitter;
+
+#[cfg(target_os = "macos")]
+use crate::macos_speech_bridge::{
+    MACOS_SPEECH_BRIDGES, start_macos_prep_dictation_bridge, start_macos_speech_bridge,
+    stop_macos_prep_dictation_bridge, stop_macos_speech_bridge,
+};
 
 #[tauri::command]
 #[cfg(target_os = "macos")]

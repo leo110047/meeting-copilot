@@ -12,10 +12,11 @@ use crate::desktop_types::{
     TranscriptEvent, TranscriptRevisionRequest,
 };
 use crate::native_storage::{insert_app_error_log, list_app_error_logs};
+#[cfg(not(target_os = "windows"))]
+use crate::oauth_provider::codex_unix_fallback_candidates;
 use crate::oauth_provider::{
     SubscriptionOAuthParse, build_transcript_cleanup_prompt, build_transcript_revision_prompt,
-    codex_command_available, codex_unix_fallback_candidates,
-    parse_subscription_oauth_authenticated, parse_transcript_cleanup_text,
+    codex_command_available, parse_subscription_oauth_authenticated, parse_transcript_cleanup_text,
     parse_transcript_revision_response, start_subscription_oauth_login,
     validate_live_state_patch_value, windows_codex_executable_names,
     windows_executable_extensions_from_pathext,
