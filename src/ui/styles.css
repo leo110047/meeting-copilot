@@ -623,32 +623,53 @@ body[data-state="review"] .review-screen {
 }
 
 .empty-line,
-.transcript-line {
+.transcript-group {
   margin: 0 0 8px;
   line-height: 1.5;
 }
 
-.transcript-line {
-  display: grid;
-  grid-template-columns: 82px minmax(0, 1fr);
-  gap: 8px;
-  align-items: start;
-  color: var(--text);
+.transcript-group {
+  padding: 0 0 8px;
+  border-bottom: 1px solid rgba(244, 241, 234, 0.08);
 }
 
-.transcript-line span {
+.transcript-group:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.transcript-group header {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 0;
+  border: 0;
+}
+
+.transcript-group header span:first-child {
   color: var(--signal);
   font-size: 12px;
   line-height: 1.6;
   text-transform: none;
 }
 
-.transcript-line span + span {
-  color: var(--text);
-  font-size: 14px;
+.transcript-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: none;
 }
 
-.transcript-line.partial span + span {
+.transcript-line {
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.transcript-line.partial,
+.transcript-group.partial .transcript-line {
   color: var(--muted);
 }
 

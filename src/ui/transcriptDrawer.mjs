@@ -9,7 +9,8 @@ export function renderTranscriptDrawerView({
 }) {
   const { liveTranscript, transcriptDrawerToggle, transcriptDrawerCount, transcriptPreview, transcriptFull } = elements;
   const lines = currentTranscriptLines({ transcriptEvents, transcriptLines, currentPartialTranscript, detectUiLanguage });
-  const latest = lines.slice(-3);
+  const groups = groupTranscriptLines(lines);
+  const latest = groups.slice(-3);
   transcriptDrawerToggle.textContent = transcriptDrawerOpen ? "收合" : "展開";
   transcriptDrawerToggle.setAttribute("aria-expanded", String(transcriptDrawerOpen));
   transcriptFull.hidden = !transcriptDrawerOpen;
@@ -17,10 +18,10 @@ export function renderTranscriptDrawerView({
   transcriptDrawerCount.textContent = currentPartialTranscript?.text ? `${finalCount} 句｜記錄中` : `${finalCount} 句`;
   liveTranscript.classList.toggle("expanded", transcriptDrawerOpen);
   transcriptPreview.innerHTML = latest.length > 0
-    ? latest.map((line) => renderTranscriptLine(line, escapeHtml)).join("")
-    : '<p class="empty-line">最近 3 句會顯示在這裡。</p>';
+    ? latest.map((group) => renderTranscriptGroup(group, escapeHtml)).join("")
+    : '<p class="empty-line">最近對話會顯示在這裡。</p>';
   transcriptFull.innerHTML = transcriptDrawerOpen
-    ? lines.map((line) => renderTranscriptLine(line, escapeHtml)).join("")
+    ? groups.map((group) => renderTranscriptGroup(group, escapeHtml)).join("")
     : "";
   transcriptPreview.scrollTop = transcriptPreview.scrollHeight;
   transcriptFull.scrollTop = transcriptFull.scrollHeight;
@@ -31,6 +32,24 @@ export function transcriptSpeakerLabel(event) {
   if (event.source === "mic") return "我";
   if (event.source === "system") return "系統音訊";
   return "未標記來源";
+}
+
+export function groupTranscriptLines(lines) {
+  const groups = [];
+  for (const line of lines) {
+    const previous = groups.at(-1);
+    if (previous && previous.speaker === line.speaker && previous.source === line.source) {
+      previous.lines.push(line);
+      continue;
+    }
+    groups.push({
+      speaker: line.speaker,
+      source: line.source,
+      partial: Boolean(line.partial),
+      lines: [line]
+    });
+  }
+  return groups;
 }
 
 function currentTranscriptLines({ transcriptEvents, transcriptLines, currentPartialTranscript, detectUiLanguage }) {
@@ -66,6 +85,10 @@ function currentTranscriptLines({ transcriptEvents, transcriptLines, currentPart
   return lines;
 }
 
-function renderTranscriptLine(line, escapeHtml) {
-  return `<p class="transcript-line${line.partial ? " partial" : ""}"><span>${escapeHtml(line.speaker)}</span><span>${escapeHtml(line.text)}${line.partial ? " <em>記錄中</em>" : ""}</span></p>`;
+function renderTranscriptGroup(group, escapeHtml) {
+  const count = group.lines.length > 1 ? `<span class="transcript-count">${group.lines.length} 句</span>` : "";
+  const body = group.lines
+    .map((line) => `<p class="transcript-line${line.partial ? " partial" : ""}">${escapeHtml(line.text)}${line.partial ? " <em>記錄中</em>" : ""}</p>`)
+    .join("");
+  return `<section class="transcript-group${group.partial ? " partial" : ""}"><header><span>${escapeHtml(group.speaker)}</span>${count}</header>${body}</section>`;
 }

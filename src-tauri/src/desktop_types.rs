@@ -242,6 +242,12 @@ pub(crate) struct AiTranscriptLine {
     pub(crate) speaker: Option<String>,
     pub(crate) source: String,
     pub(crate) language: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) editable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revision_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

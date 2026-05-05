@@ -48,6 +48,7 @@ let recognition;
 let transcriptLines = [];
 let transcriptEvents = [];
 let revisedTranscriptEvents = [];
+let transcriptRevisionMeta = new Map();
 let currentPartialTranscript;
 let suggestionHistory = [];
 let latestDecisionState;
@@ -63,6 +64,7 @@ let liveAiExtractionRunning = false;
 let lastAiExtractionEventCount = 0;
 let transcriptRevisionRunning = false;
 let lastTranscriptRevisionEventCount = 0;
+let lastTranscriptRevisionAt = 0;
 let transcriptRevisionTimer;
 const aiActivityMessages = new Map();
 let platformShellPlan;
@@ -74,7 +76,13 @@ let postMeetingAiSummaryStarted = false;
 let activeCaptureSource;
 const TRANSCRIPT_STALL_MS = 12000;
 const TRANSCRIPT_REVISION_DEBOUNCE_MS = 3500;
-const TRANSCRIPT_REVISION_WINDOW_SIZE = 18;
+const TRANSCRIPT_REVISION_CONTEXT_WINDOW_SIZE = 30;
+const TRANSCRIPT_REVISION_EDITABLE_WINDOW_SIZE = 12;
+const TRANSCRIPT_REVISION_MIN_NEW_EVENTS = 3;
+const TRANSCRIPT_REVISION_MAX_WAIT_MS = 10000;
+const TRANSCRIPT_REVISION_STABLE_AFTER_REVISIONS = 2;
+const TRANSCRIPT_REVISION_STABLE_AFTER_TRAILING_EVENTS = 4;
+const TRANSCRIPT_REVISION_META_PRUNE_THRESHOLD = 200;
 const NO_REVIEW_CONTENT_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料。請確認音訊來源或加入會議背景後再開始下一場。";
 const NO_REVIEW_AI_SKIP_MESSAGE = "沒有收到逐字稿，也沒有可整理的會前資料；不會送出空內容給 ChatGPT。";
 const nativeInvoke = window.__TAURI__?.core?.invoke;
@@ -142,16 +150,9 @@ startButton.addEventListener("click", async () => {
     resetNativeWindowOpacity();
     return;
   }
-  transcriptLines = [];
-  transcriptEvents = [];
-  revisedTranscriptEvents = [];
+  resetTranscriptState();
   suggestionHistory = [];
   latestDecisionState = undefined;
-  transcriptIndex = 0;
-  lastAiExtractionEventCount = 0;
-  liveAiExtractionRunning = false;
-  lastTranscriptRevisionEventCount = 0;
-  transcriptRevisionRunning = false;
   resetAiActivityState();
   activeCaptureSource = undefined;
   startedAt = performance.now();
@@ -279,18 +280,10 @@ enableOAuthProviderButton.addEventListener("click", () => {
   setupController.schedulePrepSummaryGeneration();
 });
 async function startNativeListening() {
-  transcriptLines = [];
-  transcriptEvents = [];
-  revisedTranscriptEvents = [];
-  currentPartialTranscript = undefined;
+  resetTranscriptState();
   suggestionHistory = [];
   latestDecisionState = undefined;
   aiSummaryOverride = undefined;
-  transcriptIndex = 0;
-  lastAiExtractionEventCount = 0;
-  liveAiExtractionRunning = false;
-  lastTranscriptRevisionEventCount = 0;
-  transcriptRevisionRunning = false;
   resetAiActivityState();
   startedAt = performance.now();
   reviewFinalized = false;
@@ -617,11 +610,15 @@ function scheduleLiveTranscriptRevision() {
   if (!nativeInvoke || !oauthAiEnabled || !textProviderStatus?.authenticated || !activeSessionId) return;
   if (document.body.dataset.state !== "listening") return;
   if (transcriptEvents.length < 2) return;
+  scheduleLiveTranscriptRevisionAfter(TRANSCRIPT_REVISION_DEBOUNCE_MS);
+}
+
+function scheduleLiveTranscriptRevisionAfter(delayMs) {
   if (transcriptRevisionTimer) clearTimeout(transcriptRevisionTimer);
   transcriptRevisionTimer = setTimeout(() => {
     transcriptRevisionTimer = undefined;
     maybeRunLiveTranscriptRevision();
-  }, TRANSCRIPT_REVISION_DEBOUNCE_MS);
+  }, Math.max(0, delayMs));
 }
 
 async function maybeRunLiveTranscriptRevision({ allowReview = false, force = false } = {}) {
@@ -631,6 +628,10 @@ async function maybeRunLiveTranscriptRevision({ allowReview = false, force = fal
   const eventCount = transcriptEvents.length;
   if (eventCount < 2 || transcriptRevisionRunning) return;
   if (!force && eventCount === lastTranscriptRevisionEventCount) return;
+  if (!force && !shouldRunLiveTranscriptRevision(eventCount)) {
+    scheduleLiveTranscriptRevisionAfter(liveTranscriptRevisionRetryDelay());
+    return;
+  }
   const revisionSnapshot = buildTranscriptRevisionSnapshot();
   if (revisionSnapshot.transcript.length === 0) return;
   transcriptRevisionRunning = true;
@@ -647,8 +648,9 @@ async function maybeRunLiveTranscriptRevision({ allowReview = false, force = fal
       return;
     }
     if (!Array.isArray(response?.transcript)) throw new Error("transcript revision response missing transcript");
-    applyRevisedTranscript(response.transcript);
+    applyRevisedTranscript(response.transcript, revisionSnapshot);
     lastTranscriptRevisionEventCount = revisionSnapshot.endCount;
+    lastTranscriptRevisionAt = Date.now();
     renderTranscriptDrawer();
     if (document.body.dataset.state === "review") renderPostMeetingReview();
     clearAiActivity("transcript_revision", "AI 已更新逐字稿說話者。");
@@ -661,36 +663,71 @@ async function maybeRunLiveTranscriptRevision({ allowReview = false, force = fal
   }
 }
 
+function shouldRunLiveTranscriptRevision(eventCount) {
+  if (lastTranscriptRevisionEventCount === 0) return true;
+  const newEvents = eventCount - lastTranscriptRevisionEventCount;
+  if (newEvents >= TRANSCRIPT_REVISION_MIN_NEW_EVENTS) return true;
+  return Date.now() - lastTranscriptRevisionAt >= TRANSCRIPT_REVISION_MAX_WAIT_MS;
+}
+
+function liveTranscriptRevisionRetryDelay() {
+  if (lastTranscriptRevisionAt === 0) return TRANSCRIPT_REVISION_DEBOUNCE_MS;
+  const remainingMs = TRANSCRIPT_REVISION_MAX_WAIT_MS - (Date.now() - lastTranscriptRevisionAt);
+  return Math.max(500, remainingMs);
+}
+
 function buildTranscriptRevisionSnapshot() {
+  refreshTranscriptRevisionStability();
   const endCount = transcriptEvents.length;
-  const startIndex = Math.max(0, endCount - TRANSCRIPT_REVISION_WINDOW_SIZE);
+  const startIndex = Math.max(0, endCount - TRANSCRIPT_REVISION_CONTEXT_WINDOW_SIZE);
+  const editableStartIndex = Math.max(startIndex, endCount - TRANSCRIPT_REVISION_EDITABLE_WINDOW_SIZE);
   const revisedById = new Map(revisedTranscriptEvents.map((event) => [event.id, event]));
   return {
     sessionId: activeSessionId,
     startIndex,
+    editableStartIndex,
     endCount,
-    transcript: transcriptEvents.slice(startIndex, endCount).map((event) => transcriptRevisionLine(event, revisedById))
+    transcript: transcriptEvents.slice(startIndex, endCount).map((event, offset) => {
+      const index = startIndex + offset;
+      const meta = transcriptRevisionMetadata(event.id);
+      const editable = index >= editableStartIndex && !meta.stable;
+      return transcriptRevisionLine(event, revisedById, meta, editable);
+    })
   };
 }
 
-function transcriptRevisionLine(event, revisedById) {
+function transcriptRevisionLine(event, revisedById, meta, editable) {
   const revised = revisedById.get(event.id);
   return {
     id: event.id,
-    text: event.text,
-    speaker: revised?.speaker ?? transcriptSpeakerLabel(event),
+    text: editable ? event.text : revised?.text ?? event.text,
+    speaker: transcriptRevisionSpeaker(event, revised),
     source: event.source ?? "unknown",
-    language: event.language ?? detectUiLanguage(event.text)
+    language: event.language ?? detectUiLanguage(event.text),
+    editable,
+    stability: meta.stable ? "stable" : editable ? "tentative" : "context",
+    revisionCount: meta.revisionCount
   };
 }
 
-function applyRevisedTranscript(lines) {
+function transcriptRevisionSpeaker(event, revised) {
+  if (revised?.speaker) return revised.speaker;
+  if (event.speaker) return event.speaker;
+  if (event.source === "mic") return "我";
+  if (event.source === "system") return "未標記來源";
+  return "未標記來源";
+}
+
+function applyRevisedTranscript(lines, revisionSnapshot) {
   const mergedRevisions = new Map(revisedTranscriptEvents.map((event) => [event.id, event]));
   const rawById = new Map(transcriptEvents.map((event) => [event.id, event]));
+  const editableIds = new Set(revisionSnapshot.transcript.filter((line) => line.editable).map((line) => line.id));
+  const appliedIds = new Set();
   for (const revised of lines) {
     if (!revised?.id) continue;
     const event = rawById.get(revised.id);
     if (!event) continue;
+    if (!editableIds.has(revised.id)) continue;
     mergedRevisions.set(revised.id, {
       ...event,
       text: revised.text,
@@ -699,14 +736,65 @@ function applyRevisedTranscript(lines) {
       language: revised.language ?? event.language,
       revisedByAi: true
     });
+    appliedIds.add(revised.id);
   }
+  updateTranscriptRevisionMetadata(appliedIds);
   revisedTranscriptEvents = transcriptEvents.map((event) => mergedRevisions.get(event.id) ?? event);
+}
+
+function transcriptRevisionMetadata(id) {
+  const existing = transcriptRevisionMeta.get(id);
+  if (existing) return existing;
+  const meta = { revisionCount: 0, stable: false, lastRevisedAt: 0 };
+  transcriptRevisionMeta.set(id, meta);
+  return meta;
+}
+
+function updateTranscriptRevisionMetadata(appliedIds) {
+  const now = Date.now();
+  for (const id of appliedIds) {
+    const meta = transcriptRevisionMetadata(id);
+    meta.revisionCount += 1;
+    meta.lastRevisedAt = now;
+  }
+  refreshTranscriptRevisionStability();
+}
+
+function refreshTranscriptRevisionStability() {
+  transcriptEvents.forEach((event, index) => {
+    const meta = transcriptRevisionMetadata(event.id);
+    if (meta.stable) return;
+    const trailingEvents = transcriptEvents.length - 1 - index;
+    const confirmedStable =
+      meta.revisionCount >= TRANSCRIPT_REVISION_STABLE_AFTER_REVISIONS
+      && trailingEvents >= TRANSCRIPT_REVISION_STABLE_AFTER_TRAILING_EVENTS;
+    const outsideEditableWindow =
+      meta.revisionCount >= 1
+      && trailingEvents >= TRANSCRIPT_REVISION_EDITABLE_WINDOW_SIZE;
+    if (confirmedStable || outsideEditableWindow) {
+      meta.stable = true;
+    }
+  });
 }
 
 function displayedTranscriptEvents() {
   if (revisedTranscriptEvents.length === 0) return transcriptEvents;
   const revisedById = new Map(revisedTranscriptEvents.map((event) => [event.id, event]));
   return transcriptEvents.map((event) => revisedById.get(event.id) ?? event);
+}
+
+function resetTranscriptState() {
+  transcriptLines = [];
+  transcriptEvents = [];
+  revisedTranscriptEvents = [];
+  transcriptRevisionMeta = new Map();
+  currentPartialTranscript = undefined;
+  transcriptIndex = 0;
+  lastAiExtractionEventCount = 0;
+  liveAiExtractionRunning = false;
+  lastTranscriptRevisionEventCount = 0;
+  lastTranscriptRevisionAt = 0;
+  transcriptRevisionRunning = false;
 }
 
 function clearLiveTranscriptRevisionTimer() {
@@ -760,17 +848,10 @@ function initializeSetupState() {
   syncStartButtonAvailability();
   stopButton.disabled = true;
   activeSessionId = undefined;
-  transcriptLines = [];
-  transcriptEvents = [];
-  revisedTranscriptEvents = [];
-  currentPartialTranscript = undefined;
+  resetTranscriptState();
   suggestionHistory = [];
   latestDecisionState = undefined;
   aiSummaryOverride = undefined;
-  lastAiExtractionEventCount = 0;
-  liveAiExtractionRunning = false;
-  lastTranscriptRevisionEventCount = 0;
-  transcriptRevisionRunning = false;
   resetAiActivityState();
   activeCaptureSource = undefined;
   reviewFinalized = false;
@@ -1302,11 +1383,22 @@ async function downloadErrorLog() {
 
 function upsertTranscriptEvent(event) {
   upsertTranscriptEventInPlace(transcriptEvents, transcriptLines, event);
+  if (event?.id) transcriptRevisionMetadata(event.id);
+  if (transcriptRevisionMeta.size > transcriptEvents.length + TRANSCRIPT_REVISION_META_PRUNE_THRESHOLD) {
+    pruneTranscriptRevisionMetadata();
+  }
 }
 
 function markTranscriptPersistence(id, status) {
   const event = transcriptEvents.find((item) => item.id === id);
   if (event) event.persistenceStatus = status;
+}
+
+function pruneTranscriptRevisionMetadata() {
+  const liveIds = new Set(transcriptEvents.map((event) => event.id));
+  for (const id of transcriptRevisionMeta.keys()) {
+    if (!liveIds.has(id)) transcriptRevisionMeta.delete(id);
+  }
 }
 
 

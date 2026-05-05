@@ -74,7 +74,7 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(html, /逐字稿/);
   assert.match(html, /目前沒有提醒/);
   assert.match(html, /0 句/);
-  assert.match(html, /最近 3 句會顯示在這裡/);
+  assert.match(html, /最近對話會顯示在這裡/);
   assert.match(html, /stopListening[^>]+>結束會議</);
   assert.doesNotMatch(html, /目前聽到的重點/);
   assert.doesNotMatch(html, /Popover 預覽/);
@@ -98,6 +98,8 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(css, /\.transcript-drawer/);
   assert.match(css, /\.transcript-preview/);
   assert.match(css, /\.transcript-full/);
+  assert.match(css, /\.transcript-group/);
+  assert.match(css, /\.transcript-count/);
   assert.match(css, /\.transcript-line\.partial/);
   assert.match(css, /max-height: 34vh/);
   assert.match(css, /\.listening-status/);
@@ -137,12 +139,19 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /liveAiExtractionRunning/);
   assert.match(js, /revise_transcript_oauth/);
   assert.match(js, /scheduleLiveTranscriptRevision/);
-  assert.match(js, /TRANSCRIPT_REVISION_WINDOW_SIZE/);
+  assert.match(js, /TRANSCRIPT_REVISION_CONTEXT_WINDOW_SIZE/);
+  assert.match(js, /TRANSCRIPT_REVISION_EDITABLE_WINDOW_SIZE/);
+  assert.match(js, /TRANSCRIPT_REVISION_MIN_NEW_EVENTS/);
+  assert.match(js, /TRANSCRIPT_REVISION_STABLE_AFTER_REVISIONS/);
   assert.match(js, /buildTranscriptRevisionSnapshot/);
   assert.match(js, /lastTranscriptRevisionEventCount = revisionSnapshot\.endCount/);
+  assert.match(js, /lastTranscriptRevisionAt = Date\.now\(\)/);
   assert.match(js, /transcriptEvents\.length > eventCount\) scheduleLiveTranscriptRevision/);
   assert.doesNotMatch(js, /lastTranscriptRevisionEventCount = transcriptEvents\.length/);
   assert.match(js, /displayedTranscriptEvents/);
+  assert.match(js, /editableStartIndex/);
+  assert.match(js, /refreshTranscriptRevisionStability/);
+  assert.match(js, /groupTranscriptLines/);
   assert.match(js, /aiActivityMessages/);
   assert.match(js, /setAiActivity/);
   assert.match(js, /clearAiActivity/);

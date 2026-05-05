@@ -462,7 +462,8 @@ Rules:
 - Write Traditional Chinese. Preserve English technical terms that appear in the source.
 - Preserve every input line id and order. Do not add, remove, merge, split, or reorder lines.
 - Preserve the original meaning. Do not summarize or add facts.
-- Clean obvious ASR errors, repeated starts, filler words, and punctuation when safe.
+- Each input line includes editable and stability metadata. Lines with editable=false are locked context: return their text and speaker unchanged.
+- Clean obvious ASR errors, repeated starts, filler words, and punctuation only for editable=true lines when safe.
 - For source="mic", speaker MUST be "我".
 - For source="system", infer remote speaker changes from semantics and conversation flow. Use stable labels "對方 A", "對方 B", "對方 C" only. Reuse the same label when the same remote speaker appears to continue.
 - If an input line already has speaker "對方 A", "對方 B", or "對方 C", keep that speaker unless nearby context strongly contradicts it.
@@ -510,6 +511,16 @@ pub(crate) fn parse_transcript_revision_response(
                 "transcript[{index}].language must preserve input language"
             ));
         }
+        if !input.editable.unwrap_or(true) {
+            lines.push(RevisedTranscriptLine {
+                id,
+                text: input.text.clone(),
+                speaker: normalized_revision_speaker(&input.source, input.speaker.as_deref()),
+                source,
+                language,
+            });
+            continue;
+        }
         let mut speaker = required_trimmed_string_field(object, "speaker")?;
         if source == "mic" {
             speaker = "我".to_string();
@@ -534,6 +545,19 @@ pub(crate) fn parse_transcript_revision_response(
         });
     }
     Ok(lines)
+}
+
+fn normalized_revision_speaker(source: &str, speaker: Option<&str>) -> String {
+    if source == "mic" {
+        return "我".to_string();
+    }
+    // Locked lines intentionally trust historical labels instead of the remote speaker allowlist.
+    let speaker = speaker.unwrap_or("未標記來源").trim();
+    if speaker.is_empty() || speaker == "未知" {
+        "未標記來源".to_string()
+    } else {
+        speaker.to_string()
+    }
 }
 
 fn required_trimmed_string_field(

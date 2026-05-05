@@ -206,6 +206,7 @@ fn transcript_revision_prompt_requires_live_speaker_labels() {
     assert!(prompt.contains("對方 A"));
     assert!(prompt.contains("source=\"mic\", speaker MUST be \"我\""));
     assert!(prompt.contains("Preserve every input line id and order"));
+    assert!(prompt.contains("Lines with editable=false are locked context"));
     assert!(prompt.contains("keep that speaker unless nearby context strongly contradicts it"));
 }
 
@@ -218,6 +219,20 @@ fn transcript_revision_parser_preserves_order_and_labels() {
     )
     .expect("parse revised transcript");
     assert_eq!(revised[0].speaker, "我");
+    assert_eq!(revised[0].text, "呃我先確認 demo 範圍");
+    assert_eq!(revised[1].speaker, "對方 A");
+}
+
+#[test]
+fn transcript_revision_parser_tolerates_missing_locked_line_speaker() {
+    let request = transcript_revision_request_fixture();
+    let revised = parse_transcript_revision_response(
+        r#"{"transcript":[{"id":"l1","text":"ignored by locked context","source":"mic","language":"zh-TW"},{"id":"l2","speaker":"對方 A","text":"先不要擴大。","source":"system","language":"zh-TW"}]}"#,
+        &request,
+    )
+    .expect("parse revised transcript");
+    assert_eq!(revised[0].speaker, "我");
+    assert_eq!(revised[0].text, "呃我先確認 demo 範圍");
     assert_eq!(revised[1].speaker, "對方 A");
 }
 
@@ -245,6 +260,9 @@ fn transcript_revision_request_fixture() -> TranscriptRevisionRequest {
                 speaker: Some("我".to_string()),
                 source: "mic".to_string(),
                 language: "zh-TW".to_string(),
+                editable: Some(false),
+                stability: Some("context".to_string()),
+                revision_count: Some(1),
             },
             AiTranscriptLine {
                 id: "l2".to_string(),
@@ -252,6 +270,9 @@ fn transcript_revision_request_fixture() -> TranscriptRevisionRequest {
                 speaker: Some("系統音訊".to_string()),
                 source: "system".to_string(),
                 language: "zh-TW".to_string(),
+                editable: Some(true),
+                stability: Some("tentative".to_string()),
+                revision_count: Some(0),
             },
         ],
     }
