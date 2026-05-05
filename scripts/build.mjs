@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const dist = resolve(root, "dist");
