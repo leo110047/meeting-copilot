@@ -56,10 +56,10 @@ pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-pub(crate) fn set_listening_window_mode(app: &tauri::AppHandle, enabled: bool) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_always_on_top(enabled);
-    }
+pub(crate) fn set_listening_window_mode(_app: &tauri::AppHandle, _enabled: bool) {
+    // Reserved for future listening-specific window behavior. Do not force
+    // always-on-top without an explicit product control.
+    // Callers in commands_audio intentionally keep this hook for start/stop/cancel transitions.
 }
 
 #[cfg(target_os = "macos")]

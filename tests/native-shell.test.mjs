@@ -151,7 +151,7 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(desktopShellSource, /Stop Listening/);
   assert.match(desktopShellSource, /stop_all_native_transcribers/);
   assert.match(desktopShellSource, /set_listening_window_mode/);
-  assert.match(desktopShellSource, /set_always_on_top\(enabled\)/);
+  assert.doesNotMatch(desktopShellSource, /set_always_on_top/);
   assert.match(desktopShellSource, /show_main_window\(&app\)/);
   assert.match(desktopShellSource, /window\.unminimize\(\)/);
   assert.match(macHelper, /CGPreflightScreenCaptureAccess/);
