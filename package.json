@@ -19,6 +19,7 @@
     "tauri:dev": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri dev",
     "native:build": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri build --debug && node scripts/install-mac-helper-app.mjs",
     "native:build:mac": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri build --debug --bundles app && node scripts/install-mac-helper-app.mjs",
+    "native:build:mac:release": "npm run build && MEETING_COPILOT_DISTRIBUTION_SIGNING=1 npm run native:helpers && MEETING_COPILOT_DISTRIBUTION_SIGNING=1 node scripts/run-with-rust.mjs npx tauri build --bundles app,dmg && MEETING_COPILOT_DISTRIBUTION_SIGNING=1 MEETING_COPILOT_MAC_BUNDLE_PATH=\"target/release/bundle/macos/Meeting Copilot.app\" node scripts/install-mac-helper-app.mjs",
     "native:build:windows": "npm run build && npm run native:helpers && node scripts/run-with-rust.mjs npx tauri build --debug --bundles nsis,msi",
     "rust:test": "node scripts/run-with-rust.mjs cargo test --workspace",
     "desktop:build": "node scripts/run-with-rust.mjs cargo build --manifest-path src-tauri/Cargo.toml",

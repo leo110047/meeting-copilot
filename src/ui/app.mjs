@@ -542,6 +542,10 @@ function renderRuntimePayload(payload) {
     suggestion.className = "suggestion-card";
     suggestion.innerHTML = renderSuggestionCard(latest);
     feedbackRow.hidden = false;
+  } else if (payload.coachingError) {
+    suggestion.className = "suggestion-empty";
+    suggestion.innerHTML = `<strong>AI 暫時無法產生提醒</strong><small>${escapeHtml(payload.coachingError)}</small>`;
+    feedbackRow.hidden = true;
   } else if (payload.decisionState?.readiness) {
     suggestion.className = "suggestion-empty";
     suggestion.innerHTML = renderDecisionOverview(payload.decisionState);
@@ -551,9 +555,13 @@ function renderRuntimePayload(payload) {
 
 function renderSuggestionCard(item) {
   const evidence = renderEvidenceLines(item.evidenceTranscriptIds ?? []);
+  const title = item.title || labelMove(item.kind);
+  const suggestedMove = item.suggestedMove || item.text;
   return [
     `<strong>${escapeHtml(labelMove(item.kind))}</strong>`,
-    `<div>${escapeHtml(item.text)}</div>`,
+    `<div class="suggestion-title">${escapeHtml(title)}</div>`,
+    `<p class="suggestion-move">${escapeHtml(suggestedMove)}</p>`,
+    item.watchOut ? `<p class="suggestion-watch">注意：${escapeHtml(item.watchOut)}</p>` : "",
     `<small>${escapeHtml(item.reason)}</small>`,
     evidence
   ].filter(Boolean).join("");
@@ -595,7 +603,7 @@ async function maybeRunLiveAiExtraction() {
     const payload = await nativeInvoke("extract_live_state_patch_oauth", { sessionId: activeSessionId });
     lastAiExtractionEventCount = transcriptEvents.length;
     renderRuntimePayload(payload);
-    clearAiActivity("live_state", "AI 已更新會議判斷。");
+    clearAiActivity("live_state", payload.coachingError ? `AI 已更新會議判斷；提醒暫時失敗：${payload.coachingError}` : "AI 已更新會議判斷。");
   } catch (error) {
     logAppError("ai.live_state_patch", error, { sessionId: activeSessionId, eventCount }, "error");
     lastAiExtractionEventCount = Math.max(0, lastAiExtractionEventCount - 1);

@@ -1,7 +1,6 @@
 use crate::commands_audio::ingest_transcript_inner;
 use crate::decision_logic::{
-    apply_live_state_patch, default_brief, derive_decision_state, derive_suggestions, now_ms,
-    now_ms_string, stable_id,
+    apply_live_state_patch, default_brief, derive_decision_state, now_ms, now_ms_string, stable_id,
 };
 use crate::desktop_types::desktop_shell_plan;
 use crate::desktop_types::{
@@ -21,8 +20,8 @@ use crate::native_storage::{
 use crate::oauth_provider::{
     build_ai_summary_prompt, build_live_state_patch_prompt, build_prep_summary_prompt,
     build_transcript_revision_prompt, cleanup_transcript_text_oauth_inner,
-    parse_ai_summary_sections, parse_live_state_patch, parse_prep_summary_points,
-    parse_transcript_revision_response, run_codex_oauth_prompt,
+    parse_ai_summary_sections, parse_live_coaching_suggestions, parse_live_state_patch,
+    parse_prep_summary_points, parse_transcript_revision_response, run_codex_oauth_prompt,
     run_codex_oauth_prompt_with_timeout, start_subscription_oauth_login, subscription_oauth_status,
 };
 use crate::shell_storage::{
@@ -524,7 +523,38 @@ pub(crate) fn extract_live_state_patch_oauth(
         }
     };
     let decision_state = apply_live_state_patch(local_state, &patch, &events);
-    let mut suggestions = derive_suggestions(&brief, &events, &decision_state);
+    let mut coaching_error = None;
+    let mut suggestions = match parse_live_coaching_suggestions(&raw_output, &session_id, &events) {
+        Ok(suggestions) => suggestions,
+        Err(("coaching_cards_discarded", error)) => {
+            let _ = log_app_error_inner(
+                Some(&session_id),
+                "live_coaching.cards_discarded",
+                "text_provider",
+                "info",
+                &error,
+                serde_json::json!({
+                    "provider": "codex-chatgpt-oauth",
+                    "promptVersion": "extract_state_patch.oauth.v1",
+                    "rawOutputRef": stable_id(&raw_output)
+                }),
+            );
+            coaching_error = Some("AI 暫時沒有可信的提醒。".to_string());
+            vec![]
+        }
+        Err((failure_kind, error)) => {
+            log_extraction_failure(
+                &session_id,
+                failure_kind,
+                &format!(
+                    "live coaching rejected: {error}: {}",
+                    stable_id(&raw_output)
+                ),
+            )?;
+            coaching_error = Some("AI 回傳的提醒格式不完整，已保留會議判斷。".to_string());
+            vec![]
+        }
+    };
     {
         let mut sessions = LIVE_SESSIONS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -581,6 +611,7 @@ pub(crate) fn extract_live_state_patch_oauth(
             new_suggestions: suggestions.len(),
             decision_snapshot_id: snapshot_id,
         },
+        coaching_error,
     })
 }
 

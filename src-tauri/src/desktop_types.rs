@@ -114,7 +114,10 @@ pub(crate) struct NativeSuggestion {
     pub(crate) session_id: String,
     pub(crate) shown_at: String,
     pub(crate) kind: String,
+    pub(crate) title: Option<String>,
     pub(crate) text: String,
+    pub(crate) suggested_move: Option<String>,
+    pub(crate) watch_out: Option<String>,
     pub(crate) reason: String,
     pub(crate) confidence: f64,
     pub(crate) priority: String,
@@ -151,6 +154,7 @@ pub(crate) struct IngestTranscriptResponse {
     pub(crate) suggestions: Vec<NativeSuggestion>,
     pub(crate) decision_state: NativeDecisionState,
     pub(crate) persisted: PersistedSummary,
+    pub(crate) coaching_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

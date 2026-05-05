@@ -1,6 +1,5 @@
 use crate::desktop_types::{
-    LiveStatePatchEnvelope, MeetingBrief, NativeDecisionState, NativeReadiness, NativeSuggestion,
-    TranscriptEvent,
+    LiveStatePatchEnvelope, MeetingBrief, NativeDecisionState, NativeReadiness, TranscriptEvent,
 };
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -260,40 +259,6 @@ pub(crate) fn value_string(value: &serde_json::Value, field: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
-}
-
-pub(crate) fn derive_suggestions(
-    _brief: &MeetingBrief,
-    events: &[TranscriptEvent],
-    decision_state: &NativeDecisionState,
-) -> Vec<NativeSuggestion> {
-    if decision_state.current_decision.is_none()
-        || decision_state.readiness.safe_to_decide
-        || decision_state.readiness.blockers.is_empty()
-    {
-        return vec![];
-    }
-    let text = "先不要定案，這裡還缺 owner、deadline 或驗收標準。建議先補問清楚再承諾 scope。";
-    let evidence: Vec<String> = events.iter().map(|event| event.id.clone()).collect();
-    vec![NativeSuggestion {
-        id: stable_id(&format!(
-            "identify_missing_input:{}:{}",
-            decision_state.session_id,
-            evidence.join(",")
-        )),
-        session_id: decision_state.session_id.clone(),
-        shown_at: now_ms_string(),
-        kind: "identify_missing_input".to_string(),
-        text: text.to_string(),
-        reason: format!(
-            "Decision readiness score {:.2}; blockers: {}",
-            decision_state.readiness.score,
-            decision_state.readiness.blockers.join(", ")
-        ),
-        confidence: 0.86,
-        priority: "high".to_string(),
-        evidence_transcript_ids: evidence,
-    }]
 }
 
 pub(crate) fn default_brief() -> MeetingBrief {

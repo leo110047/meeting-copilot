@@ -15,8 +15,9 @@ use crate::native_storage::{insert_app_error_log, list_app_error_logs};
 #[cfg(not(target_os = "windows"))]
 use crate::oauth_provider::codex_unix_fallback_candidates;
 use crate::oauth_provider::{
-    SubscriptionOAuthParse, build_transcript_cleanup_prompt, build_transcript_revision_prompt,
-    codex_command_available, parse_subscription_oauth_authenticated, parse_transcript_cleanup_text,
+    SubscriptionOAuthParse, build_live_state_patch_prompt, build_transcript_cleanup_prompt,
+    build_transcript_revision_prompt, codex_command_available, parse_live_coaching_suggestions,
+    parse_subscription_oauth_authenticated, parse_transcript_cleanup_text,
     parse_transcript_revision_response, start_subscription_oauth_login,
     validate_live_state_patch_value, windows_codex_executable_names,
     windows_executable_extensions_from_pathext,
@@ -353,6 +354,193 @@ fn live_patch_applies_meeting_items_options_and_risks() {
             .iter()
             .any(|item| item.contains("風險"))
     );
+}
+
+#[test]
+fn live_state_prompt_requires_actionable_coaching_cards() {
+    let events = vec![TranscriptEvent {
+        id: "e1".to_string(),
+        session_id: "s1".to_string(),
+        source: "system".to_string(),
+        speaker: Some("對方 A".to_string()),
+        speaker_confidence: 0.7,
+        language: "zh-TW".to_string(),
+        started_at_ms: 0,
+        ended_at_ms: Some(1),
+        text: "那下週就直接上正式版吧".to_string(),
+        is_final: true,
+    }];
+    let state = derive_decision_state("s1", &events);
+    let prompt =
+        build_live_state_patch_prompt(&crate::decision_logic::default_brief(), &events, &state)
+            .expect("build live state prompt");
+    assert!(prompt.contains("\"coaching\""));
+    assert!(prompt.contains("what the user should say next"));
+    assert!(prompt.contains("Return at most one high-value coaching card"));
+    assert!(prompt.contains("Use the meeting brief as the user's goals"));
+}
+
+#[test]
+fn live_coaching_parser_builds_evidence_backed_suggestion() {
+    let events = vec![TranscriptEvent {
+        id: "e1".to_string(),
+        session_id: "s1".to_string(),
+        source: "system".to_string(),
+        speaker: Some("對方 A".to_string()),
+        speaker_confidence: 0.7,
+        language: "zh-TW".to_string(),
+        started_at_ms: 0,
+        ended_at_ms: Some(1),
+        text: "那下週就直接上正式版吧".to_string(),
+        is_final: true,
+    }];
+    let parsed = parse_live_coaching_suggestions(
+        r#"{
+          "meetingStatePatch":{"addItems":[],"updateItems":[],"resolveItemIds":[],"evidenceTranscriptIds":[]},
+          "decisionStatePatch":{"addOptions":[],"updateOptions":[],"addRisks":[],"addMissingInputs":[],"evidenceTranscriptIds":[]},
+          "coaching":{"cards":[{
+            "kind":"ask_clarifying_question",
+            "priority":"high",
+            "confidence":0.88,
+            "title":"先確認正式版定義",
+            "suggestedMove":"你可以問：這裡的正式版是指 demo 可用，還是 production 驗收完成？",
+            "watchOut":"對方正在把模糊時程推成正式承諾。",
+            "reason":"對方要求下週上正式版，但沒有驗收標準。",
+            "evidenceTranscriptIds":["e1","missing"]
+          }]}}
+        "#,
+        "s1",
+        &events,
+    )
+    .expect("parse coaching");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].kind, "ask_clarifying_question");
+    assert_eq!(parsed[0].title.as_deref(), Some("先確認正式版定義"));
+    assert!(
+        parsed[0]
+            .suggested_move
+            .as_deref()
+            .unwrap_or("")
+            .contains("你可以問")
+    );
+    assert!(
+        parsed[0]
+            .watch_out
+            .as_deref()
+            .unwrap_or("")
+            .contains("模糊時程")
+    );
+    assert_eq!(parsed[0].evidence_transcript_ids, vec!["e1"]);
+}
+
+#[test]
+fn live_coaching_parser_selects_best_valid_card_after_invalid_first_card() {
+    let events = live_coaching_events_fixture();
+    let parsed = parse_live_coaching_suggestions(
+        r#"{
+          "meetingStatePatch":{"addItems":[],"updateItems":[],"resolveItemIds":[],"evidenceTranscriptIds":[]},
+          "decisionStatePatch":{"addOptions":[],"updateOptions":[],"addRisks":[],"addMissingInputs":[],"evidenceTranscriptIds":[]},
+          "coaching":{"cards":[
+            {
+              "kind":"ask_clarifying_question",
+              "priority":"high",
+              "confidence":0.95,
+              "title":"沒有證據",
+              "suggestedMove":"這張不應該出現",
+              "reason":"缺 evidence",
+              "evidenceTranscriptIds":[]
+            },
+            {
+              "kind":"watch_out",
+              "priority":"medium",
+              "confidence":0.75,
+              "title":"注意時程承諾",
+              "suggestedMove":"先確認下週上線的驗收定義。",
+              "watchOut":"對方正在把時程推成承諾。",
+              "reason":"有 evidence。",
+              "evidenceTranscriptIds":["e1"]
+            }
+          ]}}
+        "#,
+        "s1",
+        &events,
+    )
+    .expect("parse coaching with later valid card");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].kind, "watch_out");
+}
+
+#[test]
+fn live_coaching_parser_reports_schema_error_when_all_cards_are_invalid() {
+    let events = live_coaching_events_fixture();
+    let error = parse_live_coaching_suggestions(
+        r#"{
+          "meetingStatePatch":{"addItems":[],"updateItems":[],"resolveItemIds":[],"evidenceTranscriptIds":[]},
+          "decisionStatePatch":{"addOptions":[],"updateOptions":[],"addRisks":[],"addMissingInputs":[],"evidenceTranscriptIds":[]},
+          "coaching":{"cards":[{"kind":"invent_new_scope"}]}
+        }"#,
+        "s1",
+        &events,
+    )
+    .expect_err("invalid coaching card should be visible");
+    assert_eq!(error.0, "schema_validation");
+    assert!(error.1.contains("kind is not allowed"));
+}
+
+#[test]
+fn live_coaching_parser_reports_when_all_cards_are_discarded() {
+    let events = live_coaching_events_fixture();
+    let error = parse_live_coaching_suggestions(
+        r#"{
+          "meetingStatePatch":{"addItems":[],"updateItems":[],"resolveItemIds":[],"evidenceTranscriptIds":[]},
+          "decisionStatePatch":{"addOptions":[],"updateOptions":[],"addRisks":[],"addMissingInputs":[],"evidenceTranscriptIds":[]},
+          "coaching":{"cards":[
+            {
+              "kind":"ask_clarifying_question",
+              "priority":"medium",
+              "confidence":0.2,
+              "title":"低信心",
+              "suggestedMove":"不要顯示",
+              "reason":"低信心",
+              "evidenceTranscriptIds":["e1"]
+            },
+            {
+              "kind":"watch_out",
+              "priority":"high",
+              "confidence":0.9,
+              "title":"缺證據",
+              "suggestedMove":"不要顯示",
+              "reason":"缺證據",
+              "evidenceTranscriptIds":["missing"]
+            }
+          ]}}
+        "#,
+        "s1",
+        &events,
+    )
+    .expect_err("discarded coaching cards should be visible");
+    assert_eq!(error.0, "coaching_cards_discarded");
+    assert!(error.1.contains("confidence_too_low"));
+    assert!(
+        error
+            .1
+            .contains("missing_or_invalid_evidence_transcript_ids")
+    );
+}
+
+fn live_coaching_events_fixture() -> Vec<TranscriptEvent> {
+    vec![TranscriptEvent {
+        id: "e1".to_string(),
+        session_id: "s1".to_string(),
+        source: "system".to_string(),
+        speaker: Some("對方 A".to_string()),
+        speaker_confidence: 0.7,
+        language: "zh-TW".to_string(),
+        started_at_ms: 0,
+        ended_at_ms: Some(1),
+        text: "那下週就直接上正式版吧".to_string(),
+        is_final: true,
+    }]
 }
 
 #[test]

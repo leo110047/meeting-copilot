@@ -41,13 +41,35 @@ macOS debug bundle 會產生在：
 target/debug/bundle/macos/Meeting Copilot.app
 ```
 
-macOS TCC 權限會綁定 code-signing identity。若使用預設 ad-hoc 簽名，每次重建後可能需要重新授權螢幕與系統錄音。若本機有固定開發簽名 identity，可用：
+macOS TCC 權限會綁定 code-signing identity。engineering-only build 可用 `Apple Development` 或 ad-hoc 簽章；這可以讓熟悉 macOS Gatekeeper 的測試者手動開啟，但不應視為正式對外發佈。要交給一般使用者測試或發佈，必須使用 `Developer ID Application` identity 簽署並 notarize。
+
+本機 debug 若要固定簽章，可用 identity 的 SHA-1 hash，避免 Keychain 裡有同名憑證時 `codesign` ambiguous：
 
 ```bash
-MEETING_COPILOT_CODESIGN_IDENTITY="Apple Development: ..." \
+MEETING_COPILOT_CODESIGN_IDENTITY="CERTIFICATE_SHA1_HASH" \
 MEETING_COPILOT_CODESIGN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db" \
 npm run native:build:mac
 ```
+
+若要診斷麥克風是否真的有進到 native bridge，可暫時加上 `MEETING_COPILOT_AUDIO_DIAGNOSTICS=1`；這會在 app error log 寫入 `native_transcription.bridge_diagnostic` 與 `rms` / `peak` 音量值，平常不應開啟。
+
+若沒有可用的 Apple signing identity，macOS build 會失敗，而不是靜默改成 ad-hoc。只有一次性本機試跑才應明確開啟：
+
+```bash
+MEETING_COPILOT_ALLOW_ADHOC_SIGNING=1 npm run native:build:mac
+```
+
+ad-hoc 簽章沒有穩定 TeamIdentifier，不適合測試螢幕與系統錄音權限流程。
+
+macOS distribution build 會拒絕 `Apple Development` 與本機自簽憑證，只接受有效的 `Developer ID Application` identity：
+
+```bash
+MEETING_COPILOT_CODESIGN_IDENTITY="DEVELOPER_ID_APPLICATION_SHA1_HASH" \
+MEETING_COPILOT_CODESIGN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db" \
+npm run native:build:mac:release
+```
+
+產出的 app/dmg 仍需完成 Apple notarization 與 stapling 後再交付外部使用者。
 
 Windows debug installer / bundle 使用：
 

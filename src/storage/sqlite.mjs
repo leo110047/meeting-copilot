@@ -8,7 +8,9 @@ export function migrate(dbPath, schemaPath = new URL("./schema.sql", import.meta
   const absoluteDb = resolve(dbPath);
   mkdirSync(dirname(absoluteDb), { recursive: true });
   const schema = readFileSync(schemaPath, "utf8");
-  database(absoluteDb).exec(schema);
+  const db = database(absoluteDb);
+  db.exec(schema);
+  ensureColumn(db, "suggestions", "suggestion_json", "TEXT NOT NULL DEFAULT '{}'");
   return absoluteDb;
 }
 
@@ -70,4 +72,10 @@ function database(dbPath) {
     openDatabases.set(absoluteDb, db);
   }
   return db;
+}
+
+function ensureColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+  if (columns.includes(column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }

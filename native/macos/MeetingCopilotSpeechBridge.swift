@@ -1,6 +1,8 @@
 import AVFoundation
+import CoreAudio
 import CoreGraphics
 import CoreMedia
+import Darwin
 import Foundation
 import ScreenCaptureKit
 import Speech
@@ -24,6 +26,15 @@ struct BridgeErrorLine: Codable {
     let message: String
     let source: String
     let code: String?
+}
+
+struct BridgeDiagnosticLine: Codable {
+    let kind: String
+    let source: String
+    let code: String
+    let message: String
+    let rms: Double?
+    let peak: Double?
 }
 
 private let bridgeLock = NSLock()
@@ -83,6 +94,11 @@ private func classifySpeechErrorMessage(_ message: String) -> String? {
         return "microphone_permission_required"
     }
     return nil
+}
+
+private func audioDiagnosticsEnabled() -> Bool {
+    let value = ProcessInfo.processInfo.environment["MEETING_COPILOT_AUDIO_DIAGNOSTICS"] ?? ""
+    return ["1", "true", "yes"].contains(value.lowercased())
 }
 
 private func hasScreenCaptureAccess() -> Bool {
@@ -281,11 +297,19 @@ final class NativeSpeechBridge: NSObject {
     private let releaseContext: NativeSpeechReleaseContext?
     private let recognizer: SFSpeechRecognizer
     private let startedAt = Date()
+    private let recognitionQueue = DispatchQueue(label: "meeting-copilot.recognition-state")
     private var lastText = ""
     private var recognitionTask: SFSpeechRecognitionTask?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionRestartWorkItem: DispatchWorkItem?
     private var audioEngine: AVAudioEngine?
     private var stream: Any?
+    private var isStopping = false
+    private var recognitionHasStarted = false
+    private var recognitionGeneration = 0
+    private var lastRecoverableRestartAt = Date.distantPast
+    private var lastRecoverableErrorEmitAt = Date.distantPast
+    private var lastAudioDiagnosticAt = Date.distantPast
 
     init?(source: String, language: String, callback: @escaping NativeSpeechCallback, context: UnsafeMutableRawPointer?, releaseContext: NativeSpeechReleaseContext?) {
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: language)) else {
@@ -315,18 +339,8 @@ final class NativeSpeechBridge: NSObject {
         if source == "mic", !requestMicrophoneAccessIfNeeded() {
             throw NSError(domain: "MeetingCopilotSpeechBridge", code: 8, userInfo: [NSLocalizedDescriptionKey: "microphone permission is required"])
         }
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.addsPunctuation = true
-        recognitionRequest = request
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-            if let result {
-                self.emit(result: result)
-            }
-            if let error {
-                self.emitError(error)
-            }
+        recognitionQueue.sync {
+            createRecognitionRequestOnQueue()
         }
         if source == "system" {
             try startSystemAudioCapture()
@@ -335,17 +349,151 @@ final class NativeSpeechBridge: NSObject {
         }
     }
 
+    private func createRecognitionRequestOnQueue() {
+        recognitionGeneration += 1
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.addsPunctuation = true
+        recognitionRequest = request
+    }
+
+    private func finishRecognitionOnQueue() {
+        recognitionGeneration += 1
+        recognitionRequest?.endAudio()
+        recognitionTask?.finish()
+        recognitionTask = nil
+        recognitionRequest = nil
+        recognitionHasStarted = false
+    }
+
+    private func startRecognitionTaskOnQueue() {
+        guard !isStopping else { return }
+        guard let request = recognitionRequest else { return }
+        guard !recognitionHasStarted else { return }
+        let generation = recognitionGeneration
+        recognitionHasStarted = true
+        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            self.recognitionQueue.async { [weak self] in
+                guard let self, !self.isStopping, generation == self.recognitionGeneration else { return }
+                if let result {
+                    self.emit(result: result)
+                }
+                if let error {
+                    self.handleRecognitionErrorOnQueue(error)
+                }
+            }
+        }
+    }
+
+    private func handleRecognitionErrorOnQueue(_ error: Error) {
+        let nsError = error as NSError
+        let code = classifySpeechError(nsError)
+        if code != "no_speech_detected" || Date().timeIntervalSince(lastRecoverableErrorEmitAt) >= 5 {
+            emitError(nsError.localizedDescription, code: code)
+            if code == "no_speech_detected" {
+                lastRecoverableErrorEmitAt = Date()
+            }
+        }
+        if code == "no_speech_detected" {
+            restartRecognitionAfterRecoverableErrorOnQueue()
+        }
+    }
+
+    private func restartRecognitionAfterRecoverableErrorOnQueue() {
+        guard !isStopping else { return }
+        let delay = max(0.25, 2.0 - Date().timeIntervalSince(lastRecoverableRestartAt))
+        recognitionRestartWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.isStopping else { return }
+            self.lastRecoverableRestartAt = Date()
+            self.recognitionRestartWorkItem = nil
+            self.finishRecognitionOnQueue()
+            self.createRecognitionRequestOnQueue()
+        }
+        recognitionRestartWorkItem = workItem
+        recognitionQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
     private func startMicCapture() throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
+            guard let self else { return }
+            let level = self.measureAudioLevel(buffer)
+            guard let copiedBuffer = self.copyAudioPCMBuffer(buffer) else { return }
+            self.recognitionQueue.async { [weak self] in
+                guard let self, !self.isStopping else { return }
+                self.emitAudioDiagnosticIfNeeded(level)
+                self.recognitionRequest?.append(copiedBuffer)
+                if level.rms >= 0.01 || level.peak >= 0.03 {
+                    self.startRecognitionTaskOnQueue()
+                }
+            }
         }
         engine.prepare()
         try engine.start()
         audioEngine = engine
+    }
+
+    private func copyAudioPCMBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copied = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else {
+            return nil
+        }
+        copied.frameLength = buffer.frameLength
+        let sourceBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        let destinationBuffers = UnsafeMutableAudioBufferListPointer(copied.mutableAudioBufferList)
+        guard sourceBuffers.count == destinationBuffers.count else { return nil }
+        for index in 0..<sourceBuffers.count {
+            let source = sourceBuffers[index]
+            var destination = destinationBuffers[index]
+            guard let sourceData = source.mData, let destinationData = destination.mData else {
+                return nil
+            }
+            memcpy(destinationData, sourceData, Int(source.mDataByteSize))
+            destination.mDataByteSize = source.mDataByteSize
+            destinationBuffers[index] = destination
+        }
+        return copied
+    }
+
+    private func measureAudioLevel(_ buffer: AVAudioPCMBuffer) -> (rms: Double, peak: Double) {
+        guard let channels = buffer.floatChannelData else { return (0, 0) }
+        let channelCount = Int(buffer.format.channelCount)
+        let frameLength = Int(buffer.frameLength)
+        guard channelCount > 0, frameLength > 0 else { return (0, 0) }
+        var sumSquares = 0.0
+        var peak = 0.0
+        var sampleCount = 0
+        for channelIndex in 0..<channelCount {
+            let samples = channels[channelIndex]
+            for frameIndex in 0..<frameLength {
+                let sample = Double(samples[frameIndex])
+                let absSample = abs(sample)
+                peak = max(peak, absSample)
+                sumSquares += sample * sample
+                sampleCount += 1
+            }
+        }
+        guard sampleCount > 0 else { return (0, peak) }
+        return (sqrt(sumSquares / Double(sampleCount)), peak)
+    }
+
+    private func emitAudioDiagnosticIfNeeded(_ level: (rms: Double, peak: Double)) {
+        guard audioDiagnosticsEnabled() else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastAudioDiagnosticAt) >= 2 else { return }
+        lastAudioDiagnosticAt = now
+        emitLine(BridgeDiagnosticLine(
+            kind: "audio_diagnostic",
+            source: source,
+            code: "audio_input_level",
+            message: String(format: "audio input rms=%.5f peak=%.5f", level.rms, level.peak),
+            rms: level.rms,
+            peak: level.peak
+        ))
     }
 
     private func startSystemAudioCapture() throws {
@@ -388,8 +536,12 @@ final class NativeSpeechBridge: NSObject {
     }
 
     func stop() {
-        recognitionRequest?.endAudio()
-        recognitionTask?.finish()
+        recognitionQueue.sync {
+            isStopping = true
+            recognitionRestartWorkItem?.cancel()
+            recognitionRestartWorkItem = nil
+            finishRecognitionOnQueue()
+        }
         if let engine = audioEngine {
             engine.stop()
             engine.inputNode.removeTap(onBus: 0)
@@ -432,6 +584,15 @@ final class NativeSpeechBridge: NSObject {
         emitLine(BridgeErrorLine(kind: "error", message: message, source: source, code: code ?? classifySpeechErrorMessage(message)))
     }
 
+    @available(macOS 13.0, *)
+    fileprivate func appendSystemAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        recognitionQueue.async { [weak self] in
+            guard let self, !self.isStopping else { return }
+            self.recognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
+            self.startRecognitionTaskOnQueue()
+        }
+    }
+
     private func emitLine<T: Encodable>(_ value: T) {
         let encoder = JSONEncoder()
         guard let data = try? encoder.encode(value), let line = String(data: data, encoding: .utf8) else {
@@ -447,6 +608,6 @@ final class NativeSpeechBridge: NSObject {
 extension NativeSpeechBridge: SCStreamDelegate, SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio, sampleBuffer.isValid else { return }
-        recognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
+        appendSystemAudioSampleBuffer(sampleBuffer)
     }
 }

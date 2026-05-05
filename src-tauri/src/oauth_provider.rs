@@ -1,8 +1,8 @@
-use crate::decision_logic::{now_ms, stable_id};
+use crate::decision_logic::{now_ms, now_ms_string, stable_id};
 use crate::desktop_types::{
     AiSummaryRequest, AiSummarySections, LiveStatePatchEnvelope, MeetingBrief, NativeDecisionState,
-    PrepSummaryRequest, RevisedTranscriptLine, TextProviderStatus, TranscriptCleanupRequest,
-    TranscriptEvent, TranscriptRevisionRequest,
+    NativeSuggestion, PrepSummaryRequest, RevisedTranscriptLine, TextProviderStatus,
+    TranscriptCleanupRequest, TranscriptEvent, TranscriptRevisionRequest,
 };
 use crate::native_storage::{log_app_error_inner, log_provider_failure, log_provider_usage};
 use std::fs;
@@ -12,6 +12,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone)]
 pub(crate) struct CachedTextProviderStatus {
@@ -607,6 +608,20 @@ Exact shape:
     "addMissingInputs": [],
     "readinessPatch": {{"score": null, "safeToDecide": null, "blockers": [], "evidenceTranscriptIds": []}},
     "evidenceTranscriptIds": []
+  }},
+  "coaching": {{
+    "cards": [
+      {{
+        "kind": "say_next|ask_clarifying_question|watch_out|challenge_assumption|confirm_commitment|defer_decision",
+        "priority": "low|medium|high",
+        "confidence": 0.0,
+        "title": "...",
+        "suggestedMove": "...",
+        "watchOut": "...",
+        "reason": "...",
+        "evidenceTranscriptIds": []
+      }}
+    ]
   }}
 }}
 
@@ -615,6 +630,12 @@ Rules:
 - Do not invent owners, dates, commitments, decisions, or speakers.
 - Use only allowedEvidenceTranscriptIds for evidence.
 - If unsure, return empty arrays and null fields.
+- Coaching cards are live meeting interventions. Show a card only when the user can act on it in the next turn.
+- Use the meeting brief as the user's goals, known background, must-confirm points, constraints, and risks.
+- Coaching should answer one of: what the user should say next, what to clarify, what risk in the other party's words needs attention, or what commitment should be confirmed.
+- Do not create coaching cards for summaries, obvious acknowledgements, greetings, or low-confidence guesses.
+- Prefer a clarifying question over a directive when evidence is incomplete.
+- Return at most one high-value coaching card.
 - addMissingInputs item shape: {{"kind":"owner|deadline|acceptance_criteria|rollback_plan|other","text":"...","blocksDecision":true}}
 - addRisks item shape: {{"text":"...","severity":"low|medium|high","evidenceTranscriptIds":["..."]}}
 - Do not include fields named meetingState, decisionState, fullState, replacementState, transcriptEvents, or suggestions.
@@ -733,6 +754,176 @@ pub(crate) fn parse_live_state_patch(
     let value = parse_json_object_value(raw_output).map_err(|error| ("malformed_json", error))?;
     validate_live_state_patch_value(&value).map_err(|error| ("schema_validation", error))?;
     serde_json::from_value(value).map_err(|error| ("schema_validation", error.to_string()))
+}
+
+pub(crate) fn parse_live_coaching_suggestions(
+    raw_output: &str,
+    session_id: &str,
+    events: &[TranscriptEvent],
+) -> Result<Vec<NativeSuggestion>, (&'static str, String)> {
+    let value = parse_json_object_value(raw_output).map_err(|error| ("malformed_json", error))?;
+    let Some(cards) = value
+        .get("coaching")
+        .and_then(|value| value.get("cards"))
+        .and_then(|value| value.as_array())
+    else {
+        return Ok(vec![]);
+    };
+    let mut suggestions = vec![];
+    let mut dropped_reasons = vec![];
+    let mut first_schema_error = None;
+    for (index, card) in cards.iter().enumerate() {
+        match parse_live_coaching_card(card, index, session_id, events) {
+            Ok(CoachingCardParseResult::Accepted(suggestion)) => suggestions.push(suggestion),
+            Ok(CoachingCardParseResult::Dropped(reason)) => {
+                dropped_reasons.push(format!("coaching.cards[{index}]: {reason}"));
+            }
+            Err(error) => {
+                if first_schema_error.is_none() {
+                    first_schema_error = Some(error);
+                }
+            }
+        }
+    }
+    suggestions.sort_by(|left, right| {
+        coaching_priority_rank(&right.priority)
+            .cmp(&coaching_priority_rank(&left.priority))
+            .then_with(|| {
+                right
+                    .confidence
+                    .partial_cmp(&left.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    if let Some(suggestion) = suggestions.into_iter().next() {
+        return Ok(vec![suggestion]);
+    }
+    if let Some(error) = first_schema_error {
+        return Err(("schema_validation", error));
+    }
+    if !dropped_reasons.is_empty() {
+        return Err(("coaching_cards_discarded", dropped_reasons.join("; ")));
+    }
+    Ok(vec![])
+}
+
+enum CoachingCardParseResult {
+    Accepted(NativeSuggestion),
+    Dropped(&'static str),
+}
+
+fn parse_live_coaching_card(
+    card: &serde_json::Value,
+    index: usize,
+    session_id: &str,
+    events: &[TranscriptEvent],
+) -> Result<CoachingCardParseResult, String> {
+    let object = card
+        .as_object()
+        .ok_or_else(|| format!("coaching.cards[{index}] must be an object"))?;
+    let kind = coaching_string_field(object, "kind")?;
+    if !is_allowed_coaching_kind(&kind) {
+        return Err(format!("coaching.cards[{index}].kind is not allowed"));
+    }
+    let priority = coaching_string_field(object, "priority")?;
+    if !matches!(priority.as_str(), "low" | "medium" | "high") {
+        return Err(format!("coaching.cards[{index}].priority is not allowed"));
+    }
+    let title = coaching_string_field(object, "title")?;
+    let suggested_move = coaching_string_field(object, "suggestedMove")?;
+    let watch_out = optional_coaching_string_field(object, "watchOut");
+    let reason = coaching_string_field(object, "reason")?;
+    let confidence = object
+        .get("confidence")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.65)
+        .clamp(0.0, 1.0);
+    if confidence < 0.45 {
+        return Ok(CoachingCardParseResult::Dropped("confidence_too_low"));
+    }
+    let allowed_ids = events
+        .iter()
+        .map(|event| event.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let evidence_transcript_ids = object
+        .get("evidenceTranscriptIds")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .filter(|id| allowed_ids.contains(id))
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if evidence_transcript_ids.is_empty() {
+        return Ok(CoachingCardParseResult::Dropped(
+            "missing_or_invalid_evidence_transcript_ids",
+        ));
+    }
+    let text = if let Some(watch_out) = &watch_out {
+        format!("{suggested_move}\n注意：{watch_out}")
+    } else {
+        suggested_move.clone()
+    };
+    Ok(CoachingCardParseResult::Accepted(NativeSuggestion {
+        id: stable_id(&format!(
+            "live_coaching:{session_id}:{kind}:{}",
+            evidence_transcript_ids.join(",")
+        )),
+        session_id: session_id.to_string(),
+        shown_at: now_ms_string(),
+        kind,
+        title: Some(title),
+        text,
+        suggested_move: Some(suggested_move),
+        watch_out,
+        reason,
+        confidence,
+        priority,
+        evidence_transcript_ids,
+    }))
+}
+
+fn coaching_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String, String> {
+    optional_coaching_string_field(object, field)
+        .ok_or_else(|| format!("coaching card {field} is required"))
+}
+
+fn optional_coaching_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<String> {
+    object
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().graphemes(true).take(220).collect::<String>())
+        .filter(|value| !value.is_empty())
+}
+
+fn is_allowed_coaching_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "say_next"
+            | "ask_clarifying_question"
+            | "watch_out"
+            | "challenge_assumption"
+            | "confirm_commitment"
+            | "defer_decision"
+    )
+}
+
+fn coaching_priority_rank(priority: &str) -> u8 {
+    match priority {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
 }
 
 pub(crate) fn parse_json_object_value(raw_output: &str) -> Result<serde_json::Value, String> {

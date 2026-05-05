@@ -59,8 +59,8 @@ export class SessionRepository {
     executeSql(this.dbPath, `
       INSERT OR IGNORE INTO suggestions (
         id, session_id, shown_at, text, reason, trigger_rule_id,
-        confidence, priority, evidence_transcript_ids_json, feedback
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        confidence, priority, evidence_transcript_ids_json, suggestion_json, feedback
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     `, [
       suggestion.id,
       suggestion.sessionId,
@@ -71,6 +71,7 @@ export class SessionRepository {
       numberOrNull(suggestion.confidence),
       suggestion.priority,
       JSON.stringify(suggestion.evidenceTranscriptIds ?? []),
+      JSON.stringify(suggestion),
       suggestion.feedback ?? null
     ]);
   }

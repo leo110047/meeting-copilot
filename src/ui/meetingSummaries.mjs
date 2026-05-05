@@ -17,7 +17,7 @@ export function summarizeDecisionState(decisionState, text) {
 }
 
 export function summarizeSuggestions(suggestions, text) {
-  const shown = suggestions.map((item) => `${labelMove(item.kind)}：${item.text}`);
+  const shown = suggestions.map((item) => `${labelMove(item.kind)}：${item.suggestedMove ?? item.text}`);
   const actionLines = splitSentences(text)
     .filter((line) => /要做|負責|owner|action|todo|下次|follow up|確認|補/i.test(line));
   return uniqueLimited([...shown, ...actionLines], 6);
@@ -26,10 +26,13 @@ export function summarizeSuggestions(suggestions, text) {
 export function labelMove(kind) {
   return {
     ask_question: "Ask｜補問",
+    ask_clarifying_question: "Ask｜補問",
+    say_next: "Say｜接下來說",
+    watch_out: "Watch｜注意",
     defer_decision: "Hold｜先停一下",
-    split_decision: "Clarify｜拆清楚",
     challenge_assumption: "Hold｜挑戰假設",
     confirm_commitment: "Decide｜確認承諾",
+    split_decision: "Clarify｜拆清楚",
     surface_tradeoff: "Clarify｜攤開取捨",
     identify_missing_input: "Ask｜補齊條件"
   }[kind] ?? "決策建議";

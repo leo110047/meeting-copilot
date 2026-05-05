@@ -248,6 +248,11 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /語音轉錄已停止/);
   assert.match(js, /renderDecisionOverview/);
   assert.match(js, /renderSuggestionCard/);
+  assert.match(js, /suggestion-title/);
+  assert.match(js, /suggestion-move/);
+  assert.match(js, /suggestion-watch/);
+  assert.match(js, /coachingError/);
+  assert.match(js, /AI 暫時無法產生提醒/);
   assert.match(js, /renderEvidenceLines/);
   assert.match(js, /labelCaptureSource/);
   assert.match(js, /labelLanguage/);

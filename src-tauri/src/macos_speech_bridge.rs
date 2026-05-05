@@ -460,6 +460,34 @@ pub(crate) unsafe extern "C" fn macos_speech_bridge_callback(
         emit_native_transcription_error_with_code(&context.app, message, &context.source, code);
         return;
     }
+    if let Ok(diagnostic_line) = serde_json::from_str::<serde_json::Value>(&line)
+        && diagnostic_line.get("kind").and_then(|kind| kind.as_str()) == Some("audio_diagnostic")
+        && diagnostic_line.get("code").and_then(|code| code.as_str()) == Some("audio_input_level")
+    {
+        let message = diagnostic_line
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("macOS speech bridge diagnostic")
+            .to_string();
+        let code = diagnostic_line
+            .get("code")
+            .and_then(|code| code.as_str())
+            .unwrap_or("diagnostic");
+        let _ = log_app_error_inner(
+            Some(&context.session_id),
+            "native_transcription.bridge_diagnostic",
+            "macos_speech_bridge",
+            "info",
+            &message,
+            serde_json::json!({
+                "source": context.source,
+                "code": code,
+                "rms": diagnostic_line.get("rms").and_then(|value| value.as_f64()),
+                "peak": diagnostic_line.get("peak").and_then(|value| value.as_f64())
+            }),
+        );
+        return;
+    }
     let parsed: Result<HelperTranscriptLine, _> = serde_json::from_str(&line);
     match parsed {
         Ok(helper_line)

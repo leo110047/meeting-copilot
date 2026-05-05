@@ -48,14 +48,20 @@ pub struct DecisionState {
     pub evidence_transcript_ids: Vec<String>,
 }
 
-pub fn stable_canonical_key(kind: &str, semantic_label: &str, linked_playbook_item_id: Option<&str>) -> String {
+pub fn stable_canonical_key(
+    kind: &str,
+    semantic_label: &str,
+    linked_playbook_item_id: Option<&str>,
+) -> String {
     let mut normalized = semantic_label
         .trim()
         .to_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join("_");
-    normalized.retain(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    normalized.retain(|ch| {
+        ch.is_ascii_alphanumeric() || ch == '_' || ('\u{4e00}'..='\u{9fff}').contains(&ch)
+    });
 
     match linked_playbook_item_id {
         Some(linked) if !linked.is_empty() => format!("{kind}:{normalized}:{linked}"),

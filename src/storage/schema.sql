@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS suggestions (
   confidence REAL NOT NULL,
   priority TEXT NOT NULL,
   evidence_transcript_ids_json TEXT NOT NULL,
+  suggestion_json TEXT NOT NULL DEFAULT '{}',
   feedback TEXT,
   FOREIGN KEY (session_id) REFERENCES meeting_sessions(id)
 );

@@ -35,6 +35,7 @@ test("SQLite migration creates core, Layer 3, and shared meeting tables", () => 
   ]) {
     assert.ok(tables.includes(table), `${table} missing`);
   }
+  assert.equal(queryScalar(dbPath, "SELECT COUNT(*) FROM pragma_table_info('suggestions') WHERE name = 'suggestion_json';"), "1");
 });
 
 test("SessionRepository persists cross-project app error logs", () => {
@@ -82,6 +83,21 @@ test("SessionRepository writes user text through SQLite parameters", () => {
   });
   assert.equal(queryScalar(dbPath, "SELECT COUNT(*) FROM meeting_sessions;"), "1");
   assert.equal(queryScalar(dbPath, "SELECT text FROM transcript_events WHERE id = ?;", ["tricky_text"]), "ok'); DROP TABLE meeting_sessions; --");
+  repository.saveSuggestion({
+    id: "coach_1",
+    sessionId: "sess_sql",
+    shownAt: "1",
+    kind: "ask_clarifying_question",
+    title: "先確認正式版定義",
+    text: "你可以問：正式版是指 demo 還是 production？",
+    suggestedMove: "你可以問：正式版是指 demo 還是 production？",
+    watchOut: "對方把模糊時程推成承諾。",
+    reason: "對方要求下週上線但沒有驗收標準。",
+    confidence: 0.88,
+    priority: "high",
+    evidenceTranscriptIds: ["tricky_text"]
+  });
+  assert.equal(queryScalar(dbPath, "SELECT json_extract(suggestion_json, '$.suggestedMove') FROM suggestions WHERE id = ?;", ["coach_1"]), "你可以問：正式版是指 demo 還是 production？");
   repository.close();
 });
 
@@ -102,5 +118,5 @@ test("Node storage path does not depend on sqlite3 CLI child processes", async (
   assert.match(sqliteSource, /export function closeAllDatabases/);
   assert.match(repositorySource, /closeDatabase\(this\.dbPath\)/);
   assert.doesNotMatch(repositorySource, /sqlString|sqlNumber/);
-  assert.match(repositorySource, /VALUES \(\?, \?, \?, \?, \?, NULL, \?, \?\)/);
+  assert.match(repositorySource, /suggestion_json/);
 });

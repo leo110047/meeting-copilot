@@ -123,7 +123,38 @@ pub(crate) fn open_db(db_path: &PathBuf) -> Result<Connection, String> {
     let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
     conn.execute_batch(SCHEMA_SQL)
         .map_err(|error| error.to_string())?;
+    ensure_column(
+        &conn,
+        "suggestions",
+        "suggestion_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
     Ok(conn)
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if columns.iter().any(|name| name == column) {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub(crate) fn app_db_path() -> Result<PathBuf, String> {

@@ -1,14 +1,12 @@
-use crate::decision_logic::{
-    derive_decision_state, derive_suggestions, detect_language, now_ms, stable_id,
-};
+use crate::decision_logic::{derive_decision_state, detect_language, now_ms, stable_id};
 use crate::desktop_types::{
     HelperTranscriptLine, IngestTranscriptResponse, NativeTranscriptionErrorEvent,
     NativeTranscriptionRequest, NativeTranscriptionStartResponse, PersistedSummary,
     PrepDictationStartResponse, TranscriptEvent, TranscriptInput,
 };
 use crate::native_storage::{
-    ensure_session_exists, insert_decision_snapshot, insert_suggestion, insert_transcript_event,
-    log_app_error_inner, native_speech_helper_path, native_speech_provider_id,
+    ensure_session_exists, insert_decision_snapshot, insert_transcript_event, log_app_error_inner,
+    native_speech_helper_path, native_speech_provider_id,
 };
 use crate::oauth_provider::cleanup_transcript_text_oauth_inner;
 use crate::shell_storage::{app_db_path, open_db, set_listening_window_mode, show_main_window};
@@ -753,7 +751,7 @@ pub(crate) fn ingest_transcript_inner(
     session_id: String,
     input: TranscriptInput,
 ) -> Result<IngestTranscriptResponse, String> {
-    let (event, brief, events_snapshot, should_persist_event) = {
+    let (event, events_snapshot, should_persist_event) = {
         let mut sessions = LIVE_SESSIONS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -771,7 +769,7 @@ pub(crate) fn ingest_transcript_inner(
         {
             let event = existing.clone();
             let events_snapshot = session.events.clone();
-            (event, session.brief.clone(), events_snapshot, false)
+            (event, events_snapshot, false)
         } else {
             let event_index = session.events.len() + 1;
             let event = TranscriptEvent {
@@ -791,7 +789,7 @@ pub(crate) fn ingest_transcript_inner(
                 is_final: input.is_final.unwrap_or(true),
             };
             session.events.push(event.clone());
-            (event, session.brief.clone(), session.events.clone(), true)
+            (event, session.events.clone(), true)
         }
     };
 
@@ -802,22 +800,17 @@ pub(crate) fn ingest_transcript_inner(
     }
 
     let decision_state = derive_decision_state(&session_id, &events_snapshot);
-    let mut suggestions = derive_suggestions(&brief, &events_snapshot, &decision_state);
+    let suggestions = Vec::new();
     let transcript_events = {
-        let mut sessions = LIVE_SESSIONS
+        let sessions = LIVE_SESSIONS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .map_err(|error| error.to_string())?;
         let session = sessions
-            .get_mut(&session_id)
+            .get(&session_id)
             .ok_or_else(|| "session not found".to_string())?;
-        suggestions.retain(|suggestion| session.shown_suggestion_ids.insert(suggestion.id.clone()));
         session.events.len()
     };
-
-    for suggestion in &suggestions {
-        insert_suggestion(&conn, suggestion)?;
-    }
 
     let snapshot_id = stable_id(&format!(
         "{}:{}:{}:{}",
@@ -837,6 +830,7 @@ pub(crate) fn ingest_transcript_inner(
             new_suggestions: suggestions.len(),
             decision_snapshot_id: snapshot_id,
         },
+        coaching_error: None,
     })
 }
 

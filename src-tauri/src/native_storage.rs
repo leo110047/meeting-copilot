@@ -273,8 +273,8 @@ pub(crate) fn insert_suggestion(
 ) -> Result<(), String> {
     conn.execute(
         "INSERT OR IGNORE INTO suggestions
-        (id, session_id, shown_at, text, reason, trigger_rule_id, confidence, priority, evidence_transcript_ids_json, feedback)
-        VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL)",
+        (id, session_id, shown_at, text, reason, trigger_rule_id, confidence, priority, evidence_transcript_ids_json, suggestion_json, feedback)
+        VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, NULL)",
         params![
             suggestion.id,
             suggestion.session_id,
@@ -284,7 +284,8 @@ pub(crate) fn insert_suggestion(
             suggestion.confidence,
             suggestion.priority,
             serde_json::to_string(&suggestion.evidence_transcript_ids)
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?,
+            serde_json::to_string(suggestion).map_err(|error| error.to_string())?
         ],
     )
     .map_err(|error| error.to_string())?;
