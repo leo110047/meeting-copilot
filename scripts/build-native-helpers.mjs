@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { platform } from "node:os";
-import { dirname, resolve } from "node:path";
+import { delimiter, dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const target = platform();
@@ -14,12 +14,14 @@ if (target === "darwin" && verboseSigning) console.log(`Using macOS codesign ide
 
 if (target === "darwin") {
   removeStaleMacHelperApp();
+  buildWhisperRunner(host);
   buildMacHelper(host);
   buildMacSpeechBridge();
   process.exit(0);
 }
 
 if (target === "win32") {
+  buildWhisperRunner(host);
   buildWindowsHelper(host);
   process.exit(0);
 }
@@ -92,6 +94,26 @@ function buildWindowsHelper(hostTriple) {
   ], { stdio: "inherit" });
   if (result.status !== 0) process.exit(result.status ?? 1);
   logVerbose(`Built native helper: ${output}`);
+}
+
+function buildWhisperRunner(hostTriple) {
+  const executableName = target === "win32" ? "meeting-copilot-whisper.exe" : "meeting-copilot-whisper";
+  const builtBinary = resolve("target", "release", executableName);
+  const output = resolve(`src-tauri/binaries/meeting-copilot-whisper-${hostTriple}${target === "win32" ? ".exe" : ""}`);
+  mkdirSync(dirname(output), { recursive: true });
+  const env = { ...process.env };
+  const rustBin = rustToolchainBin();
+  if (rustBin) env.PATH = [rustBin, env.PATH].filter(Boolean).join(delimiter);
+  const result = spawnSync("cargo", [
+    "build",
+    "--package",
+    "meeting-copilot-whisper",
+    "--release"
+  ], { env, stdio: "inherit", shell: target === "win32" });
+  if (result.status !== 0) process.exit(result.status ?? 1);
+  rmSync(output, { force: true });
+  copyFileSync(builtBinary, output);
+  logVerbose(`Built Whisper runner: ${output}`);
 }
 
 function logVerbose(message) {
@@ -203,4 +225,20 @@ function detectRustHost() {
   }
   const hostLine = result.stdout.split("\n").find((line) => line.startsWith("host: "));
   return hostLine?.slice("host: ".length).trim() ?? `${process.arch}-${target}`;
+}
+
+function rustToolchainBin() {
+  if (process.env.MEETING_COPILOT_RUST_BIN) return process.env.MEETING_COPILOT_RUST_BIN;
+  const home = process.env.HOME ?? process.env.USERPROFILE;
+  if (!home) return "";
+  const candidates = target === "darwin"
+    ? [
+        `${home}/.rustup/toolchains/stable-aarch64-apple-darwin/bin`,
+        `${home}/.rustup/toolchains/stable-x86_64-apple-darwin/bin`,
+        `${home}/.cargo/bin`
+      ]
+    : target === "win32"
+      ? [`${home}\\.cargo\\bin`]
+      : [`${home}/.cargo/bin`];
+  return candidates.find((candidate) => existsSync(candidate)) ?? "";
 }

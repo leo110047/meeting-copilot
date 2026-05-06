@@ -4,17 +4,22 @@ use crate::desktop_types::{
     NativeTranscriptionRequest, NativeTranscriptionStartResponse, PersistedSummary,
     PrepDictationStartResponse, TranscriptEvent, TranscriptInput,
 };
+use crate::local_stt::{
+    is_local_whisper_profile, local_whisper_runtime, normalize_local_stt_profile_id,
+};
+#[cfg(not(target_os = "macos"))]
+use crate::native_storage::native_speech_helper_path;
 use crate::native_storage::{
     ensure_session_exists, insert_decision_snapshot, insert_transcript_event, log_app_error_inner,
-    native_speech_helper_path, native_speech_provider_id,
+    native_speech_provider_id,
 };
 use crate::oauth_provider::cleanup_transcript_text_with_provider_inner;
 use crate::shell_storage::{app_db_path, open_db, set_listening_window_mode, show_main_window};
-use crate::{LIVE_SESSIONS, NATIVE_TRANSCRIBERS, PREP_DICTATION};
+use crate::{LIVE_SESSIONS, ManagedNativeTranscriber, NATIVE_TRANSCRIBERS, PREP_DICTATION};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -23,7 +28,7 @@ use tauri::Emitter;
 #[cfg(target_os = "macos")]
 use crate::macos_speech_bridge::{
     MACOS_SPEECH_BRIDGES, start_macos_prep_dictation_bridge, start_macos_speech_bridge,
-    stop_macos_prep_dictation_bridge, stop_macos_speech_bridge,
+    start_macos_whisper_bridge, stop_macos_prep_dictation_bridge, stop_macos_speech_bridge,
 };
 
 #[tauri::command]
@@ -187,15 +192,28 @@ pub(crate) fn start_native_transcription(
     let request = request.unwrap_or(NativeTranscriptionRequest {
         language: None,
         source: None,
+        stt_profile_id: None,
     });
     let language = request.language.unwrap_or_else(|| "zh-TW".to_string());
     let source = request.source.unwrap_or_else(|| "mic".to_string());
+    let stt_profile_id = normalize_local_stt_profile_id(request.stt_profile_id.as_deref());
     if source != "mic" && source != "system" && source != "mixed" {
         return Err("native live transcription source must be mic, system, or mixed".to_string());
     }
     ensure_session_exists(&session_id)?;
-    let helper_path = native_speech_helper_path()?;
-    let requested_sources = if source == "mixed" {
+    let whisper_runtime = if is_local_whisper_profile(stt_profile_id) {
+        Some(local_whisper_runtime(stt_profile_id)?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let helper_path: Option<PathBuf> = None;
+    #[cfg(not(target_os = "macos"))]
+    let helper_path: Option<PathBuf> = Some(native_speech_helper_path()?);
+    // Platform speech starts separate helpers for mixed capture. Whisper helpers
+    // receive "mixed" and expand mic/system lanes inside one process so one
+    // persistent runner/model instance can serve both sources.
+    let requested_sources = if source == "mixed" && whisper_runtime.is_none() {
         vec!["mic".to_string(), "system".to_string()]
     } else {
         vec![source.clone()]
@@ -206,9 +224,22 @@ pub(crate) fn start_native_transcription(
     for helper_source in requested_sources {
         #[cfg(target_os = "macos")]
         {
-            if helper_source == "mic" || helper_source == "system" {
-                match start_macos_speech_bridge(app.clone(), &session_id, &helper_source, &language)
-                {
+            if helper_source == "mic"
+                || helper_source == "system"
+                || (helper_source == "mixed" && whisper_runtime.is_some())
+            {
+                let bridge_result = if let Some(runtime) = whisper_runtime.as_ref() {
+                    start_macos_whisper_bridge(
+                        app.clone(),
+                        &session_id,
+                        &helper_source,
+                        &language,
+                        runtime,
+                    )
+                } else {
+                    start_macos_speech_bridge(app.clone(), &session_id, &helper_source, &language)
+                };
+                match bridge_result {
                     Ok(()) => {
                         bridge_sources.push(helper_source);
                         continue;
@@ -223,7 +254,14 @@ pub(crate) fn start_native_transcription(
                 }
             }
         }
-        match spawn_native_speech_helper(&helper_path, &language, &helper_source) {
+        match spawn_native_speech_helper(
+            helper_path
+                .as_ref()
+                .ok_or_else(|| "native speech helper path is unavailable".to_string())?,
+            &language,
+            &helper_source,
+            whisper_runtime.as_ref(),
+        ) {
             Ok(process) => processes.push(process),
             Err(error) => {
                 stop_spawned_native_processes(processes);
@@ -245,15 +283,23 @@ pub(crate) fn start_native_transcription(
             .map_err(|error| error.to_string())?;
         for process in processes.iter_mut() {
             let key = native_transcriber_key(&session_id, &process.source);
-            if let Some(mut stale_child) = transcribers.remove(&key) {
-                let _ = stale_child.kill();
-                let _ = stale_child.wait();
+            if let Some(stale_child) = transcribers.remove(&key) {
+                stop_managed_native_transcriber_background(
+                    session_id.clone(),
+                    stale_child,
+                    true,
+                    "native_transcription.stop_stale",
+                );
             }
             transcribers.insert(
                 key,
-                process.child.take().ok_or_else(|| {
-                    format!("native speech helper child missing for {}", process.source)
-                })?,
+                ManagedNativeTranscriber {
+                    child: process.child.take().ok_or_else(|| {
+                        format!("native speech helper child missing for {}", process.source)
+                    })?,
+                    stdin: process.stdin.take(),
+                    stop_file: process.stop_file.take(),
+                },
             );
         }
     }
@@ -265,16 +311,30 @@ pub(crate) fn start_native_transcription(
 
     Ok(NativeTranscriptionStartResponse {
         session_id,
-        provider_id: native_speech_provider_id().to_string(),
+        provider_id: whisper_runtime
+            .as_ref()
+            .map(|runtime| runtime.provider_id.to_string())
+            .unwrap_or_else(|| native_speech_provider_id().to_string()),
         source,
         language,
-        helper_path: helper_path.display().to_string(),
+        helper_path: helper_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| {
+                if whisper_runtime.is_some() {
+                    "in-process-macos-whisper-bridge".to_string()
+                } else {
+                    "in-process-macos-speech-bridge".to_string()
+                }
+            }),
     })
 }
 
 pub(crate) struct NativeTranscriberProcess {
     source: String,
     child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stop_file: Option<PathBuf>,
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
 }
@@ -283,12 +343,32 @@ pub(crate) fn spawn_native_speech_helper(
     helper_path: &PathBuf,
     language: &str,
     source: &str,
+    whisper_runtime: Option<&crate::local_stt::LocalWhisperRuntime>,
 ) -> Result<NativeTranscriberProcess, String> {
-    let mut child = Command::new(helper_path)
+    let stop_file = whisper_runtime.map(|_| whisper_helper_stop_file_path(source));
+    let mut command = Command::new(helper_path);
+    command
         .arg("--language")
         .arg(language)
         .arg("--source")
-        .arg(source)
+        .arg(source);
+    if let Some(runtime) = whisper_runtime {
+        if let Some(stop_file) = stop_file.as_ref() {
+            let _ = std::fs::remove_file(stop_file);
+        }
+        command
+            .stdin(Stdio::piped())
+            .arg("--engine")
+            .arg("whisper")
+            .arg("--whisper-runner")
+            .arg(&runtime.runner_path)
+            .arg("--whisper-model")
+            .arg(&runtime.model_path);
+        if let Some(stop_file) = stop_file.as_ref() {
+            command.arg("--stop-file").arg(stop_file);
+        }
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -303,6 +383,8 @@ pub(crate) fn spawn_native_speech_helper(
         .ok_or_else(|| format!("{source} native speech helper stderr unavailable"))?;
     Ok(NativeTranscriberProcess {
         source: source.to_string(),
+        stdin: child.stdin.take(),
+        stop_file,
         child: Some(child),
         stdout: Some(stdout),
         stderr: Some(stderr),
@@ -311,11 +393,115 @@ pub(crate) fn spawn_native_speech_helper(
 
 pub(crate) fn stop_spawned_native_processes(processes: Vec<NativeTranscriberProcess>) {
     for mut process in processes {
-        if let Some(mut child) = process.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = process.child.take() {
+            let managed = ManagedNativeTranscriber {
+                child,
+                stdin: process.stdin.take(),
+                stop_file: process.stop_file.take(),
+            };
+            stop_managed_native_transcriber_background(
+                "startup".to_string(),
+                managed,
+                true,
+                "native_transcription.stop_startup",
+            );
         }
     }
+}
+
+fn signal_managed_native_transcriber(
+    transcriber: &mut ManagedNativeTranscriber,
+) -> Result<(), String> {
+    if let Some(stop_file) = transcriber.stop_file.as_ref() {
+        std::fs::write(stop_file, b"stop")
+            .map_err(|error| format!("failed to signal native speech helper stop file: {error}"))?;
+    }
+    // The Whisper runner speaks JSON-lines. Closing stdin is the stop signal;
+    // writing a sentinel would become an invalid job and surface as a false error.
+    drop(transcriber.stdin.take());
+    Ok(())
+}
+
+fn stop_managed_native_transcriber_background(
+    session_id: String,
+    mut transcriber: ManagedNativeTranscriber,
+    force_on_timeout: bool,
+    log_target: &'static str,
+) {
+    if let Err(error) = signal_managed_native_transcriber(&mut transcriber) {
+        let _ = log_app_error_inner(
+            Some(&session_id),
+            log_target,
+            "native",
+            "warning",
+            &error,
+            serde_json::json!({"stage": "signal"}),
+        );
+    }
+    thread::spawn(move || {
+        if let Err(error) =
+            finish_managed_native_transcriber(&session_id, &mut transcriber, force_on_timeout)
+        {
+            let _ = log_app_error_inner(
+                Some(&session_id),
+                log_target,
+                "native",
+                "warning",
+                &error,
+                serde_json::json!({"stage": "wait"}),
+            );
+        }
+    });
+}
+
+fn finish_managed_native_transcriber(
+    session_id: &str,
+    transcriber: &mut ManagedNativeTranscriber,
+    force_on_timeout: bool,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    loop {
+        match transcriber.child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                if force_on_timeout {
+                    transcriber
+                        .child
+                        .kill()
+                        .map_err(|error| format!("failed to kill native speech helper: {error}"))?;
+                }
+                break;
+            }
+            Err(error) => return Err(format!("failed to wait native speech helper: {error}")),
+        }
+    }
+    transcriber
+        .child
+        .wait()
+        .map_err(|error| format!("failed to reap native speech helper: {error}"))?;
+    if let Some(stop_file) = transcriber.stop_file.as_ref() {
+        let _ = std::fs::remove_file(stop_file);
+    }
+    let _ = log_app_error_inner(
+        Some(session_id),
+        "native_transcription.stop.graceful",
+        "native",
+        "info",
+        "native speech helper stopped",
+        serde_json::json!({"graceful": true}),
+    );
+    Ok(())
+}
+
+fn whisper_helper_stop_file_path(source: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "meeting-copilot-whisper-stop-{}-{source}-{}",
+        std::process::id(),
+        now_ms()
+    ))
 }
 
 pub(crate) fn install_native_transcriber_io(
@@ -537,17 +723,25 @@ pub(crate) fn monitor_native_transcriber_exit(
                         );
                     }
                 };
-                let Some(child) = transcribers.get_mut(&key) else {
+                let Some(transcriber) = transcribers.get_mut(&key) else {
                     return;
                 };
-                match child.try_wait() {
+                match transcriber.child.try_wait() {
                     Ok(Some(status)) => {
-                        transcribers.remove(&key);
+                        if let Some(transcriber) = transcribers.remove(&key)
+                            && let Some(stop_file) = transcriber.stop_file
+                        {
+                            let _ = std::fs::remove_file(stop_file);
+                        }
                         Some(Ok(status.to_string()))
                     }
                     Ok(None) => None,
                     Err(error) => {
-                        transcribers.remove(&key);
+                        if let Some(transcriber) = transcribers.remove(&key)
+                            && let Some(stop_file) = transcriber.stop_file
+                        {
+                            let _ = std::fs::remove_file(stop_file);
+                        }
                         Some(Err(error.to_string()))
                     }
                 }
@@ -624,6 +818,13 @@ pub(crate) fn classify_native_transcription_error(message: &str) -> String {
     {
         return "no_speech_detected".to_string();
     }
+    if lowered.contains("recognition request was canceled")
+        || lowered.contains("recognition request was cancelled")
+        || lowered.contains("recognition request canceled")
+        || lowered.contains("recognition request cancelled")
+    {
+        return "recognition_request_canceled".to_string();
+    }
     if lowered.contains("stopped from tray") {
         return "stopped_from_tray".to_string();
     }
@@ -679,27 +880,13 @@ pub(crate) fn stop_native_transcription(
             .filter_map(|key| transcribers.remove(&key).map(|child| (key, child)))
             .collect::<Vec<_>>();
         drop(transcribers);
-        for (_key, mut child) in stopped {
-            if let Err(error) = child.kill() {
-                let _ = log_app_error_inner(
-                    Some(&session_id),
-                    "native_transcription.stop.kill",
-                    "native",
-                    "warning",
-                    &error.to_string(),
-                    serde_json::json!({}),
-                );
-            }
-            if let Err(error) = child.wait() {
-                let _ = log_app_error_inner(
-                    Some(&session_id),
-                    "native_transcription.stop.wait",
-                    "native",
-                    "warning",
-                    &error.to_string(),
-                    serde_json::json!({}),
-                );
-            }
+        for (_key, child) in stopped {
+            stop_managed_native_transcriber_background(
+                session_id.clone(),
+                child,
+                true,
+                "native_transcription.stop",
+            );
         }
     }
     set_listening_window_mode(&app, false);
@@ -729,31 +916,19 @@ pub(crate) fn stop_all_native_transcribers(app: &tauri::AppHandle) {
     if let Some(transcribers) = NATIVE_TRANSCRIBERS.get()
         && let Ok(mut transcribers) = transcribers.lock()
     {
-        for (key, mut child) in transcribers.drain() {
+        let stopped = transcribers.drain().collect::<Vec<_>>();
+        drop(transcribers);
+        for (key, child) in stopped {
             let session_id = key
                 .split_once("::")
                 .map(|(session_id, _)| session_id)
                 .unwrap_or(&key);
-            if let Err(error) = child.kill() {
-                let _ = log_app_error_inner(
-                    Some(session_id),
-                    "native_transcription.stop_all.kill",
-                    "native",
-                    "warning",
-                    &error.to_string(),
-                    serde_json::json!({}),
-                );
-            }
-            if let Err(error) = child.wait() {
-                let _ = log_app_error_inner(
-                    Some(session_id),
-                    "native_transcription.stop_all.wait",
-                    "native",
-                    "warning",
-                    &error.to_string(),
-                    serde_json::json!({}),
-                );
-            }
+            stop_managed_native_transcriber_background(
+                session_id.to_string(),
+                child,
+                true,
+                "native_transcription.stop_all",
+            );
         }
     }
     set_listening_window_mode(app, false);

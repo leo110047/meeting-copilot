@@ -7,19 +7,23 @@ export function renderTranscriptDrawerView({
   escapeHtml,
   detectUiLanguage
 }) {
-  const { liveTranscript, transcriptDrawerToggle, transcriptDrawerCount, transcriptPreview, transcriptFull } = elements;
+  const { listeningCurtain, liveTranscript, transcriptDrawerToggle, transcriptDrawerCount, transcriptPreview, transcriptFull } = elements;
   const lines = currentTranscriptLines({ transcriptEvents, transcriptLines, currentPartialTranscript, detectUiLanguage });
   const groups = groupTranscriptLines(lines);
   const latest = groups.slice(-3);
   transcriptDrawerToggle.textContent = transcriptDrawerOpen ? "收合" : "展開";
   transcriptDrawerToggle.setAttribute("aria-expanded", String(transcriptDrawerOpen));
+  listeningCurtain?.classList.toggle("transcript-expanded", transcriptDrawerOpen);
+  transcriptPreview.hidden = transcriptDrawerOpen;
   transcriptFull.hidden = !transcriptDrawerOpen;
   const finalCount = transcriptEvents.length > 0 ? transcriptEvents.length : transcriptLines.length;
   transcriptDrawerCount.textContent = currentPartialTranscript?.text ? `${finalCount} 句｜記錄中` : `${finalCount} 句`;
   liveTranscript.classList.toggle("expanded", transcriptDrawerOpen);
-  transcriptPreview.innerHTML = latest.length > 0
-    ? latest.map((group) => renderTranscriptGroup(group, escapeHtml)).join("")
-    : '<p class="empty-line">最近對話會顯示在這裡。</p>';
+  transcriptPreview.innerHTML = !transcriptDrawerOpen
+    ? latest.length > 0
+      ? latest.map((group) => renderTranscriptGroup(group, escapeHtml)).join("")
+      : '<p class="empty-line">最近對話會顯示在這裡。</p>'
+    : "";
   transcriptFull.innerHTML = transcriptDrawerOpen
     ? groups.map((group) => renderTranscriptGroup(group, escapeHtml)).join("")
     : "";

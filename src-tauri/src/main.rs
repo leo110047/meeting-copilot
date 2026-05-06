@@ -1,7 +1,7 @@
 use meeting_copilot_core::{DecisionReadiness, DecisionState, DecisionType};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, ChildStdin};
 use std::sync::{Mutex, OnceLock};
 use tauri::image::Image;
 use tauri::{DragDropEvent, WindowEvent, include_image};
@@ -10,6 +10,7 @@ mod commands_audio;
 mod commands_core;
 mod decision_logic;
 mod desktop_types;
+mod local_stt;
 // macOS-only native Speech and ScreenCaptureKit bridge.
 #[cfg(target_os = "macos")]
 mod macos_speech_bridge;
@@ -23,7 +24,14 @@ mod tests;
 pub(crate) static LIVE_SESSIONS: OnceLock<
     Mutex<HashMap<String, desktop_types::NativeLiveSession>>,
 > = OnceLock::new();
-pub(crate) static NATIVE_TRANSCRIBERS: OnceLock<Mutex<HashMap<String, Child>>> = OnceLock::new();
+pub(crate) struct ManagedNativeTranscriber {
+    pub(crate) child: Child,
+    pub(crate) stdin: Option<ChildStdin>,
+    pub(crate) stop_file: Option<PathBuf>,
+}
+
+pub(crate) static NATIVE_TRANSCRIBERS: OnceLock<Mutex<HashMap<String, ManagedNativeTranscriber>>> =
+    OnceLock::new();
 pub(crate) static PREP_DICTATION: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 pub(crate) static DROP_READ_GRANTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 pub(crate) const SCHEMA_SQL: &str = include_str!("../../src/storage/schema.sql");
@@ -49,6 +57,7 @@ fn main() {
         "Meeting Copilot desktop shell skeleton: platform={} status_surface={} audio_capture={} suggestion_surface={}",
         plan.platform, plan.status_surface, plan.audio_capture, plan.suggestion_surface
     );
+    local_stt::cleanup_stale_whisper_temp_files();
     tauri::Builder::default()
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -77,8 +86,13 @@ fn main() {
             commands_core::request_native_audio_permissions,
             commands_core::read_dropped_context_files,
             commands_core::text_provider_status,
+            commands_core::open_text_provider_install_guide,
             commands_core::start_text_provider_login,
             commands_core::set_session_text_provider,
+            commands_core::local_stt_status_command,
+            commands_core::set_local_stt_profile_command,
+            commands_core::download_local_stt_model_command,
+            commands_core::open_local_stt_model_folder,
             commands_core::request_screen_recording_permission,
             commands_core::generate_ai_summary_oauth,
             commands_core::revise_transcript_oauth,

@@ -11,6 +11,9 @@ use crate::desktop_types::{
     LiveMeetingStatePatch, LiveStatePatchEnvelope, NativeLiveSession, TranscriptCleanupRequest,
     TranscriptEvent, TranscriptRevisionRequest,
 };
+use crate::local_stt::{
+    is_local_whisper_profile, local_stt_profiles, normalize_local_stt_profile_id,
+};
 use crate::native_storage::{
     insert_app_error_log, insert_session, list_app_error_logs, record_session_text_provider,
 };
@@ -69,6 +72,37 @@ fn native_transcription_error_classifier_handles_no_speech_without_locale_only_m
     assert_eq!(
         classify_native_transcription_error("未偵測到語音"),
         "no_speech_detected"
+    );
+    assert_eq!(
+        classify_native_transcription_error("Recognition request was canceled"),
+        "recognition_request_canceled"
+    );
+}
+
+#[test]
+fn local_stt_profiles_require_whisper_as_default() {
+    assert_eq!(normalize_local_stt_profile_id(None), "whisper-standard");
+    assert_eq!(
+        normalize_local_stt_profile_id(Some("unexpected-profile")),
+        "whisper-standard"
+    );
+    assert!(is_local_whisper_profile("whisper-fast"));
+    assert!(is_local_whisper_profile("whisper-standard"));
+}
+
+#[test]
+fn local_stt_profiles_expose_user_facing_quality_modes() {
+    let profiles = local_stt_profiles();
+    assert!(profiles.iter().any(|profile| profile.id == "whisper-fast"));
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.id == "whisper-standard" && profile.recommended)
+    );
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.id == "whisper-accurate")
     );
 }
 

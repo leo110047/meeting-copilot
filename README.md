@@ -11,10 +11,11 @@ Meeting Copilot 是一個 native desktop app，用來在會議中即時輔助決
 - npm
 - Rust toolchain
 - 目前 OS 對應的 Tauri build prerequisites
+- 從原始碼建置本機 Whisper sidecar 時需要 CMake 與 C/C++ toolchain（macOS: Xcode Command Line Tools；Windows: Visual Studio Build Tools）。
 - macOS native transcription 需要授權 `Meeting Copilot` 的 Speech Recognition、Microphone，以及螢幕與系統錄音權限。
-- Windows system audio transcription 需要 Windows audio endpoint 可用，且會使用 WASAPI loopback 與 Windows SpeechRecognition。
-- AI 功能需要透過本機 subscription/OAuth connector 登入 ChatGPT（Codex CLI）或 Claude Code；app 內可切換使用哪個 provider。
-- Claude Code provider 目前以 Claude Code CLI `2.1.128` 驗證；需要支援 `claude auth status`、`claude auth login` 與 `claude -p --output-format json --tools "" --no-session-persistence --no-chrome`。
+- Windows system audio transcription 需要 Windows audio endpoint 可用；本機 Whisper 模式會使用 WASAPI loopback capture。
+- AI 功能需要透過本機官方 CLI 連接器登入訂閱帳號：ChatGPT 走 Codex CLI，Claude 走 Claude Code CLI。未安裝時 app 只會提供官方安裝教學與指令，不會自行安裝全域 CLI。
+- Claude Code connector 目前以 Claude Code CLI `2.1.128` 驗證；需要支援 `claude auth status`、`claude auth login` 與 `claude -p --output-format json --tools "" --no-session-persistence --no-chrome`。
 
 ## 安裝
 
@@ -94,7 +95,7 @@ npm run verify         # 執行完整本機驗證流程
 ## 產品流程
 
 1. **會前準備**：登入並啟用 AI，輸入會議背景，也可以拖拉文字檔。支援的拖曳檔案會讀取文字內容，啟用 AI 後作為會議背景送給 AI。
-2. **會議中**：開始會議、選擇音訊來源、調整視窗透明度，需要時展開逐字稿抽屜。macOS 與 Windows 都提供 `麥克風 + 系統音訊`、`我的麥克風` 與 `系統音訊`；混合來源會同時啟動 mic 與 system 兩路 native helper，並保留 transcript source。Windows 系統音訊走 WASAPI loopback，再交給本機 SpeechRecognition。若音訊或 STT 出錯，錯誤會進 app error log。
+2. **會議中**：開始會議、選擇音訊來源、調整視窗透明度，需要時展開逐字稿抽屜。macOS 與 Windows 都提供 `麥克風 + 系統音訊`、`我的麥克風` 與 `系統音訊`；混合來源會同時啟動 mic 與 system capture，並保留 transcript source。預設本機 STT 走 bundled Whisper runner；若音訊或 STT 出錯，錯誤會進 app error log。
 3. **會後整理**：檢查兩份文件：AI 整理與逐字稿。主要匯出 Markdown/TXT，JSON/PDF 作為次要格式；需要回報 bug 時，可在其他格式中下載錯誤紀錄 JSON。
 
 ## 架構地圖
@@ -116,7 +117,8 @@ docs              設計與實作補充文件
 ## AI 與隱私邊界
 
 - STT provider 和 text decision provider 是分開的。
-- 使用者在 app 內明確啟用 AI 前，不會開始使用 AI 功能。
+- 使用者在 app 內明確啟用本場會議 AI 前，不會開始使用 AI 功能；切換 CLI 連接器或開始下一場會議後需要重新啟用。
+- CLI 認證由 Codex CLI / Claude Code CLI 自行處理，Meeting Copilot 只檢查登入狀態，不讀取或保存 CLI token。
 - Live AI extraction 只能輸出 patch，不能重寫完整 meeting state。
 - Shared artifacts 不包含 private copilot state。
 - `PoliticalSignal` 不得直接綁定姓名或 participant ID。

@@ -15,6 +15,7 @@ export function labelLanguage(language) {
 export function formatAudioMonitorMessage(message, code = "") {
   if (message.includes("stopped from tray")) return "已從系統列結束會議。";
   if (code === "no_speech_detected" || /No speech detected|未偵測到語音|未检测到语音/i.test(message)) return "尚未偵測到可轉成文字的語音；請確認音訊來源正在播放或有人說話。";
+  if (code === "recognition_request_canceled" || /Recognition request (was )?cancell?ed/i.test(message)) return "語音辨識正在自動恢復。";
   if (isScreenRecordingPermissionMessage(message)) return "沒有系統音訊權限。請到 macOS 設定的螢幕與系統錄音開啟 Meeting Copilot，然後重新開始會議。";
   if (/system native speech helper exited/i.test(message)) return "系統音訊轉錄已停止；請確認螢幕與系統錄音已開啟 Meeting Copilot。";
   if (/exited before Stop Listening/i.test(message)) return "語音轉錄已停止，請結束後重新開始會議。";

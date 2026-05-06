@@ -174,12 +174,14 @@ pub(crate) struct PersistedSummary {
 pub(crate) struct NativeTranscriptionRequest {
     pub(crate) language: Option<String>,
     pub(crate) source: Option<String>,
+    pub(crate) stt_profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NativeTranscriberHealthRequest {
     pub(crate) source: Option<String>,
+    pub(crate) stt_profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +215,46 @@ pub(crate) struct NativeTranscriberHealth {
     pub(crate) last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LocalSttProfile {
+    pub(crate) id: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) detail: &'static str,
+    pub(crate) engine: &'static str,
+    pub(crate) model_file: Option<&'static str>,
+    pub(crate) model_size_mb: Option<u32>,
+    pub(crate) model_sha256: Option<&'static str>,
+    pub(crate) model_download_url: Option<&'static str>,
+    pub(crate) recommended: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LocalSttStatus {
+    pub(crate) selected_profile_id: String,
+    pub(crate) profiles: Vec<LocalSttProfile>,
+    pub(crate) provider_id: String,
+    pub(crate) ready: bool,
+    pub(crate) engine_ready: bool,
+    pub(crate) model_ready: bool,
+    pub(crate) model_path: Option<String>,
+    pub(crate) model_directory: String,
+    pub(crate) last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LocalSttModelDownloadProgress {
+    pub(crate) profile_id: String,
+    pub(crate) model_file: String,
+    pub(crate) state: String,
+    pub(crate) downloaded_bytes: u64,
+    pub(crate) total_bytes: Option<u64>,
+    pub(crate) percent: Option<f64>,
+    pub(crate) message: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HelperHealthLine {
@@ -229,12 +271,16 @@ pub(crate) struct HelperHealthLine {
 pub(crate) struct TextProviderStatus {
     pub(crate) provider_id: String,
     pub(crate) kind: String,
+    pub(crate) connector_installed: bool,
+    pub(crate) connector_label: String,
     pub(crate) authenticated: bool,
     pub(crate) can_refresh_token: bool,
     pub(crate) supports_structured_output: bool,
     pub(crate) supports_streaming: bool,
     pub(crate) active: bool,
     pub(crate) status_label: String,
+    pub(crate) install_command: Option<String>,
+    pub(crate) install_url: Option<String>,
     pub(crate) last_error: Option<String>,
 }
 

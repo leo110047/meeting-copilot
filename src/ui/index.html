@@ -29,14 +29,17 @@
           </div>
           <div class="provider-actions">
             <label class="provider-choice" for="textProviderChoice">
-              <span>AI</span>
+              <span>連接器</span>
               <select id="textProviderChoice" data-text-provider-choice>
-                <option value="codex-chatgpt-oauth">ChatGPT</option>
-                <option value="claude-code-oauth">Claude Code</option>
+                <option value="codex-chatgpt-oauth">Codex CLI</option>
+                <option value="claude-code-oauth">Claude Code CLI</option>
               </select>
             </label>
-            <button id="loginTextProvider" type="button">登入 AI</button>
-            <button id="enableOAuthProvider" type="button" disabled>啟用 AI</button>
+            <button id="openTextProviderInstallGuide" type="button" hidden>安裝教學</button>
+            <button id="copyTextProviderInstallCommand" type="button" hidden>複製安裝指令</button>
+            <button id="refreshTextProviderStatus" type="button" hidden>重新檢查</button>
+            <button id="loginTextProvider" type="button">登入連接器</button>
+            <button id="enableOAuthProvider" type="button" disabled>啟用本場</button>
           </div>
         </section>
 
@@ -48,6 +51,30 @@
             <small id="setupAudioReadinessText">macOS 尚未允許 Meeting Copilot 擷取系統音訊。</small>
           </div>
           <button id="setupAudioPermissions" type="button">開啟螢幕與系統錄音</button>
+        </section>
+
+        <section class="stt-settings" aria-label="語音轉文字設定">
+          <div class="status-dot" aria-hidden="true"></div>
+          <div>
+            <p>語音轉文字</p>
+            <strong id="sttProfileName">標準</strong>
+            <small id="sttProfileDetail">正在檢查轉錄模式。</small>
+          </div>
+          <div class="stt-actions">
+            <label class="provider-choice" for="sttProfileChoice">
+              <span>品質</span>
+              <select id="sttProfileChoice" data-stt-profile-choice>
+                <option value="whisper-standard" selected>標準</option>
+                <option value="whisper-fast">快速</option>
+                <option value="whisper-accurate">高準確</option>
+              </select>
+            </label>
+            <button id="downloadSttModel" type="button" disabled hidden>下載模型</button>
+            <button id="openSttModelFolder" type="button" disabled>模型資料夾</button>
+          </div>
+          <div id="sttDownloadProgress" class="stt-download-progress" hidden>
+            <span></span>
+          </div>
         </section>
 
         <div class="prep-layout">
@@ -92,10 +119,10 @@
             <button id="openAudioPermissions" class="permission-action" type="button" hidden>開啟權限設定</button>
           </div>
           <div class="curtain-actions">
-            <label for="liveTextProviderChoice">AI</label>
+            <label for="liveTextProviderChoice">連接器</label>
             <select id="liveTextProviderChoice" data-text-provider-choice>
-              <option value="codex-chatgpt-oauth">ChatGPT</option>
-              <option value="claude-code-oauth">Claude Code</option>
+              <option value="codex-chatgpt-oauth">Codex CLI</option>
+              <option value="claude-code-oauth">Claude Code CLI</option>
             </select>
             <label for="captureSource">音訊</label>
             <select id="captureSource">

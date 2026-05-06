@@ -2,6 +2,69 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+function renderWhisperCSharp(windowsHelper) {
+  const startToken = "-TypeDefinition @'";
+  const start = windowsHelper.indexOf(startToken);
+  assert.notEqual(start, -1);
+  const bodyStart = start + startToken.length;
+  const end = windowsHelper.indexOf("'@", bodyStart);
+  assert.notEqual(end, -1);
+  return windowsHelper
+    .slice(bodyStart, end)
+    .replaceAll("{{", "{")
+    .replaceAll("}}", "}");
+}
+
+function maskStrings(source) {
+  let output = "";
+  let quote;
+  let escaping = false;
+  for (const char of source) {
+    if (quote) {
+      if (escaping) {
+        escaping = false;
+      } else if (char === "\\") {
+        escaping = true;
+      } else if (char === quote) {
+        quote = undefined;
+      }
+      output += char === "\n" ? "\n" : " ";
+    } else if (char === "\"" || char === "'") {
+      quote = char;
+      output += " ";
+    } else {
+      output += char;
+    }
+  }
+  return output;
+}
+
+function assertBalancedBraces(source) {
+  const masked = maskStrings(source);
+  let depth = 0;
+  for (let index = 0; index < masked.length; index += 1) {
+    if (masked[index] === "{") depth += 1;
+    if (masked[index] === "}") depth -= 1;
+    assert.ok(depth >= 0, `brace depth went negative at ${index}`);
+  }
+  assert.equal(depth, 0);
+}
+
+function extractCSharpBlock(source, marker) {
+  const masked = maskStrings(source);
+  const markerIndex = source.indexOf(marker);
+  assert.notEqual(markerIndex, -1);
+  const open = masked.indexOf("{", markerIndex);
+  assert.notEqual(open, -1);
+  let depth = 0;
+  for (let index = open; index < masked.length; index += 1) {
+    if (masked[index] === "{") depth += 1;
+    if (masked[index] === "}") depth -= 1;
+    if (depth === 0) return source.slice(open + 1, index);
+  }
+  assert.fail(`missing closing brace for ${marker}`);
+}
+
 test("Tauri native shell is tray/status-item first", async () => {
   const [
     mainRoot,
@@ -11,6 +74,7 @@ test("Tauri native shell is tray/status-item first", async () => {
     shellStorage,
     oauthProvider,
     nativeStorage,
+    localStt,
     decisionLogic,
     macosSpeechBridge,
     cargoToml,
@@ -30,6 +94,7 @@ test("Tauri native shell is tray/status-item first", async () => {
     readFile(new URL("../src-tauri/src/shell_storage.rs", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/src/oauth_provider.rs", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/src/native_storage.rs", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/local_stt.rs", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/src/decision_logic.rs", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/src/macos_speech_bridge.rs", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8"),
@@ -42,7 +107,7 @@ test("Tauri native shell is tray/status-item first", async () => {
     readFile(new URL("../native/macos/MeetingCopilotSpeech.swift", import.meta.url), "utf8"),
     readFile(new URL("../native/windows/meeting-copilot-windows-speech.rs", import.meta.url), "utf8")
   ]);
-  const desktopShellSource = [mainRoot, desktopTypes, commandsCore, commandsAudio, shellStorage, oauthProvider, nativeStorage, decisionLogic, macosSpeechBridge].join("\n");
+  const desktopShellSource = [mainRoot, desktopTypes, commandsCore, commandsAudio, shellStorage, oauthProvider, nativeStorage, localStt, decisionLogic, macosSpeechBridge].join("\n");
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const tauriConfig = JSON.parse(tauriConfigText);
 
@@ -55,6 +120,28 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(desktopShellSource, /start_native_transcription/);
   assert.match(desktopShellSource, /native_transcriber_health/);
   assert.match(desktopShellSource, /request_native_audio_permissions/);
+  assert.match(desktopShellSource, /local_stt_status_command/);
+  assert.match(desktopShellSource, /set_local_stt_profile_command/);
+  assert.match(desktopShellSource, /download_local_stt_model_command/);
+  assert.match(desktopShellSource, /local_stt_model_download_progress/);
+  assert.match(desktopShellSource, /open_local_stt_model_folder/);
+  assert.match(desktopShellSource, /whisper-standard/);
+  assert.match(desktopShellSource, /resolve\/5359861c739e955e79d9a303bcbc70fb988958b1\/ggml-small\.bin/);
+  assert.match(desktopShellSource, /60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe/);
+  assert.match(desktopShellSource, /1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b/);
+  assert.match(desktopShellSource, /6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208/);
+  assert.match(desktopShellSource, /localWhisperEngineMissing/);
+  assert.doesNotMatch(desktopShellSource, /localWhisperEngineUnavailable/);
+  assert.match(commandsAudio, /\.arg\("--engine"\)\s*\.arg\("whisper"\)/);
+  assert.match(commandsAudio, /\.arg\("--whisper-runner"\)/);
+  assert.match(commandsAudio, /\.arg\("--whisper-model"\)/);
+  assert.match(commandsAudio, /\.arg\("--stop-file"\)/);
+  assert.doesNotMatch(commandsAudio, /write_all\(b"stop\\n"\)/);
+  assert.match(commandsAudio, /Closing stdin is the stop signal/);
+  assert.match(commandsAudio, /source == "mixed" && whisper_runtime\.is_none\(\)/);
+  assert.match(commandsAudio, /helper_source == "mixed" && whisper_runtime\.is_some\(\)/);
+  assert.match(desktopShellSource, /ManagedNativeTranscriber/);
+  assert.match(desktopShellSource, /request_macos_audio_bridge_permissions/);
   assert.match(desktopShellSource, /NativeTranscriberHealthRequest/);
   assert.match(desktopShellSource, /run_native_transcriber_health_check/);
   assert.match(desktopShellSource, /\.arg\("--health"\)/);
@@ -72,6 +159,12 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(desktopShellSource, /request_macos_speech_bridge_permissions/);
   assert.match(desktopShellSource, /x-apple\.systempreferences:com\.apple\.preference\.security\?Privacy_ScreenCapture/);
   assert.match(desktopShellSource, /text_provider_status/);
+  assert.match(desktopShellSource, /open_text_provider_install_guide/);
+  assert.match(desktopShellSource, /connector_installed/);
+  assert.match(desktopShellSource, /npm install -g @openai\/codex/);
+  assert.match(desktopShellSource, /npm install -g @anthropic-ai\/claude-code/);
+  assert.match(desktopShellSource, /help\.openai\.com\/en\/articles\/11096431-openai-codex-cli-getting-started/);
+  assert.match(desktopShellSource, /docs\.anthropic\.com\/en\/docs\/claude-code\/getting-started/);
   assert.match(desktopShellSource, /start_text_provider_login/);
   assert.match(desktopShellSource, /set_session_text_provider/);
   assert.match(desktopShellSource, /CLAUDE_TEXT_PROVIDER_ID/);
@@ -176,13 +269,18 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(macHelper, /screen capture permission is required for system audio/);
   assert.match(macHelper, /if let startupError/);
   assert.match(macHelper, /screenCaptureReady/);
+  assert.match(macHelper, /final class WhisperChunkTranscriber/);
+  assert.match(macHelper, /final class MicWhisperStreamer/);
+  assert.match(macHelper, /final class SystemAudioWhisperStreamer/);
+  assert.match(macHelper, /--whisper-runner/);
   assert.match(macBridge, /meeting_copilot_native_speech_start/);
+  assert.match(macBridge, /source == "mic" \|\| source == "system" \|\| source == "mixed"/);
   assert.match(macBridge, /meeting_copilot_native_speech_stop/);
   assert.match(macBridge, /meeting_copilot_native_speech_health/);
   assert.match(macBridge, /meeting_copilot_native_speech_status/);
   assert.match(macBridge, /meeting_copilot_native_speech_request_permissions/);
   assert.match(macBridge, /NativeSpeechReleaseContext/);
-  assert.match(macBridge, /deinit \{\s*releaseContext\?\(context\)/);
+  assert.match(macBridge, /deinit \{\s*stopSynchronouslyForDeinit\(\)\s*releaseContext\?\(context\)/);
   assert.match(macBridge, /guard result\.isFinal \|\| text != lastText else \{ return \}/);
   assert.match(macBridge, /startRecognitionTask/);
   assert.match(macBridge, /createRecognitionRequest/);
@@ -192,6 +290,16 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(macBridge, /appendSystemAudioSampleBuffer/);
   assert.match(macBridge, /copyAudioPCMBuffer/);
   assert.match(macBridge, /memcpy/);
+  assert.match(macBridge, /meeting_copilot_native_speech_start_whisper/);
+  assert.match(macBridge, /source == "mic" \|\| source == "system" \|\| source == "mixed"/);
+  assert.match(macBridge, /startMixedCapture/);
+  assert.match(macBridge, /WhisperSourceBuffer/);
+  assert.match(macBridge, /appendingPathComponent\("meeting-copilot-whisper-\\\(bridgeId\)-\\\(source\)-\\\(chunkIndex\)\.wav"\)/);
+  assert.match(macBridge, /meeting_copilot_native_audio_request_permissions/);
+  assert.match(macBridge, /final class NativeWhisperBridge/);
+  assert.match(macBridge, /"--serve", "--model"/);
+  assert.match(macBridge, /waitForRunnerExit/);
+  assert.match(macBridge, /pending\.append\(text\)/);
   assert.match(macBridge, /BridgeDiagnosticLine/);
   assert.match(macBridge, /measureAudioLevel/);
   assert.match(macBridge, /MEETING_COPILOT_AUDIO_DIAGNOSTICS/);
@@ -227,7 +335,7 @@ test("Tauri native shell is tray/status-item first", async () => {
     "icons/icon.icns",
     "icons/icon.ico"
   ]);
-  assert.deepEqual(tauriConfig.bundle.externalBin, ["binaries/meeting-copilot-native-speech"]);
+  assert.deepEqual(tauriConfig.bundle.externalBin, ["binaries/meeting-copilot-native-speech", "binaries/meeting-copilot-whisper"]);
   assert.equal(tauriConfig.bundle.macOS.infoPlist, "Info.plist");
   assert.match(tauriConfigText, /infoPlist/);
   assert.match(macInfoPlist, /NSMicrophoneUsageDescription/);
@@ -237,6 +345,8 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(helperBuildScript, /target === "win32"/);
   assert.match(helperBuildScript, /native\/windows\/meeting-copilot-windows-speech\.rs/);
   assert.match(helperBuildScript, /meeting-copilot-native-speech-\$\{hostTriple\}\.exe/);
+  assert.match(helperBuildScript, /meeting-copilot-whisper/);
+  assert.match(helperBuildScript, /--package"[\s\S]*"meeting-copilot-whisper"/);
   assert.match(helperBuildScript, /libmeeting_copilot_speech_bridge\.dylib/);
   assert.match(helperBuildScript, /MeetingCopilotSpeechBridge\.swift/);
   assert.match(helperBuildScript, /removeStaleMacHelperApp/);
@@ -300,5 +410,23 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(windowsHelper, /powershell\.exe/);
   assert.match(windowsHelper, /sanitize_language/);
   assert.match(windowsHelper, /sanitize_source/);
+  assert.match(windowsHelper, /public static class WhisperLoop/);
+  assert.match(windowsHelper, /WasapiPcmCapture/);
+  assert.match(windowsHelper, /--whisper-runner/);
+  assert.match(windowsHelper, /--stop-file/);
+  assert.match(windowsHelper, /source == "mixed"/);
+  assert.match(windowsHelper, /CaptureLane/);
+  assert.match(windowsHelper, /lanes\.All\(lane => lane\.Completed\)/);
+  assert.match(windowsHelper, /meeting-copilot-whisper-" \+ Process\.GetCurrentProcess\(\)\.Id \+ "-" \+ source \+ "-" \+ index/);
+  assert.match(windowsHelper, /WaitForExit\(10000\)/);
   assert.doesNotMatch(windowsHelper, /not enabled in this helper yet/);
-});
+  const csharp = renderWhisperCSharp(windowsHelper);
+  assertBalancedBraces(csharp);
+  const whisperLoopBlock = extractCSharpBlock(csharp, "public static class WhisperLoop");
+  assert.match(whisperLoopBlock, /private static void WriteWav/);
+  assert.match(whisperLoopBlock, /private static string QuoteArgument/);
+  assert.match(whisperLoopBlock, /private static string JsonEscape/);
+  const runnerBlock = extractCSharpBlock(csharp, "public sealed class PersistentWhisperRunner");
+  assert.match(runnerBlock, /public void Close\(\)/);
+  assert.match(runnerBlock, /private static void Forward/);
+ });

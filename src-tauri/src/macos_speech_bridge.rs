@@ -25,6 +25,16 @@ pub(crate) type MacosSpeechStartFn = unsafe extern "C" fn(
     MacosSpeechReleaseContext,
 ) -> c_int;
 #[cfg(target_os = "macos")]
+pub(crate) type MacosWhisperStartFn = unsafe extern "C" fn(
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    MacosSpeechCallback,
+    *mut c_void,
+    MacosSpeechReleaseContext,
+) -> c_int;
+#[cfg(target_os = "macos")]
 pub(crate) type MacosSpeechStopFn = unsafe extern "C" fn(c_int);
 #[cfg(target_os = "macos")]
 pub(crate) type MacosSpeechHealthFn = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
@@ -33,15 +43,20 @@ pub(crate) type MacosSpeechStatusFn = unsafe extern "C" fn(*const c_char, *const
 #[cfg(target_os = "macos")]
 pub(crate) type MacosSpeechRequestPermissionsFn =
     unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
+#[cfg(target_os = "macos")]
+pub(crate) type MacosAudioRequestPermissionsFn =
+    unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 pub(crate) struct MacosSpeechBridgeApi {
     start: MacosSpeechStartFn,
+    start_whisper: MacosWhisperStartFn,
     stop: MacosSpeechStopFn,
     health: MacosSpeechHealthFn,
     status: MacosSpeechStatusFn,
     request_permissions: MacosSpeechRequestPermissionsFn,
+    request_audio_permissions: MacosAudioRequestPermissionsFn,
 }
 
 #[cfg(target_os = "macos")]
@@ -126,12 +141,17 @@ pub(crate) fn load_macos_speech_bridge_api() -> Result<MacosSpeechBridgeApi, Str
         }
         Ok(MacosSpeechBridgeApi {
             start: load_symbol(handle, "meeting_copilot_native_speech_start")?,
+            start_whisper: load_symbol(handle, "meeting_copilot_native_speech_start_whisper")?,
             stop: load_symbol(handle, "meeting_copilot_native_speech_stop")?,
             health: load_symbol(handle, "meeting_copilot_native_speech_health")?,
             status: load_symbol(handle, "meeting_copilot_native_speech_status")?,
             request_permissions: load_symbol(
                 handle,
                 "meeting_copilot_native_speech_request_permissions",
+            )?,
+            request_audio_permissions: load_symbol(
+                handle,
+                "meeting_copilot_native_audio_request_permissions",
             )?,
         })
     }
@@ -283,6 +303,50 @@ pub(crate) fn request_macos_speech_bridge_permissions(
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn request_macos_audio_bridge_permissions(
+    source: &str,
+    language: &str,
+) -> Result<bool, String> {
+    let api = macos_speech_bridge_api()?;
+    let source = std::ffi::CString::new(source).map_err(|error| error.to_string())?;
+    let language = std::ffi::CString::new(language).map_err(|error| error.to_string())?;
+    Ok(unsafe { (api.request_audio_permissions)(source.as_ptr(), language.as_ptr()) == 1 })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_audio_bridge_status_error(
+    source: &str,
+    status: MacosSpeechBridgeStatus,
+) -> String {
+    let mut reasons = Vec::new();
+    if source == "mic" && status.microphone_state() != "authorized" {
+        reasons.push(format!("microphone={}", status.microphone_state()));
+    }
+    if source == "system" && !status.screen_preflight() {
+        reasons.push("screenSystemAudioPreflight=false".to_string());
+    }
+    if source == "system" && !status.macos_13_or_newer() {
+        reasons.push("macOS13OrNewer=false".to_string());
+    }
+    if reasons.is_empty() {
+        reasons.push("nativeAudioHealthReturnedFalseWithoutMissingStatusFlag".to_string());
+    }
+    format!(
+        "macOS native audio is not ready for {source}: {} (statusBits={})",
+        reasons.join(", "),
+        status.raw
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_audio_bridge_ready(source: &str, status: MacosSpeechBridgeStatus) -> bool {
+    let mic_ready = source != "mic" || status.microphone_state() == "authorized";
+    let screen_ready =
+        source != "system" || (status.screen_preflight() && status.macos_13_or_newer());
+    mic_ready && screen_ready
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn start_macos_speech_bridge(
     app: tauri::AppHandle,
     session_id: &str,
@@ -312,6 +376,59 @@ pub(crate) fn start_macos_speech_bridge(
     if handle <= 0 {
         return Err(format!(
             "macOS speech bridge failed to start {source}: {handle}"
+        ));
+    }
+    let key = native_transcriber_key(session_id, source);
+    let mut bridges = MACOS_SPEECH_BRIDGES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(stale) = bridges.remove(&key) {
+        unsafe {
+            (api.stop)(stale.handle);
+        }
+    }
+    bridges.insert(key, MacosSpeechBridgeSession { handle });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn start_macos_whisper_bridge(
+    app: tauri::AppHandle,
+    session_id: &str,
+    source: &str,
+    language: &str,
+    runtime: &crate::local_stt::LocalWhisperRuntime,
+) -> Result<(), String> {
+    let api = macos_speech_bridge_api()?;
+    let source_c = std::ffi::CString::new(source).map_err(|error| error.to_string())?;
+    let language_c = std::ffi::CString::new(language).map_err(|error| error.to_string())?;
+    let runner_c = std::ffi::CString::new(runtime.runner_path.display().to_string())
+        .map_err(|error| error.to_string())?;
+    let model_c = std::ffi::CString::new(runtime.model_path.display().to_string())
+        .map_err(|error| error.to_string())?;
+    let context = Box::new(MacosSpeechCallbackContext {
+        app,
+        session_id: session_id.to_string(),
+        source: source.to_string(),
+        purpose: "live".to_string(),
+        text_provider_id: None,
+    });
+    let context_ptr = Box::into_raw(context);
+    let handle = unsafe {
+        (api.start_whisper)(
+            source_c.as_ptr(),
+            language_c.as_ptr(),
+            runner_c.as_ptr(),
+            model_c.as_ptr(),
+            macos_speech_bridge_callback,
+            context_ptr.cast::<c_void>(),
+            macos_speech_bridge_release_context,
+        )
+    };
+    if handle <= 0 {
+        return Err(format!(
+            "macOS Whisper bridge failed to start {source}: {handle}"
         ));
     }
     let key = native_transcriber_key(session_id, source);

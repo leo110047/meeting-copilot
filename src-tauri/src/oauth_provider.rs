@@ -9,7 +9,7 @@ use crate::native_storage::{
 };
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -64,7 +64,17 @@ pub(crate) fn cached_text_provider_count_for_tests() -> usize {
 }
 
 pub(crate) fn text_provider_status_for(provider_id: Option<&str>) -> TextProviderStatus {
+    text_provider_status_for_with_refresh(provider_id, false)
+}
+
+pub(crate) fn text_provider_status_for_with_refresh(
+    provider_id: Option<&str>,
+    force_refresh: bool,
+) -> TextProviderStatus {
     let normalized = normalize_text_provider_id(provider_id);
+    if force_refresh {
+        clear_text_provider_status_cache(Some(normalized));
+    }
     let cache = TEXT_PROVIDER_STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock()
         && let Some(cached) = guard.get(normalized)
@@ -86,6 +96,47 @@ pub(crate) fn text_provider_status_for(provider_id: Option<&str>) -> TextProvide
         );
     }
     status
+}
+
+pub(crate) fn text_provider_install_guide_url(provider_id: Option<&str>) -> &'static str {
+    match normalize_text_provider_id(provider_id) {
+        CLAUDE_TEXT_PROVIDER_ID => "https://docs.anthropic.com/en/docs/claude-code/getting-started",
+        _ => "https://help.openai.com/en/articles/11096431-openai-codex-cli-getting-started",
+    }
+}
+
+pub(crate) fn text_provider_install_command(provider_id: Option<&str>) -> &'static str {
+    match normalize_text_provider_id(provider_id) {
+        CLAUDE_TEXT_PROVIDER_ID => "npm install -g @anthropic-ai/claude-code",
+        _ => "npm install -g @openai/codex",
+    }
+}
+
+pub(crate) fn text_provider_connector_label(provider_id: Option<&str>) -> &'static str {
+    match normalize_text_provider_id(provider_id) {
+        CLAUDE_TEXT_PROVIDER_ID => "Claude Code CLI",
+        _ => "Codex CLI",
+    }
+}
+
+fn text_provider_install_fields(
+    provider_id: &'static str,
+) -> (String, Option<String>, Option<String>) {
+    (
+        text_provider_connector_label(Some(provider_id)).to_string(),
+        Some(text_provider_install_command(Some(provider_id)).to_string()),
+        Some(text_provider_install_guide_url(Some(provider_id)).to_string()),
+    )
+}
+
+fn command_error_suggests_missing_cli(error: &str) -> bool {
+    let normalized = error.to_lowercase();
+    normalized.contains("spawn_not_found:")
+        || normalized.contains("os error 2")
+        || normalized.contains("no such file")
+        || normalized.contains("not found")
+        || normalized.contains("cannot find")
+        || normalized.contains("找不到")
 }
 
 pub(crate) fn start_text_provider_login_for(provider_id: Option<&str>) -> Result<(), String> {
@@ -116,7 +167,9 @@ pub(crate) fn run_text_provider_prompt_with_timeout(
 }
 
 pub(crate) fn text_provider_status_ttl(status: &TextProviderStatus) -> Duration {
-    if status.authenticated {
+    if !status.connector_installed {
+        Duration::from_secs(300)
+    } else if status.authenticated {
         Duration::from_secs(30)
     } else {
         Duration::from_secs(3)
@@ -137,6 +190,8 @@ pub(crate) fn subscription_oauth_status_uncached() -> TextProviderStatus {
     let mut command = codex_command_from_path(&codex);
     configure_codex_oauth_env(&mut command);
     command.arg("login").arg("status");
+    let (connector_label, install_command, install_url) =
+        text_provider_install_fields(CODEX_TEXT_PROVIDER_ID);
     match run_command_output_with_timeout(&mut command, 5_000) {
         Ok(output) if output.status.success() => {
             let status_text = format!(
@@ -149,6 +204,8 @@ pub(crate) fn subscription_oauth_status_uncached() -> TextProviderStatus {
             TextProviderStatus {
                 provider_id: "codex-chatgpt-oauth".to_string(),
                 kind: "subscription_oauth".to_string(),
+                connector_installed: true,
+                connector_label: connector_label.clone(),
                 authenticated,
                 can_refresh_token: authenticated,
                 supports_structured_output: true,
@@ -171,38 +228,51 @@ pub(crate) fn subscription_oauth_status_uncached() -> TextProviderStatus {
                         Some(status_text.trim().to_string())
                     }
                 },
+                install_command: install_command.clone(),
+                install_url: install_url.clone(),
             }
         }
         Ok(output) => TextProviderStatus {
             provider_id: "codex-chatgpt-oauth".to_string(),
             kind: "subscription_oauth".to_string(),
+            connector_installed: true,
+            connector_label: connector_label.clone(),
             authenticated: false,
             can_refresh_token: false,
             supports_structured_output: true,
             supports_streaming: true,
             active: false,
             status_label: "無法確認 ChatGPT 訂閱 OAuth".to_string(),
+            install_command: install_command.clone(),
+            install_url: install_url.clone(),
             last_error: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
         },
-        Err(error) => TextProviderStatus {
-            provider_id: "codex-chatgpt-oauth".to_string(),
-            kind: "subscription_oauth".to_string(),
-            authenticated: false,
-            can_refresh_token: false,
-            supports_structured_output: true,
-            supports_streaming: true,
-            active: false,
-            status_label: if error.contains("timed out") {
-                "Codex CLI 無回應".to_string()
-            } else {
-                codex_connector_missing_label().to_string()
-            },
-            last_error: Some(format!(
-                "{}：{} ({error})",
-                codex_connector_missing_message(),
-                codex.display()
-            )),
-        },
+        Err(error) => {
+            let connector_installed = !command_error_suggests_missing_cli(&error);
+            TextProviderStatus {
+                provider_id: "codex-chatgpt-oauth".to_string(),
+                kind: "subscription_oauth".to_string(),
+                connector_installed,
+                connector_label,
+                authenticated: false,
+                can_refresh_token: false,
+                supports_structured_output: true,
+                supports_streaming: true,
+                active: false,
+                status_label: if error.contains("timed out") {
+                    "Codex CLI 無回應".to_string()
+                } else {
+                    codex_connector_missing_label().to_string()
+                },
+                install_command,
+                install_url,
+                last_error: Some(format!(
+                    "{}：{} ({error})",
+                    codex_connector_missing_message(),
+                    codex.display()
+                )),
+            }
+        }
     }
 }
 
@@ -358,6 +428,8 @@ pub(crate) fn claude_subscription_status_uncached() -> TextProviderStatus {
     let mut command = claude_command_from_path(&claude);
     configure_claude_subscription_env(&mut command);
     command.arg("auth").arg("status");
+    let (connector_label, install_command, install_url) =
+        text_provider_install_fields(CLAUDE_TEXT_PROVIDER_ID);
     match run_command_output_with_timeout(&mut command, 5_000) {
         Ok(output) => {
             let status_text = format!(
@@ -369,12 +441,16 @@ pub(crate) fn claude_subscription_status_uncached() -> TextProviderStatus {
                 Some((authenticated, label)) => TextProviderStatus {
                     provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
                     kind: TEXT_PROVIDER_KIND.to_string(),
+                    connector_installed: true,
+                    connector_label: connector_label.clone(),
                     authenticated,
                     can_refresh_token: authenticated,
                     supports_structured_output: true,
                     supports_streaming: true,
                     active: authenticated,
                     status_label: label,
+                    install_command: install_command.clone(),
+                    install_url: install_url.clone(),
                     last_error: if authenticated {
                         None
                     } else {
@@ -384,35 +460,46 @@ pub(crate) fn claude_subscription_status_uncached() -> TextProviderStatus {
                 None => TextProviderStatus {
                     provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
                     kind: TEXT_PROVIDER_KIND.to_string(),
+                    connector_installed: true,
+                    connector_label: connector_label.clone(),
                     authenticated: false,
                     can_refresh_token: false,
                     supports_structured_output: true,
                     supports_streaming: true,
                     active: false,
                     status_label: "無法解析 Claude Code 登入狀態".to_string(),
+                    install_command: install_command.clone(),
+                    install_url: install_url.clone(),
                     last_error: Some(truncate_for_diagnostic(status_text.trim(), 800)),
                 },
             }
         }
-        Err(error) => TextProviderStatus {
-            provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
-            kind: TEXT_PROVIDER_KIND.to_string(),
-            authenticated: false,
-            can_refresh_token: false,
-            supports_structured_output: true,
-            supports_streaming: true,
-            active: false,
-            status_label: if error.contains("timed out") {
-                "Claude Code CLI 無回應".to_string()
-            } else {
-                claude_connector_missing_label().to_string()
-            },
-            last_error: Some(format!(
-                "{}：{} ({error})",
-                claude_connector_missing_message(),
-                claude.display()
-            )),
-        },
+        Err(error) => {
+            let connector_installed = !command_error_suggests_missing_cli(&error);
+            TextProviderStatus {
+                provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
+                kind: TEXT_PROVIDER_KIND.to_string(),
+                connector_installed,
+                connector_label,
+                authenticated: false,
+                can_refresh_token: false,
+                supports_structured_output: true,
+                supports_streaming: true,
+                active: false,
+                status_label: if error.contains("timed out") {
+                    "Claude Code CLI 無回應".to_string()
+                } else {
+                    claude_connector_missing_label().to_string()
+                },
+                install_command,
+                install_url,
+                last_error: Some(format!(
+                    "{}：{} ({error})",
+                    claude_connector_missing_message(),
+                    claude.display()
+                )),
+            }
+        }
     }
 }
 
@@ -1644,7 +1731,13 @@ pub(crate) fn run_command_output_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                format!("spawn_not_found: {error}")
+            } else {
+                error.to_string()
+            }
+        })?;
     let mut stdout = child
         .stdout
         .take()

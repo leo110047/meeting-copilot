@@ -36,7 +36,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/meeting-copilot-native-speech"],
+    "externalBin": ["binaries/meeting-copilot-native-speech", "binaries/meeting-copilot-whisper"],
     "macOS": {
       "infoPlist": "Info.plist"
     }

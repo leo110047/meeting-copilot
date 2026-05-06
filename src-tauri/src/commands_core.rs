@@ -5,11 +5,16 @@ use crate::decision_logic::{
 use crate::desktop_types::desktop_shell_plan;
 use crate::desktop_types::{
     AiSummaryRequest, AiSummaryResponse, AppErrorLogInput, AppErrorLogRecord, DesktopShellPlan,
-    DroppedContextFile, IngestTranscriptResponse, NativeLiveSession, NativeTranscriberHealth,
-    NativeTranscriberHealthRequest, PersistedSummary, PrepSummaryRequest, PrepSummaryResponse,
-    StartSessionRequest, StartSessionResponse, TextProviderStatus, TranscriptCleanupRequest,
-    TranscriptCleanupResponse, TranscriptInput, TranscriptRevisionRequest,
-    TranscriptRevisionResponse,
+    DroppedContextFile, IngestTranscriptResponse, LocalSttStatus, NativeLiveSession,
+    NativeTranscriberHealth, NativeTranscriberHealthRequest, PersistedSummary, PrepSummaryRequest,
+    PrepSummaryResponse, StartSessionRequest, StartSessionResponse, TextProviderStatus,
+    TranscriptCleanupRequest, TranscriptCleanupResponse, TranscriptInput,
+    TranscriptRevisionRequest, TranscriptRevisionResponse,
+};
+use crate::local_stt::{
+    download_local_stt_model, is_local_whisper_profile, local_stt_model_directory,
+    local_stt_status, local_whisper_health, normalize_local_stt_profile_id,
+    set_selected_local_stt_profile,
 };
 use crate::native_storage::{
     LlmUsageLogInput, insert_decision_snapshot_with_source, insert_llm_usage_log, insert_session,
@@ -22,8 +27,9 @@ use crate::oauth_provider::{
     build_transcript_revision_prompt, cleanup_transcript_text_with_provider_inner,
     parse_ai_summary_sections, parse_live_coaching_suggestions, parse_live_state_patch,
     parse_prep_summary_points, parse_transcript_revision_response,
-    run_text_provider_prompt_with_timeout, start_text_provider_login_for, text_provider_status_for,
-    text_provider_summary,
+    run_text_provider_prompt_with_timeout, start_text_provider_login_for,
+    text_provider_install_guide_url, text_provider_status_for,
+    text_provider_status_for_with_refresh, text_provider_summary,
 };
 use crate::shell_storage::{
     app_db_path, open_db, read_dropped_context_file, set_native_window_opacity,
@@ -37,8 +43,9 @@ use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 use crate::macos_speech_bridge::{
-    macos_speech_bridge_health, macos_speech_bridge_status, macos_speech_bridge_status_error,
-    request_macos_speech_bridge_permissions,
+    macos_audio_bridge_ready, macos_audio_bridge_status_error, macos_speech_bridge_health,
+    macos_speech_bridge_status, macos_speech_bridge_status_error,
+    request_macos_audio_bridge_permissions, request_macos_speech_bridge_permissions,
 };
 
 #[tauri::command]
@@ -123,18 +130,23 @@ pub(crate) fn ingest_transcript(
 pub(crate) fn native_transcriber_health(
     request: Option<NativeTranscriberHealthRequest>,
 ) -> NativeTranscriberHealth {
-    let source = request
-        .and_then(|body| body.source)
-        .unwrap_or_else(|| "mic".to_string());
-    native_transcriber_health_for_source(&source).unwrap_or_else(|error| NativeTranscriberHealth {
-        provider_id: native_speech_provider_id().to_string(),
-        kind: "stt".to_string(),
-        ready: false,
-        supports_streaming: true,
-        supports_diarization: false,
-        supports_source_hints: true,
-        platform: desktop_shell_plan(),
-        last_error: Some(error),
+    let request = request.unwrap_or(NativeTranscriberHealthRequest {
+        source: None,
+        stt_profile_id: None,
+    });
+    let source = request.source.unwrap_or_else(|| "mic".to_string());
+    let profile_id = normalize_local_stt_profile_id(request.stt_profile_id.as_deref());
+    native_transcriber_health_for_source(&source, profile_id).unwrap_or_else(|error| {
+        NativeTranscriberHealth {
+            provider_id: native_speech_provider_id().to_string(),
+            kind: "stt".to_string(),
+            ready: false,
+            supports_streaming: true,
+            supports_diarization: false,
+            supports_source_hints: true,
+            platform: desktop_shell_plan(),
+            last_error: Some(error),
+        }
     })
 }
 
@@ -142,10 +154,13 @@ pub(crate) fn native_transcriber_health(
 pub(crate) fn request_native_audio_permissions(
     request: Option<NativeTranscriberHealthRequest>,
 ) -> NativeTranscriberHealth {
-    let source = request
-        .and_then(|body| body.source)
-        .unwrap_or_else(|| "mic".to_string());
-    request_native_audio_permissions_for_source(&source).unwrap_or_else(|error| {
+    let request = request.unwrap_or(NativeTranscriberHealthRequest {
+        source: None,
+        stt_profile_id: None,
+    });
+    let source = request.source.unwrap_or_else(|| "mic".to_string());
+    let profile_id = normalize_local_stt_profile_id(request.stt_profile_id.as_deref());
+    request_native_audio_permissions_for_source(&source, profile_id).unwrap_or_else(|error| {
         NativeTranscriberHealth {
             provider_id: native_speech_provider_id().to_string(),
             kind: "stt".to_string(),
@@ -161,7 +176,37 @@ pub(crate) fn request_native_audio_permissions(
 
 pub(crate) fn native_transcriber_health_for_source(
     source: &str,
+    stt_profile_id: &str,
 ) -> Result<NativeTranscriberHealth, String> {
+    if is_local_whisper_profile(stt_profile_id) {
+        let mut health = local_whisper_health(stt_profile_id)?;
+        if !health.ready {
+            return Ok(health);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let sources = if source == "mixed" {
+                vec!["mic", "system"]
+            } else {
+                vec![source]
+            };
+            let mut errors = Vec::new();
+            for helper_source in sources {
+                // The shared macOS bridge status includes Speech authorization for
+                // Apple Speech. Local Whisper only uses the audio permission subset,
+                // so gate readiness through macos_audio_bridge_ready/status_error.
+                let status = macos_speech_bridge_status(helper_source, "zh-TW")?;
+                if !macos_audio_bridge_ready(helper_source, status) {
+                    errors.push(macos_audio_bridge_status_error(helper_source, status));
+                }
+            }
+            if !errors.is_empty() {
+                health.ready = false;
+                health.last_error = Some(errors.join("; "));
+            }
+        }
+        return Ok(health);
+    }
     let sources = if source == "mixed" {
         vec!["mic", "system"]
     } else {
@@ -220,7 +265,30 @@ pub(crate) fn native_transcriber_health_for_source(
 
 pub(crate) fn request_native_audio_permissions_for_source(
     source: &str,
+    stt_profile_id: &str,
 ) -> Result<NativeTranscriberHealth, String> {
+    if is_local_whisper_profile(stt_profile_id) {
+        let health = local_whisper_health(stt_profile_id)?;
+        if !health.ready {
+            return Ok(health);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let sources = if source == "mixed" {
+                vec!["mic", "system"]
+            } else {
+                vec![source]
+            };
+            for helper_source in sources {
+                if helper_source == "mic" || helper_source == "system" {
+                    let _ = request_macos_audio_bridge_permissions(helper_source, "zh-TW")?;
+                }
+            }
+            return native_transcriber_health_for_source(source, stt_profile_id);
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Ok(health);
+    }
     #[cfg(target_os = "macos")]
     {
         let sources = if source == "mixed" {
@@ -234,7 +302,48 @@ pub(crate) fn request_native_audio_permissions_for_source(
             }
         }
     }
-    native_transcriber_health_for_source(source)
+    native_transcriber_health_for_source(source, stt_profile_id)
+}
+
+#[tauri::command]
+pub(crate) fn local_stt_status_command(
+    profile_id: Option<String>,
+) -> Result<LocalSttStatus, String> {
+    local_stt_status(profile_id.as_deref())
+}
+
+#[tauri::command]
+pub(crate) fn set_local_stt_profile_command(
+    profile_id: Option<String>,
+) -> Result<LocalSttStatus, String> {
+    set_selected_local_stt_profile(profile_id.as_deref())
+}
+
+#[tauri::command]
+pub(crate) async fn download_local_stt_model_command(
+    app: tauri::AppHandle,
+    profile_id: Option<String>,
+) -> Result<LocalSttStatus, String> {
+    download_local_stt_model(app, profile_id.as_deref()).await
+}
+
+#[tauri::command]
+pub(crate) fn open_local_stt_model_folder() -> Result<(), String> {
+    let path = local_stt_model_directory()?;
+    fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("open").arg(&path).status();
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new("explorer").arg(&path).status();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let status = std::process::Command::new("xdg-open").arg(&path).status();
+    let status =
+        status.map_err(|error| format!("failed to open local STT model folder: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("failed to open local STT model folder: {status}"))
+    }
 }
 
 #[tauri::command]
@@ -261,8 +370,36 @@ pub(crate) fn request_screen_recording_permission() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn text_provider_status(provider_id: Option<String>) -> TextProviderStatus {
-    text_provider_status_for(provider_id.as_deref())
+pub(crate) fn text_provider_status(
+    provider_id: Option<String>,
+    force_refresh: Option<bool>,
+) -> TextProviderStatus {
+    text_provider_status_for_with_refresh(provider_id.as_deref(), force_refresh.unwrap_or(false))
+}
+
+#[tauri::command]
+pub(crate) fn open_text_provider_install_guide(provider_id: Option<String>) -> Result<(), String> {
+    let url = text_provider_install_guide_url(provider_id.as_deref());
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("open").arg(url).status();
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg(url)
+        .status();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let status = std::process::Command::new("xdg-open").arg(url).status();
+    let status =
+        status.map_err(|error| format!("failed to open AI connector install guide: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to open AI connector install guide: {status}"
+        ))
+    }
 }
 
 #[tauri::command]

@@ -1,5 +1,6 @@
 import { downloadMeetingArtifact as downloadMeetingArtifactFile, escapeHtml } from "./documentExports.mjs";
 import { labelMove, summarizeDecisionState, summarizeSuggestions, summarizeTranscript } from "./meetingSummaries.mjs";
+import { PARTIAL_TRANSCRIPT_COMMIT_IDLE_MS, shouldCommitIdlePartial, shouldCommitReplacedPartial } from "./partialTranscriptPolicy.mjs";
 import { createSetupController } from "./setupController.mjs";
 import { upsertTranscriptEventInPlace } from "./transcriptState.mjs";
 import { renderTranscriptDrawerView, transcriptSpeakerLabel } from "./transcriptDrawer.mjs";
@@ -12,6 +13,7 @@ const openAudioPermissionsButton = document.querySelector("#openAudioPermissions
 const setupAudioReadiness = document.querySelector("#setupAudioReadiness");
 const setupAudioReadinessText = document.querySelector("#setupAudioReadinessText");
 const setupAudioPermissionsButton = document.querySelector("#setupAudioPermissions");
+const listeningCurtain = document.querySelector(".listening-curtain");
 const liveTranscript = document.querySelector("#liveTranscript");
 const transcriptDrawerToggle = document.querySelector("#transcriptDrawerToggle");
 const transcriptDrawerCount = document.querySelector("#transcriptDrawerCount");
@@ -42,22 +44,40 @@ const textProviderName = document.querySelector("#textProviderName");
 const textProviderDetail = document.querySelector("#textProviderDetail");
 const loginTextProviderButton = document.querySelector("#loginTextProvider");
 const enableOAuthProviderButton = document.querySelector("#enableOAuthProvider");
+const openTextProviderInstallGuideButton = document.querySelector("#openTextProviderInstallGuide");
+const copyTextProviderInstallCommandButton = document.querySelector("#copyTextProviderInstallCommand");
+const refreshTextProviderStatusButton = document.querySelector("#refreshTextProviderStatus");
 const providerSettings = document.querySelector(".provider-settings");
 const textProviderChoices = document.querySelectorAll("[data-text-provider-choice]");
-const AI_ENABLED_STORAGE_KEY = "meetingCopilot.aiEnabled";
+const sttSettings = document.querySelector(".stt-settings");
+const sttProfileName = document.querySelector("#sttProfileName");
+const sttProfileDetail = document.querySelector("#sttProfileDetail");
+const sttProfileChoice = document.querySelector("#sttProfileChoice");
+const downloadSttModelButton = document.querySelector("#downloadSttModel");
+const openSttModelFolderButton = document.querySelector("#openSttModelFolder");
+const sttDownloadProgress = document.querySelector("#sttDownloadProgress");
+const sttDownloadProgressFill = document.querySelector("#sttDownloadProgress span");
 const TEXT_PROVIDER_STORAGE_KEY = "meetingCopilot.textProvider";
+const LEGACY_AI_STORAGE_KEY = "meetingCopilot.aiEnabled";
+const LOCAL_STT_PROFILE_STORAGE_KEY = "meetingCopilot.localSttProfile";
 const TEXT_PROVIDERS = {
   "codex-chatgpt-oauth": {
-    label: "ChatGPT",
-    loginLabel: "登入 ChatGPT",
-    unavailableStatus: "瀏覽器預覽無法登入 ChatGPT",
-    missingLogin: "請先登入 ChatGPT"
+    label: "Codex CLI",
+    serviceLabel: "ChatGPT",
+    installCommand: "npm install -g @openai/codex",
+    installUrl: "https://help.openai.com/en/articles/11096431-openai-codex-cli-getting-started",
+    loginLabel: "登入 Codex CLI",
+    unavailableStatus: "瀏覽器預覽無法使用 Codex CLI",
+    missingLogin: "請先登入 Codex CLI"
   },
   "claude-code-oauth": {
-    label: "Claude Code",
-    loginLabel: "登入 Claude Code",
-    unavailableStatus: "瀏覽器預覽無法登入 Claude Code",
-    missingLogin: "請先登入 Claude Code"
+    label: "Claude Code CLI",
+    serviceLabel: "Claude",
+    installCommand: "npm install -g @anthropic-ai/claude-code",
+    installUrl: "https://docs.anthropic.com/en/docs/claude-code/getting-started",
+    loginLabel: "登入 Claude Code CLI",
+    unavailableStatus: "瀏覽器預覽無法使用 Claude Code CLI",
+    missingLogin: "請先登入 Claude Code CLI"
   }
 };
 let recognition;
@@ -70,7 +90,7 @@ let suggestionHistory = [];
 let latestDecisionState;
 let aiSummaryOverride;
 let textProviderStatus;
-let oauthAiEnabled = readAiEnabledPreference();
+let oauthAiEnabled = false;
 let activeSessionId;
 let transcriptIndex = 0;
 let startedAt = 0;
@@ -87,10 +107,17 @@ let platformShellPlan;
 let browserErrorLogs = [];
 let textProviderRefreshTimers = [];
 let transcriptStallTimer;
+let partialTranscriptCommitTimer;
+let partialTranscriptLastUpdatedAt = 0;
+let partialTranscriptFirstSeenAt = 0;
 let reviewFinalized = false;
 let postMeetingAiSummaryStarted = false;
 let activeCaptureSource;
 let selectedTextProviderId = readTextProviderPreference();
+let selectedLocalSttProfileId = readLocalSttProfilePreference();
+let localSttStatus;
+let localSttDownloadState;
+let sttFolderMessageTimer;
 const TRANSCRIPT_STALL_MS = 12000;
 const TRANSCRIPT_REVISION_DEBOUNCE_MS = 3500;
 const TRANSCRIPT_REVISION_CONTEXT_WINDOW_SIZE = 30;
@@ -128,16 +155,41 @@ syncTextProviderChoiceControls();
 initializeSetupState();
 setupController.install();
 installOpacityControl();
+installLocalSttDownloadListener();
 refreshPlatformShellPlan();
 refreshTextProviderStatus();
+refreshLocalSttStatus("startup");
 refreshNativeAudioReadiness("startup");
 for (const choice of textProviderChoices) {
   choice.addEventListener("change", () => {
-    setSelectedTextProvider(choice.value, { keepEnabledIfAuthenticated: oauthAiEnabled });
+    setSelectedTextProvider(choice.value);
   });
 }
 captureSource?.addEventListener("change", () => {
   refreshNativeAudioReadiness("source_change");
+});
+sttProfileChoice?.addEventListener("change", () => {
+  setSelectedLocalSttProfile(sttProfileChoice.value);
+});
+downloadSttModelButton?.addEventListener("click", () => {
+  downloadSelectedLocalSttModel();
+});
+openSttModelFolderButton?.addEventListener("click", async () => {
+  if (!nativeInvoke) return;
+  openSttModelFolderButton.disabled = true;
+  try {
+    await nativeInvoke("open_local_stt_model_folder");
+    sttProfileDetail.textContent = "已開啟 Whisper 模型資料夾。";
+    clearTimeout(sttFolderMessageTimer);
+    sttFolderMessageTimer = setTimeout(() => {
+      renderLocalSttStatus();
+    }, 2500);
+  } catch (error) {
+    logAppError("stt.open_model_folder", error, {}, "warning");
+    sttProfileDetail.textContent = `無法開啟模型資料夾：${formatError(error)}`;
+  } finally {
+    openSttModelFolderButton.disabled = false;
+  }
 });
 startButton.addEventListener("click", async () => {
   if (!canStartWithAi()) {
@@ -145,7 +197,14 @@ startButton.addEventListener("click", async () => {
     syncStartButtonAvailability();
     textProviderDetail.textContent = textProviderStatus?.authenticated
       ? "請先啟用 AI，Meeting Copilot 才能開始會議。"
-      : `${providerMissingLoginCopy()}，Meeting Copilot 才能開始會議。`;
+      : `${providerStartBlockedCopy()}，Meeting Copilot 才能開始會議。`;
+    return;
+  }
+  if (!canStartWithSelectedStt()) {
+    const message = formatNativeAudioReadinessMessage(localSttStatus?.lastError ?? "localWhisperEngineMissing");
+    logAppError("meeting.start_blocked_without_stt", message, { sttProfileId: selectedLocalSttProfileId }, "warning");
+    syncStartButtonAvailability();
+    providerState.textContent = `語音轉文字尚未就緒：${message}`;
     return;
   }
   startButton.disabled = true;
@@ -277,6 +336,10 @@ setupAudioPermissionsButton?.addEventListener("click", async () => {
   }
 });
 loginTextProviderButton.addEventListener("click", async () => {
+  if (textProviderStatus?.connectorInstalled === false) {
+    textProviderDetail.textContent = `請先安裝 ${selectedTextProviderLabel()}，再回來登入。`;
+    return;
+  }
   if (!nativeInvoke) {
     logAppError("ai.login_unavailable", "Text provider login requires the desktop app", {}, "warning");
     textProviderDetail.textContent = "登入需要使用桌面 app。";
@@ -294,6 +357,43 @@ loginTextProviderButton.addEventListener("click", async () => {
     loginTextProviderButton.disabled = false;
   }
 });
+openTextProviderInstallGuideButton?.addEventListener("click", async () => {
+  await openSelectedTextProviderInstallGuide();
+});
+copyTextProviderInstallCommandButton?.addEventListener("click", async () => {
+  await copySelectedTextProviderInstallCommand();
+});
+refreshTextProviderStatusButton?.addEventListener("click", () => {
+  refreshTextProviderStatus({ forceRefresh: true });
+});
+
+async function openSelectedTextProviderInstallGuide() {
+  const providerId = selectedTextProviderId;
+  const url = textProviderStatus?.installUrl ?? providerConfig(providerId).installUrl;
+  if (nativeInvoke) {
+    try {
+      await nativeInvoke("open_text_provider_install_guide", { providerId });
+      textProviderDetail.textContent = `已開啟 ${selectedTextProviderLabel()} 官方安裝教學。`;
+      return;
+    } catch (error) {
+      logAppError("ai.open_install_guide", error, { providerId, url }, "warning");
+    }
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+async function copySelectedTextProviderInstallCommand() {
+  const providerId = selectedTextProviderId;
+  const command = textProviderStatus?.installCommand ?? providerConfig(providerId).installCommand;
+  try {
+    await navigator.clipboard.writeText(command);
+    textProviderDetail.textContent = `已複製安裝指令：${command}`;
+  } catch (error) {
+    logAppError("ai.copy_install_command", error, { providerId }, "warning");
+    textProviderDetail.textContent = `請在 Terminal 執行：${command}`;
+  }
+}
+
 enableOAuthProviderButton.addEventListener("click", () => {
   if (!textProviderStatus?.authenticated) {
     logAppError("ai.enable_without_auth", "AI enable was requested without authenticated subscription OAuth", { providerId: selectedTextProviderId }, "warning");
@@ -320,11 +420,11 @@ async function startNativeListening() {
   activeCaptureSource = requestedSource;
   hideAudioPermissionAction();
   let health = await nativeInvoke("request_native_audio_permissions", {
-    request: { source: requestedSource }
+    request: { source: requestedSource, sttProfileId: selectedLocalSttProfileId }
   });
   if (!health.ready) {
     health = await nativeInvoke("native_transcriber_health", {
-      request: { source: requestedSource }
+      request: { source: requestedSource, sttProfileId: selectedLocalSttProfileId }
     });
   }
   if (!health.ready) {
@@ -332,7 +432,7 @@ async function startNativeListening() {
     throw new Error(`音訊尚未就緒：${health.lastError ?? "未知原因"}`);
   }
   health = await nativeInvoke("native_transcriber_health", {
-    request: { source: requestedSource }
+    request: { source: requestedSource, sttProfileId: selectedLocalSttProfileId }
   });
   if (!health.ready) {
     handleAudioPermissionProblem(health.lastError ?? "");
@@ -344,7 +444,7 @@ async function startNativeListening() {
   sessionState.textContent = "開始記錄";
   const started = await nativeInvoke("start_native_transcription", {
     sessionId: activeSessionId,
-    request: { language: "zh-TW", source: requestedSource }
+    request: { language: "zh-TW", source: requestedSource, sttProfileId: selectedLocalSttProfileId }
   });
   updateAppState("listening");
   sessionState.textContent = "記錄中";
@@ -382,6 +482,7 @@ async function installNativeListeners() {
       const payload = event.payload;
       if (!payload?.event?.text) return;
       clearTranscriptStallMonitor();
+      clearPartialTranscriptCommitTimer();
       currentPartialTranscript = undefined;
       renderRuntimePayload(payload);
       scheduleLiveTranscriptRevision();
@@ -391,8 +492,7 @@ async function installNativeListeners() {
       const payload = event.payload;
       if (!payload?.text) return;
       clearTranscriptStallMonitor();
-      currentPartialTranscript = payload;
-      renderTranscriptDrawer();
+      handleNativeTranscriptPreview(payload);
     });
     await nativeListen("native_transcription_error", (event) => {
       const payload = event.payload;
@@ -418,6 +518,20 @@ async function installNativeListeners() {
     logAppError("native.install_listeners", error, {}, "error");
     nativeListenersInstalled = false;
     throw new Error(`無法接收 native 事件：${formatError(error)}`);
+  }
+}
+
+async function installLocalSttDownloadListener() {
+  if (!nativeListen) return;
+  try {
+    await nativeListen("local_stt_model_download_progress", (event) => {
+      const payload = event.payload;
+      if (!payload || payload.profileId !== selectedLocalSttProfileId) return;
+      localSttDownloadState = payload;
+      renderLocalSttStatus();
+    });
+  } catch (error) {
+    logAppError("stt.install_download_listener", error, {}, "warning");
   }
 }
 
@@ -488,14 +602,22 @@ async function sendTranscript(text) {
 }
 
 async function promoteCurrentPartialTranscript(reason) {
-  const partial = currentPartialTranscript;
+  await promotePartialTranscript(currentPartialTranscript, reason, { clearCurrent: true });
+}
+
+async function promotePartialTranscript(partial, reason, { clearCurrent = false } = {}) {
   const text = partial?.text?.trim();
   if (!text || !activeSessionId) return;
   const duplicate = transcriptEvents.some((event) =>
     event.text.trim() === text
     && (event.source ?? "unknown") === (partial.source ?? "unknown")
   );
-  currentPartialTranscript = undefined;
+  if (clearCurrent && partial === currentPartialTranscript) {
+    clearPartialTranscriptCommitTimer();
+    currentPartialTranscript = undefined;
+    partialTranscriptLastUpdatedAt = 0;
+    partialTranscriptFirstSeenAt = 0;
+  }
   if (duplicate) {
     renderTranscriptDrawer();
     return;
@@ -545,6 +667,43 @@ async function promoteCurrentPartialTranscript(reason) {
     markTranscriptPersistence(promotedEvent.id, "failed");
     logAppError("native.promote_partial_transcript_failed", error, { sessionId: activeSessionId, reason }, "error");
   }
+}
+
+function handleNativeTranscriptPreview(payload) {
+  const now = performance.now();
+  const previous = currentPartialTranscript;
+  const previousAgeMs = partialTranscriptFirstSeenAt > 0 ? now - partialTranscriptFirstSeenAt : 0;
+  const commitPrevious = previous?.text && shouldCommitReplacedPartial(previous, payload, previousAgeMs);
+  if (commitPrevious) {
+    promotePartialTranscript(previous, "partial_replaced");
+  }
+  if (!previous?.text || commitPrevious) {
+    partialTranscriptFirstSeenAt = now;
+  }
+  currentPartialTranscript = payload;
+  partialTranscriptLastUpdatedAt = now;
+  schedulePartialTranscriptCommit();
+  renderTranscriptDrawer();
+}
+
+function schedulePartialTranscriptCommit() {
+  clearPartialTranscriptCommitTimer();
+  partialTranscriptCommitTimer = setTimeout(() => {
+    partialTranscriptCommitTimer = undefined;
+    if (document.body.dataset.state !== "listening") return;
+    const idleMs = performance.now() - partialTranscriptLastUpdatedAt;
+    if (shouldCommitIdlePartial(currentPartialTranscript, idleMs)) {
+      promotePartialTranscript(currentPartialTranscript, "partial_idle", { clearCurrent: true });
+      return;
+    }
+    if (currentPartialTranscript?.text) schedulePartialTranscriptCommit();
+  }, PARTIAL_TRANSCRIPT_COMMIT_IDLE_MS);
+}
+
+function clearPartialTranscriptCommitTimer() {
+  if (!partialTranscriptCommitTimer) return;
+  clearTimeout(partialTranscriptCommitTimer);
+  partialTranscriptCommitTimer = undefined;
 }
 
 function renderRuntimePayload(payload) {
@@ -819,12 +978,15 @@ function resetTranscriptState() {
   revisedTranscriptEvents = [];
   transcriptRevisionMeta = new Map();
   currentPartialTranscript = undefined;
+  partialTranscriptLastUpdatedAt = 0;
+  partialTranscriptFirstSeenAt = 0;
   transcriptIndex = 0;
   lastAiExtractionEventCount = 0;
   liveAiExtractionRunning = false;
   lastTranscriptRevisionEventCount = 0;
   lastTranscriptRevisionAt = 0;
   transcriptRevisionRunning = false;
+  clearPartialTranscriptCommitTimer();
 }
 
 function clearLiveTranscriptRevisionTimer() {
@@ -867,7 +1029,9 @@ function setProviderUnavailable() {
 
 function initializeSetupState() {
   clearTranscriptStallMonitor();
+  clearLegacyAiEnabledPreference();
   updateAppState("setup");
+  setAiEnabledPreference(false);
   resetNativeWindowOpacity();
   reviewScreen.dataset.reviewState = "idle";
   reviewStageLabel.textContent = "會後";
@@ -890,6 +1054,7 @@ function initializeSetupState() {
   sessionState.textContent = "待機中";
   providerState.textContent = "尚未開始會議。";
   resetListeningSurface();
+  renderTextProviderStatus();
   setupController.renderPrepSummary();
 }
 
@@ -914,7 +1079,7 @@ async function refreshNativeAudioReadiness(reason) {
   const source = captureSource?.value ?? "mic";
   try {
     const health = await nativeInvoke("native_transcriber_health", {
-      request: { source }
+      request: { source, sttProfileId: selectedLocalSttProfileId }
     });
     if (health.ready) {
       hideAudioPermissionAction();
@@ -927,6 +1092,11 @@ async function refreshNativeAudioReadiness(reason) {
     logAppError("permissions.native_audio_health", message, { source, reason }, "warning");
     handleAudioPermissionProblem(message);
     const readinessMessage = formatNativeAudioReadinessMessage(message);
+    if (/localWhisper/i.test(message)) {
+      hideAudioPermissionAction();
+      providerState.textContent = `語音轉文字需處理：${readinessMessage}`;
+      return;
+    }
     if (setupAudioReadinessText) setupAudioReadinessText.textContent = readinessMessage;
     providerState.textContent = `音訊權限需處理：${readinessMessage}`;
   } catch (error) {
@@ -935,6 +1105,15 @@ async function refreshNativeAudioReadiness(reason) {
 }
 
 function formatNativeAudioReadinessMessage(message) {
+  if (/localWhisperEngineMissing/i.test(message)) {
+    return "Whisper 引擎尚未打包或設定，無法開始會議。";
+  }
+  if (/localWhisperModelMissing/i.test(message)) {
+    return "Whisper 模型尚未放到本機模型資料夾，無法開始會議。";
+  }
+  if (/localWhisperHealthFailed/i.test(message)) {
+    return "Whisper 模型或引擎健康檢查失敗，請重新下載模型或改選其他模型。";
+  }
   if (/screenSystemAudioPreflight=false/i.test(message)) {
     return "macOS 尚未把螢幕與系統錄音權限套用到目前這個 Meeting Copilot。";
   }
@@ -945,6 +1124,218 @@ function formatNativeAudioReadinessMessage(message) {
     return "語音辨識權限尚未可用。";
   }
   return formatAudioMonitorMessage(message);
+}
+
+async function refreshLocalSttStatus(reason) {
+  syncLocalSttChoiceControl();
+  if (!nativeInvoke) {
+    localSttStatus = {
+      selectedProfileId: selectedLocalSttProfileId,
+      ready: false,
+      providerId: "browser-speech-recognition",
+      profiles: fallbackLocalSttProfiles(),
+      lastError: "localWhisperEngineMissing: 桌面 app 才能使用本機 Whisper。"
+    };
+    renderLocalSttStatus();
+    return;
+  }
+  try {
+    localSttStatus = await nativeInvoke("local_stt_status_command", { profileId: selectedLocalSttProfileId });
+    selectedLocalSttProfileId = normalizeLocalSttProfileId(localSttStatus.selectedProfileId);
+    writeLocalSttProfilePreference(selectedLocalSttProfileId);
+    syncLocalSttChoiceControl();
+  } catch (error) {
+    logAppError("stt.local_status", error, { profileId: selectedLocalSttProfileId, reason }, "warning");
+    localSttStatus = {
+      selectedProfileId: selectedLocalSttProfileId,
+      ready: false,
+      providerId: "unknown",
+      profiles: fallbackLocalSttProfiles(),
+      lastError: formatError(error)
+    };
+  } finally {
+    renderLocalSttStatus();
+  }
+}
+
+async function setSelectedLocalSttProfile(profileId) {
+  const nextProfileId = normalizeLocalSttProfileId(profileId);
+  if (isLocalSttDownloadActive()) {
+    sttProfileDetail.textContent = "模型下載中，完成後再切換品質。";
+    syncLocalSttChoiceControl();
+    return;
+  }
+  selectedLocalSttProfileId = nextProfileId;
+  localSttDownloadState = undefined;
+  writeLocalSttProfilePreference(nextProfileId);
+  syncLocalSttChoiceControl();
+  if (!nativeInvoke) {
+    await refreshLocalSttStatus("profile_change");
+    return;
+  }
+  try {
+    localSttStatus = await nativeInvoke("set_local_stt_profile_command", { profileId: nextProfileId });
+  } catch (error) {
+    logAppError("stt.set_profile", error, { profileId: nextProfileId }, "warning");
+  }
+  await refreshLocalSttStatus("profile_change");
+  refreshNativeAudioReadiness("stt_profile_change");
+}
+
+async function downloadSelectedLocalSttModel() {
+  if (!nativeInvoke || isLocalSttDownloadActive()) return;
+  const profileId = selectedLocalSttProfileId;
+  localSttDownloadState = {
+    profileId,
+    state: "starting",
+    downloadedBytes: 0,
+    totalBytes: undefined,
+    percent: 0,
+    message: "準備下載 Whisper 模型。"
+  };
+  renderLocalSttStatus();
+  try {
+    localSttStatus = await nativeInvoke("download_local_stt_model_command", { profileId });
+    selectedLocalSttProfileId = normalizeLocalSttProfileId(localSttStatus.selectedProfileId);
+    writeLocalSttProfilePreference(selectedLocalSttProfileId);
+    localSttDownloadState = {
+      profileId: selectedLocalSttProfileId,
+      state: "completed",
+      downloadedBytes: 0,
+      totalBytes: undefined,
+      percent: 100,
+      message: "模型下載完成。"
+    };
+  } catch (error) {
+    logAppError("stt.download_model", error, { profileId }, "error");
+    localSttDownloadState = {
+      profileId,
+      state: "failed",
+      downloadedBytes: 0,
+      totalBytes: undefined,
+      percent: undefined,
+      message: formatError(error)
+    };
+  }
+  await refreshLocalSttStatus("model_download");
+  refreshNativeAudioReadiness("model_download");
+}
+
+function renderLocalSttStatus() {
+  if (!sttSettings || !sttProfileName || !sttProfileDetail) return;
+  const profile = currentLocalSttProfile();
+  const ready = Boolean(localSttStatus?.ready);
+  const modelMissing = localSttStatus?.modelReady === false;
+  const engineReady = localSttStatus?.engineReady !== false;
+  const healthFailed = /localWhisperHealthFailed/i.test(localSttStatus?.lastError ?? "");
+  const downloadActive = isLocalSttDownloadActive();
+  const downloadAvailable = modelMissing || healthFailed;
+  sttSettings.classList.toggle("ready", ready);
+  sttSettings.classList.toggle("warning", !ready);
+  sttProfileName.textContent = profile?.recommended ? `${profile.label}（建議）` : profile?.label ?? "標準";
+  if (downloadActive || localSttDownloadState?.state === "failed") {
+    sttProfileDetail.textContent = formatLocalSttDownloadMessage(localSttDownloadState, profile);
+  } else if (!ready) {
+    sttProfileDetail.textContent = formatNativeAudioReadinessMessage(localSttStatus?.lastError ?? "localWhisperEngineMissing");
+  } else {
+    const modelText = profile?.modelSizeMb ? `模型約 ${profile.modelSizeMb} MB。` : "";
+    sttProfileDetail.textContent = `${profile?.detail ?? "使用本機 Whisper。"}${modelText ? ` ${modelText}` : ""}`;
+  }
+  renderLocalSttDownloadProgress(localSttDownloadState, downloadActive);
+  if (downloadSttModelButton) {
+    downloadSttModelButton.hidden = !downloadAvailable && !downloadActive && localSttDownloadState?.state !== "failed";
+    downloadSttModelButton.disabled = !nativeInvoke || !engineReady || downloadActive;
+    downloadSttModelButton.textContent = downloadActive
+      ? "下載中"
+      : localSttDownloadState?.state === "failed"
+        ? "重新下載"
+        : "下載模型";
+  }
+  if (openSttModelFolderButton) {
+    openSttModelFolderButton.disabled = !nativeInvoke || downloadActive;
+    openSttModelFolderButton.hidden = false;
+  }
+  if (sttProfileChoice) sttProfileChoice.disabled = downloadActive;
+  syncStartButtonAvailability();
+}
+
+function isLocalSttDownloadActive() {
+  return ["starting", "checking", "replacing", "downloading", "verifying", "installing"].includes(localSttDownloadState?.state);
+}
+
+function formatLocalSttDownloadMessage(progress, profile) {
+  if (!progress) return "準備下載 Whisper 模型。";
+  const size = progress.totalBytes
+    ? `${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}`
+    : formatBytes(progress.downloadedBytes ?? 0);
+  if (progress.state === "failed") {
+    return `模型下載失敗：${progress.message ?? "請稍後重試。"}`;
+  }
+  if (progress.state === "checking") return "正在檢查本機模型。";
+  if (progress.state === "replacing") return "既有模型驗證失敗，正在重新下載。";
+  if (progress.state === "verifying") return "模型下載完成，正在驗證。";
+  if (progress.state === "installing") return "模型驗證通過，正在安裝。";
+  if (progress.state === "completed") return "模型下載完成。";
+  const percent = typeof progress.percent === "number" ? `${Math.round(progress.percent)}%` : "下載中";
+  const modelName = profile?.modelFile ?? progress.modelFile ?? "Whisper 模型";
+  return `正在下載 ${modelName}：${percent}（${size}）。`;
+}
+
+function renderLocalSttDownloadProgress(progress, active) {
+  if (!sttDownloadProgress || !sttDownloadProgressFill) return;
+  const visible = active || progress?.state === "failed";
+  sttDownloadProgress.hidden = !visible;
+  const percent = typeof progress?.percent === "number" ? clamp(progress.percent, 0, 100) : 0;
+  sttDownloadProgress.style.setProperty("--progress", `${percent}%`);
+  sttDownloadProgressFill.textContent = progress?.state === "failed" ? "下載失敗" : `${Math.round(percent)}%`;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes ?? 0);
+  if (value >= 1024 * 1024 * 1024) return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  if (value >= 1024 * 1024) return `${Math.round(value / 1024 / 1024)} MB`;
+  if (value >= 1024) return `${Math.round(value / 1024)} KB`;
+  return `${value} B`;
+}
+
+function currentLocalSttProfile() {
+  const profiles = localSttStatus?.profiles?.length ? localSttStatus.profiles : fallbackLocalSttProfiles();
+  return profiles.find((profile) => profile.id === selectedLocalSttProfileId) ?? profiles[0];
+}
+
+function fallbackLocalSttProfiles() {
+  return [
+    { id: "whisper-standard", label: "標準", detail: "本機 Whisper small。", engine: "whisper", modelFile: "ggml-small.bin", modelSizeMb: 500, recommended: true },
+    { id: "whisper-fast", label: "快速", detail: "本機 Whisper base。", engine: "whisper", modelFile: "ggml-base.bin", modelSizeMb: 150 },
+    { id: "whisper-accurate", label: "高準確", detail: "本機 Whisper medium。", engine: "whisper", modelFile: "ggml-medium.bin", modelSizeMb: 1500 }
+  ];
+}
+
+function normalizeLocalSttProfileId(profileId) {
+  return ["whisper-fast", "whisper-standard", "whisper-accurate"].includes(profileId)
+    ? profileId
+    : "whisper-standard";
+}
+
+function readLocalSttProfilePreference() {
+  try {
+    return normalizeLocalSttProfileId(window.localStorage?.getItem(LOCAL_STT_PROFILE_STORAGE_KEY));
+  } catch {
+    return "whisper-standard";
+  }
+}
+
+function writeLocalSttProfilePreference(profileId) {
+  try {
+    window.localStorage?.setItem(LOCAL_STT_PROFILE_STORAGE_KEY, normalizeLocalSttProfileId(profileId));
+  } catch {
+    // Local storage only restores the selected transcription quality.
+  }
+}
+
+function syncLocalSttChoiceControl() {
+  if (!sttProfileChoice) return;
+  sttProfileChoice.value = selectedLocalSttProfileId;
 }
 
 function showAudioPermissionAction() {
@@ -1134,6 +1525,7 @@ function hasReviewContent(artifact) {
 
 function classifyNativeTranscriptionError(message) {
   if (/No speech detected|未偵測到語音|未检测到语音/i.test(message)) return "no_speech_detected";
+  if (/Recognition request (was )?cancell?ed/i.test(message)) return "recognition_request_canceled";
   if (/stopped from tray/i.test(message)) return "stopped_from_tray";
   if (isScreenRecordingPermissionMessage(message)) return "screen_recording_permission";
   return "native_transcription_error";
@@ -1205,22 +1597,27 @@ function buildMeetingArtifact() {
   };
 }
 
-async function refreshTextProviderStatus() {
+async function refreshTextProviderStatus({ forceRefresh = false } = {}) {
   const requestedProviderId = selectedTextProviderId;
   if (!nativeInvoke) {
     textProviderStatus = {
       providerId: "browser-local-rule",
       kind: "local",
+      connectorInstalled: false,
+      connectorLabel: selectedTextProviderLabel(),
       authenticated: false,
       active: false,
-      statusLabel: providerConfig().unavailableStatus
+      statusLabel: providerConfig().unavailableStatus,
+      installCommand: providerConfig().installCommand,
+      installUrl: providerConfig().installUrl
     };
     renderTextProviderStatus();
     return;
   }
   textProviderDetail.textContent = `正在檢查 ${selectedTextProviderLabel()} 登入狀態。`;
+  if (refreshTextProviderStatusButton) refreshTextProviderStatusButton.disabled = true;
   try {
-    const status = await nativeInvoke("text_provider_status", { providerId: requestedProviderId });
+    const status = await nativeInvoke("text_provider_status", { providerId: requestedProviderId, forceRefresh });
     if (requestedProviderId !== selectedTextProviderId) return;
     textProviderStatus = status;
   } catch (error) {
@@ -1229,12 +1626,17 @@ async function refreshTextProviderStatus() {
     textProviderStatus = {
       providerId: selectedTextProviderId,
       kind: "subscription_oauth",
+      connectorInstalled: false,
+      connectorLabel: selectedTextProviderLabel(),
       authenticated: false,
       active: false,
       statusLabel: `無法檢查 ${selectedTextProviderLabel()} 登入`,
+      installCommand: providerConfig().installCommand,
+      installUrl: providerConfig().installUrl,
       lastError: formatError(error)
     };
   } finally {
+    if (refreshTextProviderStatusButton) refreshTextProviderStatusButton.disabled = false;
     if (requestedProviderId === selectedTextProviderId) renderTextProviderStatus();
   }
 }
@@ -1264,21 +1666,40 @@ function applyPlatformCaptureAvailability() {
 
 function renderTextProviderStatus() {
   const authenticated = Boolean(textProviderStatus?.authenticated);
+  const connectorInstalled = textProviderStatus?.connectorInstalled !== false;
   providerSettings.classList.toggle("enabled", authenticated && oauthAiEnabled);
+  providerSettings.classList.toggle("warning", !connectorInstalled);
   textProviderName.textContent = oauthAiEnabled && authenticated
     ? `${selectedTextProviderLabel()} 已啟用`
-    : "AI 尚未啟用";
-  textProviderDetail.textContent = oauthAiEnabled && authenticated
-    ? `會議背景整理、即時提醒與會後整理會送到 ${selectedTextProviderLabel()}；語音辨識會分開處理。`
-    : authenticated
-      ? `已偵測到 ${selectedTextProviderLabel()} 登入；按啟用後才會把會議內容送去 AI 整理。`
-      : `${textProviderStatus?.statusLabel ?? `尚未登入 ${selectedTextProviderLabel()}`}；目前不會傳送會議內容。`;
+    : connectorInstalled && authenticated
+      ? `${selectedTextProviderLabel()} 已登入`
+      : "AI 尚未啟用";
+  textProviderDetail.textContent = textProviderStatusMessage({ authenticated, connectorInstalled });
   enableOAuthProviderButton.disabled = !authenticated || oauthAiEnabled;
-  enableOAuthProviderButton.textContent = oauthAiEnabled && authenticated ? "AI 已啟用" : "啟用 AI";
+  enableOAuthProviderButton.textContent = oauthAiEnabled && authenticated ? "本場已啟用" : "啟用本場";
   loginTextProviderButton.textContent = providerConfig().loginLabel;
-  loginTextProviderButton.hidden = authenticated;
+  loginTextProviderButton.hidden = !connectorInstalled || authenticated;
+  if (openTextProviderInstallGuideButton) openTextProviderInstallGuideButton.hidden = connectorInstalled;
+  if (copyTextProviderInstallCommandButton) copyTextProviderInstallCommandButton.hidden = connectorInstalled;
+  if (refreshTextProviderStatusButton) refreshTextProviderStatusButton.hidden = connectorInstalled && authenticated;
   syncStartButtonAvailability();
   setupController.renderPrepSummary();
+}
+
+function textProviderStatusMessage({ authenticated, connectorInstalled }) {
+  const providerLabel = selectedTextProviderLabel();
+  const serviceLabel = providerConfig().serviceLabel;
+  if (!connectorInstalled) {
+    const command = textProviderStatus?.installCommand ?? providerConfig().installCommand;
+    return `尚未安裝 ${providerLabel}。請依官方教學安裝，或複製指令到 Terminal 執行：${command}。安裝後按重新檢查。`;
+  }
+  if (oauthAiEnabled && authenticated) {
+    return `本場會議已啟用；會議背景、即時提醒與會後整理會透過本機 ${providerLabel} 送到 ${serviceLabel}。Meeting Copilot 不會保存 CLI token。`;
+  }
+  if (authenticated) {
+    return `已偵測到 ${providerLabel} 登入；按「啟用本場」後才會把本場會議內容送去 ${serviceLabel}。`;
+  }
+  return `${textProviderStatus?.statusLabel ?? `尚未登入 ${providerLabel}`}；登入由官方 CLI 處理，Meeting Copilot 不會保存 CLI token。`;
 }
 
 function canStartWithAi() {
@@ -1287,7 +1708,7 @@ function canStartWithAi() {
 
 function syncStartButtonAvailability() {
   if (document.body.dataset.state !== "setup") return;
-  const ready = canStartWithAi();
+  const ready = canStartWithAi() && canStartWithSelectedStt();
   startButton.disabled = !ready;
   updateStartButtonCopy(ready);
 }
@@ -1299,26 +1720,27 @@ function updateStartButtonCopy(ready) {
   if (subtitle) {
     subtitle.textContent = ready
       ? "開始記錄會議音訊"
+      : !canStartWithSelectedStt()
+        ? "Whisper 尚未就緒"
       : textProviderStatus?.authenticated
         ? "請先按左側啟用 AI"
-        : providerMissingLoginCopy();
+        : providerStartBlockedCopy();
   }
 }
 
-function readAiEnabledPreference() {
-  try {
-    return window.localStorage?.getItem(AI_ENABLED_STORAGE_KEY) === "true";
-  } catch {
-    return false;
-  }
+function canStartWithSelectedStt() {
+  return Boolean(localSttStatus?.ready);
 }
 
 function setAiEnabledPreference(enabled) {
   oauthAiEnabled = enabled;
+}
+
+function clearLegacyAiEnabledPreference() {
   try {
-    window.localStorage?.setItem(AI_ENABLED_STORAGE_KEY, String(enabled));
+    window.localStorage?.removeItem(LEGACY_AI_STORAGE_KEY);
   } catch {
-    // Local storage is only for restoring the user's opt-in after restart.
+    // Old builds persisted AI enablement; current builds require per-meeting enablement.
   }
 }
 
@@ -1336,6 +1758,12 @@ function selectedTextProviderLabel() {
 
 function providerMissingLoginCopy() {
   return providerConfig().missingLogin;
+}
+
+function providerStartBlockedCopy() {
+  if (!nativeInvoke) return "請使用桌面 app";
+  if (textProviderStatus?.connectorInstalled === false) return `請先安裝 ${selectedTextProviderLabel()}`;
+  return providerMissingLoginCopy();
 }
 
 function readTextProviderPreference() {
@@ -1360,7 +1788,7 @@ function syncTextProviderChoiceControls() {
   }
 }
 
-async function setSelectedTextProvider(providerId, { keepEnabledIfAuthenticated = false } = {}) {
+async function setSelectedTextProvider(providerId) {
   const nextProviderId = normalizeTextProviderId(providerId);
   if (nextProviderId === selectedTextProviderId) {
     syncTextProviderChoiceControls();
@@ -1370,7 +1798,7 @@ async function setSelectedTextProvider(providerId, { keepEnabledIfAuthenticated 
   writeTextProviderPreference(selectedTextProviderId);
   syncTextProviderChoiceControls();
   textProviderStatus = undefined;
-  if (!keepEnabledIfAuthenticated) setAiEnabledPreference(false);
+  setAiEnabledPreference(false);
   renderTextProviderStatus();
   if (nativeInvoke && activeSessionId && document.body.dataset.state === "listening") {
     try {
@@ -1384,11 +1812,6 @@ async function setSelectedTextProvider(providerId, { keepEnabledIfAuthenticated 
   }
   await refreshTextProviderStatus();
   if (nextProviderId !== selectedTextProviderId) return;
-  if (keepEnabledIfAuthenticated && !textProviderStatus?.authenticated) {
-    setAiEnabledPreference(false);
-    renderTextProviderStatus();
-  }
-  if (oauthAiEnabled) setupController.schedulePrepSummaryGeneration();
 }
 
 function scheduleTextProviderRefresh() {
@@ -1509,7 +1932,7 @@ function pruneTranscriptRevisionMetadata() {
 
 function renderTranscriptDrawer() {
   renderTranscriptDrawerView({
-    elements: { liveTranscript, transcriptDrawerToggle, transcriptDrawerCount, transcriptPreview, transcriptFull },
+    elements: { listeningCurtain, liveTranscript, transcriptDrawerToggle, transcriptDrawerCount, transcriptPreview, transcriptFull },
     transcriptDrawerOpen,
     transcriptEvents: displayedTranscriptEvents(),
     transcriptLines,
