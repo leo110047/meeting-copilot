@@ -1,8 +1,12 @@
 use crate::LIVE_SESSIONS;
 use crate::commands_audio::{
-    classify_native_transcription_error, transcript_cleanup_context, transcript_text_matches,
+    classify_native_transcription_error, is_native_transcription_diagnostic,
+    transcript_cleanup_context, transcript_text_matches,
 };
-use crate::commands_core::{read_granted_dropped_context_file, register_drop_read_grants};
+use crate::commands_core::{
+    LIVE_SESSION_STOP_GRACE_MS, cleanup_stopped_live_session, read_granted_dropped_context_file,
+    register_drop_read_grants, stop_session_inner,
+};
 use crate::decision_logic::{
     apply_live_state_patch, derive_decision_state, now_ms, now_ms_string, value_string,
 };
@@ -23,17 +27,19 @@ use crate::oauth_provider::{
     CLAUDE_TEXT_PROVIDER_ID, CODEX_TEXT_PROVIDER_ID, SubscriptionOAuthParse,
     build_live_state_patch_prompt, build_transcript_cleanup_prompt,
     build_transcript_revision_prompt, cached_text_provider_count_for_tests, claude_command_path,
-    codex_command_available, normalize_text_provider_id, parse_claude_auth_status,
-    parse_claude_print_result, parse_live_coaching_suggestions,
-    parse_subscription_oauth_authenticated, parse_transcript_cleanup_text,
-    parse_transcript_revision_response, start_subscription_oauth_login, text_provider_summary,
-    validate_live_state_patch_value, windows_codex_executable_names,
-    windows_executable_extensions_from_pathext,
+    claude_status_from_print_probe, codex_command_available, normalize_text_provider_id,
+    parse_claude_auth_status, parse_claude_cli_capabilities, parse_claude_print_result,
+    parse_live_coaching_suggestions, parse_subscription_oauth_authenticated,
+    parse_transcript_cleanup_text, parse_transcript_revision_response,
+    start_subscription_oauth_login, text_provider_summary, validate_live_state_patch_value,
+    windows_codex_executable_names, windows_executable_extensions_from_pathext,
 };
 use crate::shell_storage::{open_db, read_dropped_context_file};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[test]
 fn dropped_context_file_reads_utf8_text() {
@@ -114,7 +120,6 @@ fn codex_command_available_returns_false_for_missing_binary() {
 
 #[test]
 fn start_subscription_oauth_login_rejects_missing_override_before_launch() {
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let key = "MEETING_COPILOT_CODEX";
     let previous = std::env::var_os(key);
@@ -135,6 +140,114 @@ fn start_subscription_oauth_login_rejects_missing_override_before_launch() {
     let error = result.expect_err("missing Codex override should fail before launching login");
     assert!(error.contains("MEETING_COPILOT_CODEX"));
     assert!(error.contains(&missing.display().to_string()));
+}
+
+#[test]
+fn stop_session_keeps_live_session_for_late_native_transcripts() {
+    let session_id = format!("late_native_{}", now_ms());
+    let mut brief = crate::decision_logic::default_brief();
+    brief.session_id = session_id.clone();
+    let db_path = std::env::temp_dir().join(format!("meeting-copilot-stop-{}.db", now_ms()));
+    let conn = open_db(&db_path).expect("open temp db");
+    insert_session(&conn, &brief, true, Some(CODEX_TEXT_PROVIDER_ID)).expect("insert session");
+    drop(conn);
+    LIVE_SESSIONS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("lock live sessions")
+        .insert(
+            session_id.clone(),
+            NativeLiveSession {
+                brief,
+                text_provider_id: None,
+                events: vec![],
+                shown_suggestion_ids: std::collections::HashSet::new(),
+                stopped_at_ms: None,
+            },
+        );
+
+    let result = stop_session_inner(session_id.clone(), db_path.clone());
+    let retained = LIVE_SESSIONS
+        .get()
+        .and_then(|sessions| sessions.lock().ok())
+        .map(|sessions| {
+            sessions
+                .get(&session_id)
+                .and_then(|session| session.stopped_at_ms)
+                .is_some()
+        })
+        .unwrap_or(false);
+    if let Some(sessions) = LIVE_SESSIONS.get()
+        && let Ok(mut sessions) = sessions.lock()
+    {
+        sessions.remove(&session_id);
+    }
+    let ended_at = open_db(&db_path)
+        .expect("reopen temp db")
+        .query_row(
+            "SELECT ended_at FROM meeting_sessions WHERE id = ?1",
+            [&session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("read ended_at");
+    let _ = fs::remove_file(db_path);
+
+    result.expect("stop session should update ended_at");
+    assert!(ended_at.is_some());
+    assert!(
+        retained,
+        "late native transcript ingest needs the live session after Stop"
+    );
+}
+
+#[test]
+fn stopped_live_session_is_removed_after_late_transcript_grace_window() {
+    let session_id = format!("cleanup_stopped_{}", now_ms());
+    let stopped_at_ms = i64::try_from(now_ms()).unwrap_or(i64::MAX - LIVE_SESSION_STOP_GRACE_MS);
+    LIVE_SESSIONS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("lock live sessions")
+        .insert(
+            session_id.clone(),
+            NativeLiveSession {
+                brief: crate::decision_logic::default_brief(),
+                text_provider_id: None,
+                events: vec![],
+                shown_suggestion_ids: std::collections::HashSet::new(),
+                stopped_at_ms: Some(stopped_at_ms),
+            },
+        );
+
+    assert!(!cleanup_stopped_live_session(
+        &session_id,
+        stopped_at_ms,
+        stopped_at_ms + LIVE_SESSION_STOP_GRACE_MS - 1
+    ));
+    assert!(cleanup_stopped_live_session(
+        &session_id,
+        stopped_at_ms,
+        stopped_at_ms + LIVE_SESSION_STOP_GRACE_MS
+    ));
+    let still_present = LIVE_SESSIONS
+        .get()
+        .and_then(|sessions| sessions.lock().ok())
+        .map(|sessions| sessions.contains_key(&session_id))
+        .unwrap_or(false);
+    assert!(!still_present);
+}
+
+#[test]
+fn native_transcription_diagnostics_do_not_surface_as_ui_errors() {
+    assert!(is_native_transcription_diagnostic(
+        "whisper_init_state: compute buffer (decode) =   97.28 MB"
+    ));
+    assert!(is_native_transcription_diagnostic(
+        "Windows WASAPI Whisper capture started: eCapture 48000Hz/1ch/32bit/tag65534"
+    ));
+    assert!(!is_native_transcription_diagnostic(
+        "Whisper chunk transcription failed: failed to open wav"
+    ));
 }
 
 #[test]
@@ -214,7 +327,6 @@ fn claude_cli_probe_flags_are_supported_when_binary_exists() {
         String::from_utf8_lossy(&output.stderr)
     );
     for expected in [
-        "auth",
         "--tools",
         "--no-session-persistence",
         "--no-chrome",
@@ -225,19 +337,28 @@ fn claude_cli_probe_flags_are_supported_when_binary_exists() {
             "Claude Code help is missing expected flag or command: {expected}"
         );
     }
-    let auth_output = std::process::Command::new(&claude)
-        .arg("auth")
-        .arg("--help")
-        .output()
-        .expect("run claude auth --help");
-    assert!(auth_output.status.success());
-    let auth_help = format!(
-        "{}{}",
-        String::from_utf8_lossy(&auth_output.stdout),
-        String::from_utf8_lossy(&auth_output.stderr)
-    );
-    assert!(auth_help.contains("login"));
-    assert!(auth_help.contains("status"));
+    let capabilities = parse_claude_cli_capabilities(&help);
+    assert!(capabilities.supports_print_mode);
+    if capabilities.supports_legacy_auth {
+        let auth_output = std::process::Command::new(&claude)
+            .arg("auth")
+            .arg("--help")
+            .output()
+            .expect("run claude auth --help");
+        assert!(auth_output.status.success());
+        let auth_help = format!(
+            "{}{}",
+            String::from_utf8_lossy(&auth_output.stdout),
+            String::from_utf8_lossy(&auth_output.stderr)
+        );
+        assert!(auth_help.contains("login"));
+        assert!(auth_help.contains("status"));
+    } else {
+        assert!(
+            capabilities.supports_setup_token,
+            "Claude Code help is missing both legacy auth and setup-token commands"
+        );
+    }
 
     let flag_probe = std::process::Command::new(&claude)
         .arg("-p")
@@ -256,6 +377,42 @@ fn claude_cli_probe_flags_are_supported_when_binary_exists() {
         String::from_utf8_lossy(&flag_probe.stdout),
         String::from_utf8_lossy(&flag_probe.stderr)
     );
+}
+
+#[test]
+fn claude_print_mode_status_requires_successful_runtime_probe() {
+    let capabilities = parse_claude_cli_capabilities(
+        r#"
+Options:
+  -p, --print
+  --tools <tools...>
+  --no-session-persistence
+  --no-chrome
+  --output-format <format>
+Commands:
+  setup-token
+"#,
+    );
+    let failed = claude_status_from_print_probe(
+        capabilities,
+        Err("not authenticated".to_string()),
+        "Claude Code CLI".to_string(),
+        Some("npm install -g @anthropic-ai/claude-code".to_string()),
+        Some("https://example.invalid".to_string()),
+    );
+    assert!(!failed.authenticated);
+    assert!(!failed.active);
+    assert!(failed.can_refresh_token);
+
+    let verified = claude_status_from_print_probe(
+        capabilities,
+        Ok(()),
+        "Claude Code CLI".to_string(),
+        None,
+        None,
+    );
+    assert!(verified.authenticated);
+    assert!(verified.active);
 }
 
 #[test]
@@ -334,6 +491,7 @@ fn transcript_cleanup_context_includes_source_and_recent_lines() {
                     is_final: true,
                 }],
                 shown_suggestion_ids: std::collections::HashSet::new(),
+                stopped_at_ms: None,
             },
         );
     let context = transcript_cleanup_context(

@@ -1,6 +1,6 @@
 use crate::commands_audio::ingest_transcript_inner;
 use crate::decision_logic::{
-    apply_live_state_patch, default_brief, derive_decision_state, now_ms, now_ms_string, stable_id,
+    apply_live_state_patch, default_brief, derive_decision_state, now_ms, stable_id,
 };
 use crate::desktop_types::desktop_shell_plan;
 use crate::desktop_types::{
@@ -40,6 +40,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+
+pub(crate) const LIVE_SESSION_STOP_GRACE_MS: i64 = 60_000;
+const LIVE_SESSION_STOP_GRACE: Duration = Duration::from_millis(LIVE_SESSION_STOP_GRACE_MS as u64);
 
 #[cfg(target_os = "macos")]
 use crate::macos_speech_bridge::{
@@ -90,6 +95,7 @@ pub(crate) fn start_session(
                 text_provider_id,
                 events: vec![],
                 shown_suggestion_ids: HashSet::new(),
+                stopped_at_ms: None,
             },
         );
     Ok(StartSessionResponse {
@@ -102,20 +108,64 @@ pub(crate) fn start_session(
 
 #[tauri::command]
 pub(crate) fn stop_session(session_id: String) -> Result<(), String> {
-    if let Some(sessions) = LIVE_SESSIONS.get() {
-        sessions
-            .lock()
-            .map_err(|error| error.to_string())?
-            .remove(&session_id);
-    }
-    let db_path = app_db_path()?;
+    stop_session_inner(session_id, app_db_path()?)
+}
+
+pub(crate) fn stop_session_inner(session_id: String, db_path: PathBuf) -> Result<(), String> {
+    let stopped_at_ms = current_time_ms_i64();
     let conn = open_db(&db_path)?;
     conn.execute(
         "UPDATE meeting_sessions SET ended_at = ?1 WHERE id = ?2",
-        params![now_ms_string(), session_id],
+        params![stopped_at_ms.to_string(), session_id],
     )
     .map_err(|error| error.to_string())?;
+    mark_live_session_stopped(&session_id, stopped_at_ms);
+    schedule_live_session_cleanup(session_id, stopped_at_ms);
     Ok(())
+}
+
+fn current_time_ms_i64() -> i64 {
+    i64::try_from(now_ms()).unwrap_or(i64::MAX)
+}
+
+fn mark_live_session_stopped(session_id: &str, stopped_at_ms: i64) {
+    if let Some(sessions) = LIVE_SESSIONS.get()
+        && let Ok(mut sessions) = sessions.lock()
+        && let Some(session) = sessions.get_mut(session_id)
+    {
+        session.stopped_at_ms = Some(stopped_at_ms);
+    }
+}
+
+fn schedule_live_session_cleanup(session_id: String, stopped_at_ms: i64) {
+    thread::spawn(move || {
+        thread::sleep(LIVE_SESSION_STOP_GRACE);
+        let _ = cleanup_stopped_live_session(&session_id, stopped_at_ms, current_time_ms_i64());
+    });
+}
+
+pub(crate) fn cleanup_stopped_live_session(
+    session_id: &str,
+    stopped_at_ms: i64,
+    current_ms: i64,
+) -> bool {
+    if current_ms.saturating_sub(stopped_at_ms) < LIVE_SESSION_STOP_GRACE_MS {
+        return false;
+    }
+    let Some(sessions) = LIVE_SESSIONS.get() else {
+        return false;
+    };
+    let Ok(mut sessions) = sessions.lock() else {
+        return false;
+    };
+    let should_remove = sessions
+        .get(session_id)
+        .map(|session| session.stopped_at_ms == Some(stopped_at_ms))
+        .unwrap_or(false);
+    if should_remove {
+        sessions.remove(session_id);
+    }
+    should_remove
 }
 
 #[tauri::command]
@@ -179,7 +229,7 @@ pub(crate) fn native_transcriber_health_for_source(
     stt_profile_id: &str,
 ) -> Result<NativeTranscriberHealth, String> {
     if is_local_whisper_profile(stt_profile_id) {
-        let mut health = local_whisper_health(stt_profile_id)?;
+        let health = local_whisper_health(stt_profile_id)?;
         if !health.ready {
             return Ok(health);
         }

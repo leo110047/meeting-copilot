@@ -40,6 +40,13 @@ pub(crate) enum SubscriptionOAuthParse {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClaudeCliCapabilities {
+    pub(crate) supports_legacy_auth: bool,
+    pub(crate) supports_setup_token: bool,
+    pub(crate) supports_print_mode: bool,
+}
+
 pub(crate) static TEXT_PROVIDER_STATUS_CACHE: OnceLock<
     Mutex<HashMap<String, CachedTextProviderStatus>>,
 > = OnceLock::new();
@@ -425,11 +432,23 @@ exit /b %EXIT_CODE%
 
 pub(crate) fn claude_subscription_status_uncached() -> TextProviderStatus {
     let claude = claude_command_path();
+    let (connector_label, install_command, install_url) =
+        text_provider_install_fields(CLAUDE_TEXT_PROVIDER_ID);
+    if let Ok(capabilities) = claude_cli_capabilities(&claude)
+        && !capabilities.supports_legacy_auth
+        && capabilities.supports_print_mode
+    {
+        return claude_status_from_print_probe(
+            capabilities,
+            run_claude_subscription_auth_probe(),
+            connector_label,
+            install_command,
+            install_url,
+        );
+    }
     let mut command = claude_command_from_path(&claude);
     configure_claude_subscription_env(&mut command);
     command.arg("auth").arg("status");
-    let (connector_label, install_command, install_url) =
-        text_provider_install_fields(CLAUDE_TEXT_PROVIDER_ID);
     match run_command_output_with_timeout(&mut command, 5_000) {
         Ok(output) => {
             let status_text = format!(
@@ -531,6 +550,115 @@ pub(crate) fn parse_claude_auth_status(status_text: &str) -> Option<(bool, Strin
     Some((logged_in, label))
 }
 
+pub(crate) fn parse_claude_cli_capabilities(help_text: &str) -> ClaudeCliCapabilities {
+    let supports_legacy_auth = help_text
+        .lines()
+        .any(|line| line.trim_start().starts_with("auth "));
+    let supports_setup_token = help_text
+        .lines()
+        .any(|line| line.trim_start().starts_with("setup-token"));
+    let supports_print_mode = [
+        "--tools",
+        "--no-session-persistence",
+        "--no-chrome",
+        "--output-format",
+    ]
+    .iter()
+    .all(|expected| help_text.contains(expected));
+    ClaudeCliCapabilities {
+        supports_legacy_auth,
+        supports_setup_token,
+        supports_print_mode,
+    }
+}
+
+fn claude_cli_capabilities(claude: &Path) -> Result<ClaudeCliCapabilities, String> {
+    let mut command = claude_command_from_path(claude);
+    configure_claude_subscription_env(&mut command);
+    command.arg("--help");
+    let output = run_command_output_with_timeout(&mut command, 3_000)?;
+    if !output.status.success() {
+        return Err(format!("Claude Code --help exited with {}", output.status));
+    }
+    let help_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(parse_claude_cli_capabilities(&help_text))
+}
+
+fn run_claude_subscription_auth_probe() -> Result<(), String> {
+    let output = run_claude_subscription_prompt_with_timeout(
+        "Reply with exactly OK. Do not include anything else.",
+        12_000,
+    )?;
+    if output.trim().is_empty() {
+        Err(format!(
+            "Claude Code auth probe returned empty output: {}",
+            truncate_for_diagnostic(&output, 200)
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn claude_status_from_print_probe(
+    capabilities: ClaudeCliCapabilities,
+    probe_result: Result<(), String>,
+    connector_label: String,
+    install_command: Option<String>,
+    install_url: Option<String>,
+) -> TextProviderStatus {
+    match probe_result {
+        Ok(()) => TextProviderStatus {
+            provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
+            kind: TEXT_PROVIDER_KIND.to_string(),
+            connector_installed: true,
+            connector_label,
+            authenticated: true,
+            can_refresh_token: capabilities.supports_setup_token,
+            supports_structured_output: true,
+            supports_streaming: true,
+            active: true,
+            status_label: "已驗證 Claude Code CLI 訂閱可用".to_string(),
+            install_command,
+            install_url,
+            last_error: None,
+        },
+        Err(error) => TextProviderStatus {
+            provider_id: CLAUDE_TEXT_PROVIDER_ID.to_string(),
+            kind: TEXT_PROVIDER_KIND.to_string(),
+            connector_installed: true,
+            connector_label,
+            authenticated: false,
+            can_refresh_token: capabilities.supports_setup_token,
+            supports_structured_output: true,
+            supports_streaming: true,
+            active: false,
+            status_label: if capabilities.supports_setup_token {
+                "Claude Code CLI 可用，但尚未驗證訂閱 token".to_string()
+            } else {
+                "Claude Code CLI 可用，但無法驗證訂閱狀態".to_string()
+            },
+            install_command,
+            install_url,
+            last_error: Some(truncate_for_diagnostic(&error, 800)),
+        },
+    }
+}
+
+fn claude_subscription_login_args(claude: &Path) -> Result<Vec<&'static str>, String> {
+    let capabilities = claude_cli_capabilities(claude)?;
+    if capabilities.supports_legacy_auth {
+        Ok(vec!["auth", "login"])
+    } else if capabilities.supports_setup_token {
+        Ok(vec!["setup-token"])
+    } else {
+        Err("Claude Code CLI does not expose auth login or setup-token".to_string())
+    }
+}
+
 pub(crate) fn start_claude_subscription_login() -> Result<(), String> {
     let claude = claude_command_path();
     if let Err(error) = claude_command_probe(&claude) {
@@ -540,12 +668,18 @@ pub(crate) fn start_claude_subscription_login() -> Result<(), String> {
             claude.display()
         ));
     }
+    let login_args = claude_subscription_login_args(&claude)?;
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::PermissionsExt;
 
         let script_dir = create_private_oauth_temp_dir()?;
         let script_path = script_dir.join("login.command");
+        let login_invocation = format!(
+            "{} {}",
+            shell_quote(&claude.display().to_string()),
+            login_args.join(" ")
+        );
         let script = format!(
             r#"#!/bin/zsh
 cleanup() {{
@@ -555,7 +689,7 @@ cleanup() {{
 export HOME="${{HOME:-/Users/$USER}}"
 echo "Meeting Copilot Claude Code subscription login"
 echo "This window was opened by Meeting Copilot. Complete the browser login, then return to the app; Meeting Copilot will refresh the status automatically."
-{} auth login
+{}
 EXIT_CODE=$?
 echo
 if [ "$EXIT_CODE" -eq 0 ]; then
@@ -569,7 +703,7 @@ read -r _
 cleanup
 exit "$EXIT_CODE"
 "#,
-            shell_quote(&claude.display().to_string())
+            login_invocation
         );
         fs::write(&script_path, script).map_err(|error| error.to_string())?;
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
@@ -594,13 +728,15 @@ exit "$EXIT_CODE"
     {
         let script_dir = create_private_oauth_temp_dir()?;
         let script_path = script_dir.join("login.cmd");
+        let login_invocation =
+            format!("{} {}", cmd_batch_quote_path(&claude), login_args.join(" "));
         let script = format!(
             r#"@echo off
 setlocal
 echo Meeting Copilot Claude Code subscription login
 echo This window was opened by Meeting Copilot. Complete the browser login, then return to the app; Meeting Copilot will refresh the status automatically.
 echo.
-{} auth login
+{}
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 if "%EXIT_CODE%"=="0" (
@@ -614,7 +750,7 @@ del "%~f0" >nul 2>nul
 for %%I in ("%~dp0.") do rmdir "%%~fI" >nul 2>nul
 exit /b %EXIT_CODE%
 "#,
-            cmd_batch_quote_path(&claude)
+            login_invocation
         );
         fs::write(&script_path, script).map_err(|error| error.to_string())?;
         Command::new("cmd")
@@ -1808,9 +1944,6 @@ pub(crate) fn codex_unix_fallback_candidates() -> &'static [&'static str] {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn codex_path_candidates_from_path() -> Vec<PathBuf> {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return vec![];
-    };
     let pathext = std::env::var_os("PATHEXT");
     let executable_names = windows_codex_executable_names(pathext.as_deref());
     command_path_candidates_from_path(&executable_names)
@@ -1985,6 +2118,7 @@ pub(crate) fn configure_claude_subscription_env(command: &mut Command) {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

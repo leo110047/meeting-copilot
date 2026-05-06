@@ -570,17 +570,28 @@ pub(crate) fn install_native_transcriber_io(
     let app_for_stderr = app.clone();
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let is_diagnostic = is_native_transcription_diagnostic(&line);
             let _ = log_app_error_inner(
                 Some(&session_id),
                 "native_transcription.stderr",
                 "native_speech_helper",
-                "error",
+                if is_diagnostic { "info" } else { "error" },
                 &line,
                 serde_json::json!({"source": stderr_source}),
             );
-            emit_native_transcription_error(&app_for_stderr, line, &stderr_source);
+            if !is_diagnostic {
+                emit_native_transcription_error(&app_for_stderr, line, &stderr_source);
+            }
         }
     });
+}
+
+pub(crate) fn is_native_transcription_diagnostic(message: &str) -> bool {
+    let trimmed = message.trim();
+    trimmed.starts_with("whisper_init_")
+        || trimmed.starts_with("whisper_model_load:")
+        || trimmed.starts_with("whisper_backend_init_gpu: no GPU found")
+        || trimmed.starts_with("Windows WASAPI Whisper capture started:")
 }
 
 pub(crate) fn handle_native_transcript_line(
@@ -588,45 +599,15 @@ pub(crate) fn handle_native_transcript_line(
     session_id: &str,
     helper_line: HelperTranscriptLine,
 ) {
-    let cleanup_context = transcript_cleanup_context(session_id, &helper_line);
-    let text_provider_id = LIVE_SESSIONS
-        .get()
-        .and_then(|sessions| sessions.lock().ok())
-        .and_then(|sessions| {
-            sessions
-                .get(session_id)
-                .and_then(|session| session.text_provider_id.clone())
-        });
-    let cleaned_text = match cleanup_transcript_text_with_provider_inner(
-        text_provider_id.as_deref(),
-        &helper_line.text,
-        &cleanup_context,
-        Some(session_id),
-    ) {
-        Ok(cleaned_text) => cleaned_text,
-        Err(error) => {
-            let _ = log_app_error_inner(
-                Some(session_id),
-                "native_transcription.cleanup_fallback",
-                "native",
-                "warning",
-                &error,
-                serde_json::json!({
-                    "fallback": "raw_transcript_text",
-                    "inputHash": stable_id(&helper_line.text)
-                }),
-            );
-            helper_line.text.clone()
-        }
-    };
+    let transcript_text = helper_line.text.clone();
     let event_id = stable_id(&format!(
         "native:{}:{}:{}:{}",
-        session_id, helper_line.source, helper_line.ended_at_ms, cleaned_text
+        session_id, helper_line.source, helper_line.ended_at_ms, transcript_text
     ));
     let event_source = helper_line.source.clone();
     let input = TranscriptInput {
         id: Some(event_id.clone()),
-        text: cleaned_text,
+        text: transcript_text,
         source: Some(event_source.clone()),
         speaker: None,
         speaker_confidence: Some(helper_line.confidence),
@@ -652,6 +633,7 @@ pub(crate) fn handle_native_transcript_line(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transcript_cleanup_context(
     session_id: &str,
     helper_line: &HelperTranscriptLine,
@@ -685,6 +667,7 @@ pub(crate) fn transcript_cleanup_context(
     .to_string()
 }
 
+#[cfg(test)]
 fn transcript_source_label(source: &str) -> &'static str {
     match source {
         "mic" => "我",

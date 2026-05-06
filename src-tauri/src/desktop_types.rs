@@ -46,6 +46,7 @@ pub(crate) struct NativeLiveSession {
     pub(crate) text_provider_id: Option<String>,
     pub(crate) events: Vec<TranscriptEvent>,
     pub(crate) shown_suggestion_ids: HashSet<String>,
+    pub(crate) stopped_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
