@@ -229,7 +229,7 @@ pub(crate) fn native_transcriber_health_for_source(
     stt_profile_id: &str,
 ) -> Result<NativeTranscriberHealth, String> {
     if is_local_whisper_profile(stt_profile_id) {
-        let health = local_whisper_health(stt_profile_id)?;
+        let mut health = local_whisper_health(stt_profile_id)?;
         if !health.ready {
             return Ok(health);
         }

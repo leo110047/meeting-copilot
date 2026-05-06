@@ -13,7 +13,6 @@ use crate::native_storage::{
     ensure_session_exists, insert_decision_snapshot, insert_transcript_event, log_app_error_inner,
     native_speech_provider_id,
 };
-use crate::oauth_provider::cleanup_transcript_text_with_provider_inner;
 use crate::shell_storage::{app_db_path, open_db, set_listening_window_mode, show_main_window};
 use crate::{LIVE_SESSIONS, ManagedNativeTranscriber, NATIVE_TRANSCRIBERS, PREP_DICTATION};
 use std::collections::HashMap;
@@ -85,28 +84,29 @@ pub(crate) fn start_prep_dictation(
             let parsed: Result<HelperTranscriptLine, _> = serde_json::from_str(&line);
             match parsed {
                 Ok(helper_line) if helper_line.kind == "transcript" && helper_line.is_final => {
-                    let cleaned_text = match cleanup_transcript_text_with_provider_inner(
-                        provider_id.as_deref(),
-                        &helper_line.text,
-                        "prep_dictation",
-                        Some("prep_dictation_cleanup"),
-                    ) {
-                        Ok(cleaned_text) => cleaned_text,
-                        Err(error) => {
-                            let _ = log_app_error_inner(
-                                None,
-                                "prep_dictation.cleanup_fallback",
-                                "native",
-                                "warning",
-                                &error,
-                                serde_json::json!({
-                                    "fallback": "raw_transcript_text",
-                                    "inputHash": stable_id(&helper_line.text)
-                                }),
-                            );
-                            helper_line.text.clone()
-                        }
-                    };
+                    let cleaned_text =
+                        match crate::oauth_provider::cleanup_transcript_text_with_provider_inner(
+                            provider_id.as_deref(),
+                            &helper_line.text,
+                            "prep_dictation",
+                            Some("prep_dictation_cleanup"),
+                        ) {
+                            Ok(cleaned_text) => cleaned_text,
+                            Err(error) => {
+                                let _ = log_app_error_inner(
+                                    None,
+                                    "prep_dictation.cleanup_fallback",
+                                    "native",
+                                    "warning",
+                                    &error,
+                                    serde_json::json!({
+                                        "fallback": "raw_transcript_text",
+                                        "inputHash": stable_id(&helper_line.text)
+                                    }),
+                                );
+                                helper_line.text.clone()
+                            }
+                        };
                     let _ = app_for_stdout.emit("prep_dictation_text", cleaned_text);
                 }
                 Ok(_) => {}
