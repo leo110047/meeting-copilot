@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import { rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { closeAllDatabases, closeDatabase, migrate, listTables, queryScalar } from "../src/storage/sqlite.mjs";
+import { closeAllDatabases, closeDatabase, executeSql, migrate, listTables, queryScalar } from "../src/storage/sqlite.mjs";
 import { SessionRepository } from "../src/storage/sessionRepository.mjs";
 
 afterEach(() => {
@@ -28,6 +28,8 @@ test("SQLite migration creates core, Layer 3, and shared meeting tables", () => 
     "participant_profiles",
     "knowledge_memories",
     "memory_candidates",
+    "meeting_series",
+    "meeting_history_entries",
     "political_signals",
     "shared_meeting_artifacts",
     "shared_conflict_candidates",
@@ -36,6 +38,60 @@ test("SQLite migration creates core, Layer 3, and shared meeting tables", () => 
     assert.ok(tables.includes(table), `${table} missing`);
   }
   assert.equal(queryScalar(dbPath, "SELECT COUNT(*) FROM pragma_table_info('suggestions') WHERE name = 'suggestion_json';"), "1");
+  assert.equal(queryScalar(dbPath, "PRAGMA foreign_keys;"), "1");
+  assert.equal(queryScalar(dbPath, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_meeting_history_series';"), "1");
+});
+
+test("SessionRepository saves explicit meeting history as reusable meeting series", () => {
+  const dbPath = ".data/test-meeting-copilot-history.db";
+  rmSync(dbPath, { force: true });
+  const repository = new SessionRepository(dbPath);
+  const saved = repository.saveMeetingHistory({
+    sessionId: "sess_history",
+    seriesTitle: "每週產品同步",
+    allowAiContext: true,
+    artifact: {
+      title: "每週產品同步",
+      summary: {
+        keyPoints: ["Demo scope needs confirmation", "Backend owner is unclear"],
+        decisionsAndOpenQuestions: ["誰負責 rollback plan？"],
+        suggestedActions: ["下次先確認 owner"]
+      },
+      transcript: [{ speaker: "對方 A", text: "我們下週再確認 owner" }]
+    },
+    createdAt: "2026-05-07T10:00:00.000Z"
+  });
+  assert.equal(saved.series.title, "每週產品同步");
+  const series = repository.listMeetingSeries();
+  assert.equal(series.length, 1);
+  assert.equal(series[0].historyCount, 1);
+  assert.deepEqual(series[0].latestContext.keyPoints.slice(0, 1), ["Demo scope needs confirmation"]);
+  repository.saveMeetingHistory({
+    sessionId: "sess_private",
+    seriesTitle: "每週產品同步",
+    allowAiContext: false,
+    artifact: {
+      title: "每週產品同步",
+      summary: {
+        keyPoints: ["這場不要更新 future context"],
+        decisionsAndOpenQuestions: [],
+        suggestedActions: []
+      },
+      transcript: []
+    },
+    createdAt: "2026-05-07T11:00:00.000Z"
+  });
+  const updated = repository.listMeetingSeries()[0];
+  assert.equal(updated.historyCount, 2);
+  assert.deepEqual(updated.latestContext.keyPoints.slice(0, 1), ["Demo scope needs confirmation"]);
+  assert.match(updated.lastSavedAt, /^2026-05-07T11:00:00\.000Z$/);
+  assert.equal(queryScalar(dbPath, "SELECT COUNT(*) FROM meeting_history_entries WHERE session_id = ?;", ["sess_history"]), "1");
+  assert.throws(() => executeSql(dbPath, `
+    INSERT INTO meeting_history_entries (id, series_id, session_id, title, artifact_json, allow_ai_context, created_at)
+    VALUES ('bad_fk', 'missing_series', 'bad', 'Bad', '{}', 0, '2026-05-07T12:00:00.000Z');
+  `), /FOREIGN KEY/);
+  repository.close();
+  rmSync(dbPath, { force: true });
 });
 
 test("SessionRepository persists cross-project app error logs", () => {

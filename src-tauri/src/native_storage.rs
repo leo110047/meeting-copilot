@@ -1,19 +1,20 @@
 use crate::decision_logic::{now_ms, now_ms_string, stable_id};
 use crate::desktop_types::desktop_shell_plan;
 use crate::desktop_types::{
-    AppErrorLogRecord, HelperHealthLine, MeetingBrief, NativeDecisionState, NativeSuggestion,
-    NativeTranscriberHealth, TranscriptEvent,
+    AppErrorLogRecord, HelperHealthLine, MeetingBrief, MeetingSeriesOption, NativeDecisionState,
+    NativeSuggestion, NativeTranscriberHealth, SaveMeetingHistoryRequest,
+    SaveMeetingHistoryResponse, TranscriptEvent,
 };
 use crate::shell_storage::{app_db_path, open_db};
 use crate::{LIVE_SESSIONS, NATIVE_SPEECH_HELPER};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) fn ensure_session_exists(session_id: &str) -> Result<(), String> {
     let sessions = LIVE_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -319,6 +320,342 @@ pub(crate) fn record_session_text_provider(
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+pub(crate) fn list_meeting_series(conn: &Connection) -> Result<Vec<MeetingSeriesOption>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT
+                s.id,
+                s.title,
+                s.summary,
+                s.latest_context_json,
+                s.updated_at,
+                COUNT(h.id) AS history_count
+            FROM meeting_series s
+            LEFT JOIN meeting_history_entries h ON h.series_id = s.id
+            WHERE s.archived_at IS NULL
+            GROUP BY s.id
+            ORDER BY s.updated_at DESC, s.title ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            let latest_context_text: String = row.get(3)?;
+            let latest_context = serde_json::from_str(&latest_context_text)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok(MeetingSeriesOption {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                summary: row.get(2)?,
+                latest_context,
+                last_saved_at: row.get(4)?,
+                history_count: row.get(5)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    let mut series = vec![];
+    for row in rows {
+        series.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(series)
+}
+
+fn read_meeting_series_by_id(
+    conn: &Connection,
+    series_id: &str,
+) -> Result<MeetingSeriesOption, String> {
+    conn.query_row(
+        "SELECT
+            s.id,
+            s.title,
+            s.summary,
+            s.latest_context_json,
+            s.updated_at,
+            (SELECT COUNT(*) FROM meeting_history_entries h WHERE h.series_id = s.id) AS history_count
+        FROM meeting_series s
+        WHERE s.id = ?1 AND s.archived_at IS NULL",
+        params![series_id],
+        |row| {
+            let latest_context_text: String = row.get(3)?;
+            let latest_context = serde_json::from_str(&latest_context_text)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok(MeetingSeriesOption {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                summary: row.get(2)?,
+                latest_context,
+                last_saved_at: row.get(4)?,
+                history_count: row.get(5)?,
+            })
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn save_meeting_history(
+    conn: &Connection,
+    request: SaveMeetingHistoryRequest,
+) -> Result<SaveMeetingHistoryResponse, String> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| error.to_string())?;
+    let result = save_meeting_history_in_transaction(conn, request);
+    match result {
+        Ok(response) => {
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error.to_string())
+            } else {
+                Ok(response)
+            }
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn save_meeting_history_in_transaction(
+    conn: &Connection,
+    request: SaveMeetingHistoryRequest,
+) -> Result<SaveMeetingHistoryResponse, String> {
+    let saved_at = now_iso_string();
+    let title = normalize_history_title(request.series_title.as_deref().or_else(|| {
+        request
+            .artifact
+            .get("title")
+            .and_then(|value| value.as_str())
+    }));
+    let (series_id, series_title, series_exists) =
+        resolve_meeting_series_identity(conn, request.series_id.as_deref(), &title)?;
+    let entry_id = stable_id(&format!(
+        "meeting-history:{}:{}:{}",
+        series_id,
+        request.session_id.as_deref().unwrap_or("local"),
+        saved_at
+    ));
+    let latest_context = if request.allow_ai_context {
+        build_latest_meeting_context(&entry_id, &series_title, &saved_at, &request)
+    } else {
+        serde_json::json!({})
+    };
+    let summary = latest_context
+        .get("summaryText")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    if series_exists {
+        conn.execute(
+            "UPDATE meeting_series
+            SET
+                summary = CASE WHEN ?1 = 1 THEN ?2 ELSE summary END,
+                latest_context_json = CASE WHEN ?1 = 1 THEN ?3 ELSE latest_context_json END,
+                updated_at = ?4,
+                archived_at = NULL
+            WHERE id = ?5",
+            params![
+                if request.allow_ai_context { 1 } else { 0 },
+                &summary,
+                latest_context.to_string(),
+                &saved_at,
+                &series_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        conn.execute(
+            "INSERT INTO meeting_series (id, title, summary, latest_context_json, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &series_id,
+                &series_title,
+                &summary,
+                latest_context.to_string(),
+                &saved_at,
+                &saved_at
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO meeting_history_entries
+        (id, series_id, session_id, title, artifact_json, allow_ai_context, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            &entry_id,
+            &series_id,
+            &request.session_id,
+            &series_title,
+            request.artifact.to_string(),
+            if request.allow_ai_context { 1 } else { 0 },
+            &saved_at
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let series = read_meeting_series_by_id(conn, &series_id)?;
+    Ok(SaveMeetingHistoryResponse {
+        entry_id,
+        series,
+        saved_at,
+    })
+}
+
+fn resolve_meeting_series_identity(
+    conn: &Connection,
+    requested_series_id: Option<&str>,
+    requested_title: &str,
+) -> Result<(String, String, bool), String> {
+    if let Some(series_id) = requested_series_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some((id, title)) = conn
+            .query_row(
+                "SELECT id, title FROM meeting_series WHERE id = ?1",
+                params![series_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            return Ok((id, title, true));
+        }
+    }
+    if let Some((id, title)) = conn
+        .query_row(
+            "SELECT id, title FROM meeting_series WHERE title = ?1",
+            params![requested_title],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+    {
+        return Ok((id, title, true));
+    }
+    let series_id = requested_series_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| stable_id(&format!("meeting-series:{requested_title}")));
+    Ok((series_id, requested_title.to_string(), false))
+}
+
+fn normalize_history_title(value: Option<&str>) -> String {
+    let title = value.unwrap_or("").trim();
+    if title.is_empty() {
+        "未命名會議".to_string()
+    } else {
+        title.chars().take(120).collect()
+    }
+}
+
+fn now_iso_string() -> String {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_seconds = duration.as_secs() as i64;
+    let millis = duration.subsec_millis();
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
+}
+
+fn build_latest_meeting_context(
+    entry_id: &str,
+    title: &str,
+    saved_at: &str,
+    request: &SaveMeetingHistoryRequest,
+) -> serde_json::Value {
+    let summary = request
+        .artifact
+        .get("summary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let key_points = limited_string_array(summary.get("keyPoints"), 6);
+    let unresolved = limited_string_array(summary.get("decisionsAndOpenQuestions"), 6);
+    let suggested_actions = limited_string_array(summary.get("suggestedActions"), 6);
+    let transcript_preview = request
+        .artifact
+        .get("transcript")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .filter_map(|line| {
+                    let text =
+                        normalize_context_text(line.get("text").and_then(|value| value.as_str()));
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let speaker = normalize_context_text(
+                        line.get("speaker").and_then(|value| value.as_str()),
+                    );
+                    Some(serde_json::json!({
+                        "speaker": if speaker.is_empty() { "未標記來源".to_string() } else { speaker },
+                        "text": text
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "entryId": entry_id,
+        "sessionId": request.session_id,
+        "title": title,
+        "updatedAt": saved_at,
+        "summaryText": key_points.iter().take(2).cloned().collect::<Vec<_>>().join("；"),
+        "keyPoints": key_points,
+        "unresolved": unresolved,
+        "suggestedActions": suggested_actions,
+        "transcriptPreview": transcript_preview
+    })
+}
+
+fn limited_string_array(value: Option<&serde_json::Value>, limit: usize) -> Vec<String> {
+    value
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(|item| normalize_context_text(Some(item)))
+                .filter(|item| !item.is_empty())
+                .take(limit)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_context_text(value: Option<&str>) -> String {
+    value
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub(crate) fn insert_transcript_event(

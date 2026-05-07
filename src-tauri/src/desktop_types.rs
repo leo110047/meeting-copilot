@@ -86,6 +86,35 @@ pub(crate) struct StartSessionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct MeetingSeriesOption {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) summary: String,
+    pub(crate) latest_context: serde_json::Value,
+    pub(crate) last_saved_at: String,
+    pub(crate) history_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveMeetingHistoryRequest {
+    pub(crate) session_id: Option<String>,
+    pub(crate) series_id: Option<String>,
+    pub(crate) series_title: Option<String>,
+    pub(crate) allow_ai_context: bool,
+    pub(crate) artifact: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveMeetingHistoryResponse {
+    pub(crate) entry_id: String,
+    pub(crate) series: MeetingSeriesOption,
+    pub(crate) saved_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct TranscriptInput {
     pub(crate) id: Option<String>,
     pub(crate) text: String,

@@ -38,6 +38,9 @@ const setupContextMeta = document.querySelector("#setupContextMeta");
 const droppedFileCount = document.querySelector("#droppedFileCount");
 const prepDictationButton = document.querySelector("#prepDictation");
 const prepSummary = document.querySelector("#prepSummary");
+const meetingSeriesChoice = document.querySelector("#meetingSeriesChoice");
+const meetingSeriesDetail = document.querySelector("#meetingSeriesDetail");
+const refreshMeetingSeriesButton = document.querySelector("#refreshMeetingSeries");
 const feedbackRow = document.querySelector("#feedbackRow");
 const newMeetingButton = document.querySelector("#newMeeting");
 const reviewScreen = document.querySelector(".review-screen");
@@ -47,6 +50,11 @@ const reviewStatus = document.querySelector("#reviewStatus");
 const postMeetingSummary = document.querySelector("#postMeetingSummary");
 const postMeetingTranscript = document.querySelector("#postMeetingTranscript");
 const downloadState = document.querySelector("#downloadState");
+const historySeriesTarget = document.querySelector("#historySeriesTarget");
+const historySeriesTitle = document.querySelector("#historySeriesTitle");
+const historyAllowAiContext = document.querySelector("#historyAllowAiContext");
+const saveMeetingHistoryButton = document.querySelector("#saveMeetingHistory");
+const historySaveState = document.querySelector("#historySaveState");
 const downloadButtons = document.querySelectorAll("[data-download-format]");
 const downloadErrorLogButton = document.querySelector("#downloadErrorLog");
 const textProviderName = document.querySelector("#textProviderName");
@@ -69,6 +77,7 @@ const sttDownloadProgressFill = document.querySelector("#sttDownloadProgress spa
 const TEXT_PROVIDER_STORAGE_KEY = "meetingCopilot.textProvider";
 const LEGACY_AI_STORAGE_KEY = "meetingCopilot.aiEnabled";
 const LOCAL_STT_PROFILE_STORAGE_KEY = "meetingCopilot.localSttProfile";
+const DEFAULT_MEETING_TITLE = "即時會議";
 const TEXT_PROVIDERS = {
   "codex-chatgpt-oauth": {
     label: "Codex CLI",
@@ -124,6 +133,8 @@ let postMeetingAiSummaryStarted = false;
 let activeCaptureSource;
 let selectedTextProviderId = readTextProviderPreference();
 let selectedLocalSttProfileId = readLocalSttProfilePreference();
+let meetingSeriesOptions = [];
+let selectedMeetingSeriesId = "";
 let localSttStatus;
 let localSttDownloadState;
 let sttFolderMessageTimer;
@@ -167,6 +178,7 @@ setupController.install();
 installOpacityControl();
 installLocalSttDownloadListener();
 refreshPlatformShellPlan();
+loadMeetingSeriesOptions();
 refreshTextProviderStatus();
 refreshLocalSttStatus("startup");
 refreshNativeAudioReadiness("startup");
@@ -180,6 +192,14 @@ captureSource?.addEventListener("change", () => {
 });
 sttProfileChoice?.addEventListener("change", () => {
   setSelectedLocalSttProfile(sttProfileChoice.value);
+});
+meetingSeriesChoice?.addEventListener("change", () => {
+  selectedMeetingSeriesId = meetingSeriesChoice.value;
+  applySelectedMeetingSeriesContext();
+  renderHistorySaveControls();
+});
+refreshMeetingSeriesButton?.addEventListener("click", () => {
+  loadMeetingSeriesOptions({ forceStatus: true });
 });
 downloadSttModelButton?.addEventListener("click", () => {
   downloadSelectedLocalSttModel();
@@ -334,6 +354,12 @@ for (const button of downloadButtons) {
 downloadErrorLogButton?.addEventListener("click", () => {
   downloadErrorLog();
 });
+historySeriesTarget?.addEventListener("change", () => {
+  syncHistorySeriesTitleInput();
+});
+saveMeetingHistoryButton?.addEventListener("click", () => {
+  saveCurrentMeetingHistory();
+});
 openAudioPermissionsButton?.addEventListener("click", () => {
   openScreenRecordingSettings("manual_button");
 });
@@ -378,6 +404,85 @@ copyTextProviderInstallCommandButton?.addEventListener("click", async () => {
 refreshTextProviderStatusButton?.addEventListener("click", () => {
   refreshTextProviderStatus({ forceRefresh: true });
 });
+
+async function loadMeetingSeriesOptions({ forceStatus = false } = {}) {
+  if (!meetingSeriesChoice) return;
+  if (!nativeInvoke) {
+    meetingSeriesOptions = [];
+    renderMeetingSeriesChoices();
+    meetingSeriesDetail.textContent = "會議脈絡需要使用桌面 app；目前會以臨時會議開始。";
+    return;
+  }
+  if (refreshMeetingSeriesButton) refreshMeetingSeriesButton.disabled = true;
+  if (forceStatus && meetingSeriesDetail) meetingSeriesDetail.textContent = "正在讀取已保存的會議脈絡。";
+  try {
+    meetingSeriesOptions = await nativeInvoke("list_meeting_series_command");
+  } catch (error) {
+    logAppError("history.list_meeting_series", error, {}, "warning");
+    meetingSeriesOptions = [];
+    if (meetingSeriesDetail) meetingSeriesDetail.textContent = `無法讀取會議脈絡：${formatError(error)}`;
+  }
+  renderMeetingSeriesChoices();
+  applySelectedMeetingSeriesContext();
+  renderHistorySaveControls();
+  if (refreshMeetingSeriesButton) refreshMeetingSeriesButton.disabled = false;
+}
+
+function renderMeetingSeriesChoices() {
+  if (!meetingSeriesChoice) return;
+  const previous = selectedMeetingSeriesId || meetingSeriesChoice.value;
+  meetingSeriesChoice.innerHTML = [
+    `<option value="">新增臨時會議</option>`,
+    ...meetingSeriesOptions.map((series) => `<option value="${escapeHtml(series.id)}">${escapeHtml(series.title)}</option>`)
+  ].join("");
+  selectedMeetingSeriesId = meetingSeriesOptions.some((series) => series.id === previous) ? previous : "";
+  meetingSeriesChoice.value = selectedMeetingSeriesId;
+  if (refreshMeetingSeriesButton) refreshMeetingSeriesButton.disabled = false;
+}
+
+function selectedMeetingSeries() {
+  return meetingSeriesOptions.find((series) => series.id === selectedMeetingSeriesId);
+}
+
+function applySelectedMeetingSeriesContext() {
+  const series = selectedMeetingSeries();
+  const context = series ? buildMeetingSeriesPrepContext(series) : "";
+  setupController.setMeetingSeriesContext(context);
+  if (!meetingSeriesDetail) return;
+  if (!series) {
+    meetingSeriesDetail.textContent = meetingSeriesOptions.length > 0
+      ? "未選擇既有會議；本場會以新的臨時會議開始。"
+      : "尚未有保存過的會議脈絡；會後保存後，下次會出現在這裡。";
+    return;
+  }
+  const count = Number(series.historyCount ?? 0);
+  meetingSeriesDetail.textContent = `已選「${series.title}」；會帶入上次摘要與未完成事項。已保存 ${count} 場。`;
+}
+
+function buildMeetingSeriesPrepContext(series) {
+  const context = series.latestContext ?? {};
+  const lines = [`既有會議脈絡：${cleanPromptItem(series.title)}`];
+  const keyPoints = arrayOfStrings(context.keyPoints);
+  const unresolved = arrayOfStrings(context.unresolved);
+  const suggestedActions = arrayOfStrings(context.suggestedActions);
+  const transcriptPreview = Array.isArray(context.transcriptPreview) ? context.transcriptPreview : [];
+  if (keyPoints.length > 0) lines.push(`上次重點：${keyPoints.join("；")}`);
+  if (unresolved.length > 0) lines.push(`上次待確認：${unresolved.join("；")}`);
+  if (suggestedActions.length > 0) lines.push(`上次建議動作：${suggestedActions.join("；")}`);
+  if (transcriptPreview.length > 0) {
+    lines.push(`上次最後片段：${transcriptPreview.map((line) => `${cleanPromptItem(line.speaker ?? "未標記來源")}：${cleanPromptItem(line.text ?? "")}`).join(" / ")}`);
+  }
+  lines.push("請把以上視為舊脈絡，只用來提醒本場要確認，不要假設舊結論仍然成立。");
+  return lines.join("\n");
+}
+
+function arrayOfStrings(value) {
+  return Array.isArray(value) ? value.map(cleanPromptItem).filter(Boolean) : [];
+}
+
+function cleanPromptItem(value) {
+  return String(value ?? "").replace(/[\s；;]+/gu, " ").trim();
+}
 
 async function openSelectedTextProviderInstallGuide() {
   const providerId = selectedTextProviderId;
@@ -1550,6 +1655,7 @@ function setDownloadActionsEnabled(enabled) {
 
 function renderPostMeetingReview() {
   const artifact = buildMeetingArtifact();
+  renderHistorySaveControls(artifact);
   if (!hasReviewContent(artifact)) {
     postMeetingSummary.innerHTML = renderNoReviewInput(artifact);
     postMeetingTranscript.innerHTML = `<p class="empty-line">本場沒有收到逐字稿。</p>`;
@@ -1570,6 +1676,79 @@ function renderPostMeetingReview() {
     : "沒有逐字稿內容；仍可下載 AI 整理。";
   syncReviewDownloadButtons(artifact);
   return artifact;
+}
+
+function renderHistorySaveControls(artifact = buildMeetingArtifact()) {
+  if (!historySeriesTarget || !historySeriesTitle || !historySaveState || !saveMeetingHistoryButton) return;
+  historySeriesTarget.innerHTML = [
+    `<option value="__new__">建立新會議脈絡</option>`,
+    ...meetingSeriesOptions.map((series) => `<option value="${escapeHtml(series.id)}">${escapeHtml(series.title)}</option>`)
+  ].join("");
+  const currentSeries = selectedMeetingSeries();
+  historySeriesTarget.value = currentSeries ? currentSeries.id : "__new__";
+  historySeriesTitle.value = currentSeries?.title ?? inferredHistoryTitle(artifact);
+  syncHistorySeriesTitleInput();
+  const hasContent = hasReviewContent(artifact);
+  saveMeetingHistoryButton.disabled = !hasContent;
+  if (!hasContent) {
+    historySaveState.textContent = "本場沒有可保存內容。";
+  } else if (currentSeries) {
+    historySaveState.textContent = `本場會保存到「${currentSeries.title}」，下次會前可直接選。`;
+  } else {
+    historySaveState.textContent = "保存後，這個會議會出現在下次會前準備的選項。";
+  }
+}
+
+function syncHistorySeriesTitleInput() {
+  if (!historySeriesTarget || !historySeriesTitle) return;
+  const selected = meetingSeriesOptions.find((series) => series.id === historySeriesTarget.value);
+  if (selected) {
+    historySeriesTitle.value = selected.title;
+    historySeriesTitle.disabled = true;
+  } else {
+    historySeriesTitle.disabled = false;
+  }
+}
+
+function inferredHistoryTitle(artifact = buildMeetingArtifact()) {
+  const selected = selectedMeetingSeries();
+  if (selected?.title) return selected.title;
+  const title = artifact.title && artifact.title !== DEFAULT_MEETING_TITLE ? artifact.title : "";
+  return title || "未命名會議";
+}
+
+async function saveCurrentMeetingHistory() {
+  if (!nativeInvoke) {
+    historySaveState.textContent = "保存會議脈絡需要使用桌面 app。";
+    return;
+  }
+  const artifact = buildMeetingArtifact();
+  if (!hasReviewContent(artifact)) {
+    historySaveState.textContent = "本場沒有可保存內容。";
+    return;
+  }
+  saveMeetingHistoryButton.disabled = true;
+  historySaveState.textContent = "正在保存本場會議。";
+  try {
+    const selectedTarget = meetingSeriesOptions.find((series) => series.id === historySeriesTarget?.value);
+    const response = await nativeInvoke("save_meeting_history_command", {
+      request: {
+        sessionId: activeSessionId ?? null,
+        seriesId: selectedTarget?.id ?? null,
+        seriesTitle: selectedTarget?.title ?? historySeriesTitle?.value ?? artifact.title,
+        allowAiContext: Boolean(historyAllowAiContext?.checked),
+        artifact
+      }
+    });
+    selectedMeetingSeriesId = response.series?.id ?? selectedMeetingSeriesId;
+    await loadMeetingSeriesOptions();
+    historySaveState.textContent = `已保存到「${response.series?.title ?? historySeriesTitle?.value ?? "會議脈絡"}」。`;
+  } catch (error) {
+    logAppError("history.save_meeting", error, { sessionId: activeSessionId }, "error");
+    historySaveState.textContent = `保存失敗：${formatError(error)}`;
+  } finally {
+    saveMeetingHistoryButton.disabled = false;
+  }
 }
 
 function renderNoReviewInput(artifact) {
@@ -1654,7 +1833,7 @@ function buildMeetingArtifact() {
   };
   const summary = aiSummaryOverride ?? localSummary;
   return {
-    title: "即時會議",
+    title: DEFAULT_MEETING_TITLE,
     sessionId: activeSessionId ?? "local_review",
     generatedAt: new Date().toISOString(),
     prepContext,
@@ -2050,19 +2229,27 @@ function resetNativeWindowOpacity() {
 }
 
 function createBriefFromSetupContext() {
+  const series = selectedMeetingSeries();
   const context = setupController.combinedPrepContext();
   const contextLine = context ? `會議背景：${context.slice(0, 1400)}` : "未提供會議背景，會議中只依照即時內容判斷。";
+  const title = series?.title ?? DEFAULT_MEETING_TITLE;
   return {
     sessionId: makeClientId("native"),
     projectId: "live_default_project",
     meetingType: "live_decision_copilot",
-    title: "即時會議",
-    goal: context
-      ? `依據會議背景追蹤會議決策：${context.slice(0, 160)}`
+    title,
+    goal: series
+      ? `延續「${series.title}」追蹤本場會議決策，確認舊脈絡是否仍成立`
+      : context
+        ? `依據會議背景追蹤會議決策：${context.slice(0, 160)}`
       : "即時追蹤會議決策，避免在 owner、deadline、驗收標準不清楚時承諾 scope",
     mustConfirm: ["owner", "deadline", "驗收標準", "rollback plan"],
     risks: ["未定義 owner/deadline 就做承諾", "demo scope 和正式版 scope 混在一起"],
-    constraints: ["先確認決策條件再承諾交付", contextLine],
+    constraints: [
+      "先確認決策條件再承諾交付",
+      series ? `本場選用既有會議脈絡：${series.title}` : "本場未選用既有會議脈絡",
+      contextLine
+    ],
     knownParticipants: [],
     preferredTone: "direct",
     startedAt: new Date().toISOString()

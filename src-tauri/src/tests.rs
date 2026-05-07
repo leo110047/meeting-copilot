@@ -12,15 +12,16 @@ use crate::decision_logic::{
 };
 use crate::desktop_types::{
     AiTranscriptLine, AppErrorLogRecord, HelperTranscriptLine, LiveDecisionStatePatch,
-    LiveMeetingStatePatch, LiveStatePatchEnvelope, NativeLiveSession, TranscriptCleanupRequest,
-    TranscriptEvent, TranscriptRevisionRequest,
+    LiveMeetingStatePatch, LiveStatePatchEnvelope, NativeLiveSession, SaveMeetingHistoryRequest,
+    TranscriptCleanupRequest, TranscriptEvent, TranscriptRevisionRequest,
 };
 use crate::local_stt::{
     is_local_whisper_profile, local_stt_profiles, normalize_local_stt_profile_id,
 };
 use crate::macos_speech_bridge::audio_diagnostic_severity;
 use crate::native_storage::{
-    insert_app_error_log, insert_session, list_app_error_logs, record_session_text_provider,
+    insert_app_error_log, insert_session, list_app_error_logs, list_meeting_series,
+    record_session_text_provider, save_meeting_history,
 };
 #[cfg(not(target_os = "windows"))]
 use crate::oauth_provider::codex_unix_fallback_candidates;
@@ -664,6 +665,64 @@ fn session_disclosure_records_provider_switch_history() {
             .len(),
         2
     );
+}
+
+#[test]
+fn meeting_history_save_creates_reusable_series_context() {
+    let db_path = std::env::temp_dir().join(format!("meeting-copilot-history-{}.db", now_ms()));
+    let conn = open_db(&db_path).expect("open temp db");
+    let response = save_meeting_history(
+        &conn,
+        SaveMeetingHistoryRequest {
+            session_id: Some("session-history".to_string()),
+            series_id: None,
+            series_title: Some("每週產品同步".to_string()),
+            allow_ai_context: true,
+            artifact: serde_json::json!({
+                "title": "每週產品同步",
+                "summary": {
+                    "keyPoints": ["Demo scope needs confirmation"],
+                    "decisionsAndOpenQuestions": ["誰負責 rollback plan？"],
+                    "suggestedActions": ["下次先確認 owner"]
+                },
+                "transcript": [
+                    { "speaker": "對方 A", "text": "我們下週再確認 owner" }
+                ]
+            }),
+        },
+    )
+    .expect("save meeting history");
+    save_meeting_history(
+        &conn,
+        SaveMeetingHistoryRequest {
+            session_id: Some("session-private".to_string()),
+            series_id: Some(response.series.id.clone()),
+            series_title: Some("每週產品同步".to_string()),
+            allow_ai_context: false,
+            artifact: serde_json::json!({
+                "title": "每週產品同步",
+                "summary": {
+                    "keyPoints": ["這場不要更新 future context"],
+                    "decisionsAndOpenQuestions": [],
+                    "suggestedActions": []
+                },
+                "transcript": []
+            }),
+        },
+    )
+    .expect("save private meeting history");
+    let series = list_meeting_series(&conn).expect("list meeting series");
+    assert_eq!(response.series.title, "每週產品同步");
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].history_count, 2);
+    assert!(series[0].last_saved_at.contains('T'));
+    assert!(series[0].last_saved_at.ends_with('Z'));
+    assert_eq!(
+        series[0].latest_context["keyPoints"][0],
+        "Demo scope needs confirmation"
+    );
+    drop(conn);
+    let _ = fs::remove_file(db_path);
 }
 
 #[test]

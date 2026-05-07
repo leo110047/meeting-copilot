@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeDatabase, executeSql, migrate } from "./sqlite.mjs";
+import { closeDatabase, executeSql, migrate, queryRows, runTransaction } from "./sqlite.mjs";
 
 export class SessionRepository {
   constructor(dbPath) {
@@ -96,6 +96,89 @@ export class SessionRepository {
     ]);
   }
 
+  saveMeetingHistory({ id, sessionId, seriesId, seriesTitle, artifact, allowAiContext = true, createdAt = new Date().toISOString() }) {
+    return runTransaction(this.dbPath, (db) => {
+      const requestedTitle = normalizedTitle(seriesTitle ?? artifact?.title ?? "未命名會議");
+      const resolved = resolveMeetingSeriesIdentity(db, { seriesId, title: requestedTitle });
+      const entryId = id ?? `history_${stableId(`${resolved.id}:${sessionId ?? "local"}:${createdAt}`)}`;
+      const latestContext = allowAiContext
+        ? buildLatestContext({ entryId, sessionId, title: resolved.title, artifact, createdAt })
+        : {};
+      if (resolved.exists) {
+        db.prepare(`
+          UPDATE meeting_series
+          SET
+            summary = CASE WHEN ? = 1 THEN ? ELSE summary END,
+            latest_context_json = CASE WHEN ? = 1 THEN ? ELSE latest_context_json END,
+            updated_at = ?,
+            archived_at = NULL
+          WHERE id = ?;
+        `).run(
+          allowAiContext ? 1 : 0,
+          latestContext.summaryText ?? "",
+          allowAiContext ? 1 : 0,
+          JSON.stringify(latestContext),
+          createdAt,
+          resolved.id
+        );
+      } else {
+        db.prepare(`
+          INSERT INTO meeting_series (id, title, summary, latest_context_json, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?);
+        `).run(
+          resolved.id,
+          resolved.title,
+          latestContext.summaryText ?? "",
+          JSON.stringify(latestContext),
+          createdAt,
+          createdAt
+        );
+      }
+      db.prepare(`
+        INSERT OR REPLACE INTO meeting_history_entries (
+          id, series_id, session_id, title, artifact_json, allow_ai_context, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?);
+      `).run(
+        entryId,
+        resolved.id,
+        sessionId ?? null,
+        resolved.title,
+        JSON.stringify(artifact ?? {}),
+        allowAiContext ? 1 : 0,
+        createdAt
+      );
+      return {
+        entryId,
+        series: readMeetingSeriesById(db, resolved.id)
+      };
+    });
+  }
+
+  listMeetingSeries() {
+    const rows = queryRows(this.dbPath, `
+      SELECT
+        s.id,
+        s.title,
+        s.summary,
+        s.latest_context_json,
+        s.updated_at,
+        COUNT(h.id) AS history_count
+      FROM meeting_series s
+      LEFT JOIN meeting_history_entries h ON h.series_id = s.id
+      WHERE s.archived_at IS NULL
+      GROUP BY s.id
+      ORDER BY s.updated_at DESC, s.title ASC;
+    `);
+    return rows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      summary: row.summary ?? "",
+      latestContext: parseJsonObject(row.latest_context_json),
+      lastSavedAt: row.updated_at,
+      historyCount: Number(row.history_count ?? 0)
+    }));
+  }
+
   saveAppErrorLog({ id, sessionId, stage, source, severity = "error", message, detail = {}, createdAt = new Date().toISOString() }) {
     executeSql(this.dbPath, `
       INSERT INTO app_error_logs (
@@ -121,4 +204,93 @@ export class SessionRepository {
 function numberOrNull(value) {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return null;
   return Number(value);
+}
+
+function normalizedTitle(value) {
+  const title = String(value ?? "").trim();
+  return [...(title || "未命名會議")].slice(0, 120).join("");
+}
+
+function stableId(value) {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(String(value))) {
+    hash ^= BigInt(byte);
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+function parseJsonObject(text) {
+  try {
+    const value = JSON.parse(text || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function buildLatestContext({ entryId, sessionId, title, artifact, createdAt }) {
+  const summary = artifact?.summary ?? {};
+  const transcript = Array.isArray(artifact?.transcript) ? artifact.transcript : [];
+  const keyPoints = limitedStringArray(summary.keyPoints, 6);
+  const unresolved = limitedStringArray(summary.decisionsAndOpenQuestions, 6);
+  const suggestedActions = limitedStringArray(summary.suggestedActions, 6);
+  return {
+    entryId,
+    sessionId: sessionId ?? null,
+    title,
+    updatedAt: createdAt,
+    summaryText: keyPoints.slice(0, 2).join("；"),
+    keyPoints,
+    unresolved,
+    suggestedActions,
+    transcriptPreview: transcript.slice(-6).map((line) => ({
+      speaker: normalizedContextText(line.speaker ?? "未標記來源"),
+      text: normalizedContextText(line.text ?? "")
+    })).filter((line) => line.text)
+  };
+}
+
+function resolveMeetingSeriesIdentity(db, { seriesId, title }) {
+  const requestedId = String(seriesId ?? "").trim();
+  if (requestedId) {
+    const byId = db.prepare("SELECT id, title FROM meeting_series WHERE id = ?;").get(requestedId);
+    if (byId) return { id: byId.id, title: byId.title, exists: true };
+  }
+  const byTitle = db.prepare("SELECT id, title FROM meeting_series WHERE title = ?;").get(title);
+  if (byTitle) return { id: byTitle.id, title: byTitle.title, exists: true };
+  return { id: requestedId || `series_${stableId(title)}`, title, exists: false };
+}
+
+function readMeetingSeriesById(db, id) {
+  const row = db.prepare(`
+    SELECT
+      s.id,
+      s.title,
+      s.summary,
+      s.latest_context_json,
+      s.updated_at,
+      (SELECT COUNT(*) FROM meeting_history_entries h WHERE h.series_id = s.id) AS history_count
+    FROM meeting_series s
+    WHERE s.id = ? AND s.archived_at IS NULL;
+  `).get(id);
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    title: row.title,
+    summary: row.summary ?? "",
+    latestContext: parseJsonObject(row.latest_context_json),
+    lastSavedAt: row.updated_at,
+    historyCount: Number(row.history_count ?? 0)
+  };
+}
+
+function limitedStringArray(value, limit) {
+  return Array.isArray(value)
+    ? value.map(normalizedContextText).filter(Boolean).slice(0, limit)
+    : [];
+}
+
+function normalizedContextText(value) {
+  return String(value ?? "").replace(/\s+/gu, " ").trim();
 }

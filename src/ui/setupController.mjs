@@ -19,6 +19,7 @@ export function createSetupController({
   let prepSummaryRequestId = 0;
   let prepSummaryInFlight = false;
   let prepSummaryQueued = false;
+  let meetingSeriesContext = "";
 
   const {
     setupContext,
@@ -232,11 +233,18 @@ export function createSetupController({
   }
 
   function combinedPrepContext() {
+    const series = meetingSeriesContext.trim();
     const typed = setupContext.value.trim();
     const files = droppedContextChunks
       .map((chunk) => `檔案 ${chunk.name}${chunk.truncated ? "（已截斷）" : ""}\n${chunk.text}`)
       .join("\n\n");
-    return [typed, files].filter(Boolean).join("\n\n").trim();
+    return [series, typed, files].filter(Boolean).join("\n\n").trim();
+  }
+
+  function setMeetingSeriesContext(context) {
+    meetingSeriesContext = String(context ?? "").trim();
+    renderPrepSummary();
+    schedulePrepSummaryGeneration();
   }
 
   function contextDiagnostics() {
@@ -316,6 +324,7 @@ export function createSetupController({
     install,
     combinedPrepContext,
     contextDiagnostics,
+    setMeetingSeriesContext,
     renderPrepSummary,
     resetPrepSummaryQueue,
     schedulePrepSummaryGeneration,

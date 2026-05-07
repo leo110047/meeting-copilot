@@ -230,6 +230,13 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(desktopShellSource, /app_error_logs/);
   assert.match(desktopShellSource, /log_app_error/);
   assert.match(desktopShellSource, /export_app_error_logs/);
+  assert.match(desktopShellSource, /list_meeting_series_command/);
+  assert.match(desktopShellSource, /save_meeting_history_command/);
+  assert.match(desktopShellSource, /SaveMeetingHistoryRequest/);
+  assert.match(desktopShellSource, /MeetingSeriesOption/);
+  assert.match(desktopShellSource, /meeting_series/);
+  assert.match(desktopShellSource, /meeting_history_entries/);
+  assert.match(shellStorage, /pragma_update\(None, "foreign_keys", "ON"\)/);
   assert.match(desktopShellSource, /log_app_error_inner/);
   assert.match(desktopShellSource, /read_dropped_context_file/);
   assert.match(desktopShellSource, /set_window_opacity/);

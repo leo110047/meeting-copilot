@@ -42,6 +42,13 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(html, /setupAudioReadiness/);
   assert.match(html, /setupAudioPermissions/);
   assert.match(html, /開啟螢幕與系統錄音/);
+  assert.match(html, /meetingSeriesChoice/);
+  assert.match(html, /這場是哪個會議/);
+  assert.match(html, /新增臨時會議/);
+  assert.match(html, /保存到會議脈絡/);
+  assert.match(html, /historySeriesTarget/);
+  assert.match(html, /historyAllowAiContext/);
+  assert.match(html, /saveMeetingHistory/);
   assert.match(html, /會前/);
   assert.match(html, /背景/);
   assert.match(html, /檔案/);
@@ -112,6 +119,7 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(css, /\.listening-status/);
   assert.match(css, /\.permission-action/);
   assert.match(css, /\.setup-audio-readiness/);
+  assert.match(css, /\.meeting-series-panel/);
   assert.match(css, /\.stt-settings/);
   assert.match(css, /\.stt-settings\.warning/);
   assert.match(css, /\.status-dot\.warning/);
@@ -119,6 +127,7 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(css, /\.prep-layout/);
   assert.match(css, /\.context-dropzone/);
   assert.match(css, /\.primary-export/);
+  assert.match(css, /\.history-save-panel/);
   assert.match(css, /\.secondary-export/);
   assert.match(css, /\.evidence-disclosure/);
   assert.match(css, /\.review-status/);
@@ -126,6 +135,14 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(css, /@keyframes processing-sweep/);
 
   assert.match(js, /initializeSetupState\(\)/);
+  assert.match(js, /loadMeetingSeriesOptions/);
+  assert.match(js, /list_meeting_series_command/);
+  assert.match(js, /save_meeting_history_command/);
+  assert.match(js, /buildMeetingSeriesPrepContext/);
+  assert.match(js, /projectId: "live_default_project"/);
+  assert.doesNotMatch(js, /projectId: series\?\.id/);
+  assert.doesNotMatch(js, /sourceSeriesId/);
+  assert.match(js, /不要假設舊結論仍然成立/);
   assert.match(js, /refreshPlatformShellPlan/);
   assert.match(js, /applyPlatformCaptureAvailability/);
   assert.match(js, /option\[value="mixed"\]/);

@@ -121,6 +121,8 @@ pub(crate) fn open_db(db_path: &PathBuf) -> Result<Connection, String> {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|error| error.to_string())?;
     conn.execute_batch(SCHEMA_SQL)
         .map_err(|error| error.to_string())?;
     ensure_column(

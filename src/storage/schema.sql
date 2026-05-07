@@ -156,6 +156,30 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   reviewed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS meeting_series (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL UNIQUE CHECK(length(title) <= 120),
+  summary TEXT NOT NULL DEFAULT '',
+  latest_context_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  archived_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS meeting_history_entries (
+  id TEXT PRIMARY KEY,
+  series_id TEXT,
+  session_id TEXT,
+  title TEXT NOT NULL,
+  artifact_json TEXT NOT NULL,
+  allow_ai_context INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (series_id) REFERENCES meeting_series(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_meeting_history_series
+  ON meeting_history_entries(series_id);
+
 CREATE TABLE IF NOT EXISTS political_signals (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,

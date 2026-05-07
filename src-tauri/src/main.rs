@@ -100,6 +100,8 @@ fn main() {
             commands_core::cleanup_transcript_text_oauth,
             commands_core::log_app_error,
             commands_core::export_app_error_logs,
+            commands_core::list_meeting_series_command,
+            commands_core::save_meeting_history_command,
             commands_core::extract_live_state_patch_oauth,
             commands_core::set_window_opacity,
             commands_audio::start_prep_dictation,

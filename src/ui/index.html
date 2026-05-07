@@ -53,6 +53,20 @@
           <button id="setupAudioPermissions" type="button">開啟螢幕與系統錄音</button>
         </section>
 
+        <section class="meeting-series-panel" aria-label="選擇會議脈絡">
+          <div>
+            <p class="section-kicker">會議脈絡</p>
+            <h2>這場是哪個會議？</h2>
+            <small id="meetingSeriesDetail">可選擇之前保存過的固定會議；未選時會以臨時會議開始。</small>
+          </div>
+          <div class="meeting-series-controls">
+            <select id="meetingSeriesChoice" aria-label="會前會議脈絡">
+              <option value="">新增臨時會議</option>
+            </select>
+            <button id="refreshMeetingSeries" type="button">重新整理</button>
+          </div>
+        </section>
+
         <section class="stt-settings" aria-label="語音轉文字設定">
           <div class="status-dot" aria-hidden="true"></div>
           <div>
@@ -190,6 +204,31 @@
             <div id="postMeetingTranscript" class="post-transcript"></div>
           </section>
         </div>
+
+        <section class="history-save-panel" aria-label="保存到會議脈絡">
+          <div>
+            <p class="section-kicker">保存</p>
+            <h2>保存到會議脈絡</h2>
+            <small id="historySaveState">保存後，這個會議會出現在下次會前準備的選項。</small>
+          </div>
+          <div class="history-save-controls">
+            <label for="historySeriesTarget">
+              <span>歸到</span>
+              <select id="historySeriesTarget">
+                <option value="__new__">建立新會議脈絡</option>
+              </select>
+            </label>
+            <label for="historySeriesTitle">
+              <span>名稱</span>
+              <input id="historySeriesTitle" type="text" maxlength="120" placeholder="例如：每週產品同步" />
+            </label>
+            <label class="history-context-toggle" for="historyAllowAiContext">
+              <input id="historyAllowAiContext" type="checkbox" checked />
+              <span>下次可作為 AI 背景</span>
+            </label>
+            <button id="saveMeetingHistory" class="primary-export" type="button">保存本場</button>
+          </div>
+        </section>
 
         <section class="export-panel" aria-label="下載會議記錄">
           <div>

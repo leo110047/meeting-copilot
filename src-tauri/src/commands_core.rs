@@ -6,11 +6,12 @@ use crate::decision_logic::{
 use crate::desktop_types::desktop_shell_plan;
 use crate::desktop_types::{
     AiSummaryRequest, AiSummaryResponse, AppErrorLogInput, AppErrorLogRecord, DesktopShellPlan,
-    DroppedContextFile, IngestTranscriptResponse, LocalSttStatus, NativeLiveSession,
-    NativeTranscriberHealth, NativeTranscriberHealthRequest, PersistedSummary, PrepSummaryRequest,
-    PrepSummaryResponse, StartSessionRequest, StartSessionResponse, TextProviderStatus,
-    TranscriptCleanupRequest, TranscriptCleanupResponse, TranscriptInput,
-    TranscriptRevisionRequest, TranscriptRevisionResponse,
+    DroppedContextFile, IngestTranscriptResponse, LocalSttStatus, MeetingSeriesOption,
+    NativeLiveSession, NativeTranscriberHealth, NativeTranscriberHealthRequest, PersistedSummary,
+    PrepSummaryRequest, PrepSummaryResponse, SaveMeetingHistoryRequest, SaveMeetingHistoryResponse,
+    StartSessionRequest, StartSessionResponse, TextProviderStatus, TranscriptCleanupRequest,
+    TranscriptCleanupResponse, TranscriptInput, TranscriptRevisionRequest,
+    TranscriptRevisionResponse,
 };
 use crate::local_stt::{
     download_local_stt_model, is_local_whisper_profile, local_stt_model_directory,
@@ -19,9 +20,10 @@ use crate::local_stt::{
 };
 use crate::native_storage::{
     LlmUsageLogInput, insert_decision_snapshot_with_source, insert_llm_usage_log, insert_session,
-    insert_suggestion, list_app_error_logs, log_app_error_inner, log_extraction_failure_for,
-    log_provider_failure_for, log_provider_usage_for, native_speech_helper_path,
-    native_speech_provider_id, record_session_text_provider, run_native_transcriber_health_check,
+    insert_suggestion, list_app_error_logs, list_meeting_series, log_app_error_inner,
+    log_extraction_failure_for, log_provider_failure_for, log_provider_usage_for,
+    native_speech_helper_path, native_speech_provider_id, record_session_text_provider,
+    run_native_transcriber_health_check, save_meeting_history,
 };
 use crate::oauth_provider::{
     build_ai_summary_prompt, build_live_state_patch_prompt, build_prep_summary_prompt,
@@ -721,6 +723,22 @@ pub(crate) fn export_app_error_logs(
     let db_path = app_db_path()?;
     let conn = open_db(&db_path)?;
     list_app_error_logs(&conn, session_id.as_deref())
+}
+
+#[tauri::command]
+pub(crate) fn list_meeting_series_command() -> Result<Vec<MeetingSeriesOption>, String> {
+    let db_path = app_db_path()?;
+    let conn = open_db(&db_path)?;
+    list_meeting_series(&conn)
+}
+
+#[tauri::command]
+pub(crate) fn save_meeting_history_command(
+    request: SaveMeetingHistoryRequest,
+) -> Result<SaveMeetingHistoryResponse, String> {
+    let db_path = app_db_path()?;
+    let conn = open_db(&db_path)?;
+    save_meeting_history(&conn, request)
 }
 
 #[tauri::command]

@@ -38,6 +38,15 @@ export function queryScalar(dbPath, sql, params = []) {
   return value === null || value === undefined ? "" : String(value);
 }
 
+export function queryRows(dbPath, sql, params = []) {
+  return database(dbPath).prepare(sql).all(...params);
+}
+
+export function runTransaction(dbPath, callback) {
+  const db = database(dbPath);
+  return db.transaction(() => callback(db))();
+}
+
 export function closeDatabase(dbPath) {
   const absoluteDb = resolve(dbPath);
   const db = openDatabases.get(absoluteDb);
@@ -69,6 +78,7 @@ function database(dbPath) {
   if (!db) {
     mkdirSync(dirname(absoluteDb), { recursive: true });
     db = new Database(absoluteDb);
+    db.pragma("foreign_keys = ON");
     openDatabases.set(absoluteDb, db);
   }
   return db;
