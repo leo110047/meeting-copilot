@@ -330,6 +330,10 @@ namespace MeetingCopilot {{
 
   public static class WhisperLoop {{
     private const int ChunkBytes = 16000 * 2 * 3;
+    private const int MaxDeferredPostMeetingChunks = 1200;
+    private const int PostMeetingMillisecondsPerChunk = 8000;
+    private const int MinPostMeetingStopTimeoutMs = 30000;
+    private const int MaxPostMeetingStopTimeoutMs = 1800000;
 
     public static void Run(string language, string source, string runner, string model, string stopFile, EDataFlow dataFlow, bool loopback) {{
       var lanes = source == "mixed"
@@ -342,6 +346,7 @@ namespace MeetingCopilot {{
       var whisper = new PersistentWhisperRunner(runner, model);
       var started = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
       var chunkIndex = 0;
+      var postMeetingChunkIndex = 0;
       while (true) {{
         var stopRequested = !String.IsNullOrWhiteSpace(stopFile) && File.Exists(stopFile);
         foreach (var lane in lanes) {{
@@ -352,8 +357,17 @@ namespace MeetingCopilot {{
             lane.Pending.RemoveRange(0, ChunkBytes);
             var chunkStarted = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - started - (long)(ready.Length / 2.0 / 16000.0 * 1000.0);
             var chunkEnded = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - started;
-            chunkIndex++;
-            whisper.TranscribeChunk(language, lane.Source, ready, chunkIndex, Math.Max(0, chunkStarted), Math.Max(0, chunkEnded));
+            if (source == "mixed" && lane.Source == "mic") {{
+              if (whisper.CanDeferChunk()) {{
+                postMeetingChunkIndex++;
+                whisper.DeferChunk(language, lane.Source, ready, postMeetingChunkIndex, Math.Max(0, chunkStarted), Math.Max(0, chunkEnded));
+              }} else {{
+                whisper.ReportDeferredChunkDropped();
+              }}
+            }} else {{
+              chunkIndex++;
+              whisper.TranscribeChunk(language, lane.Source, ready, chunkIndex, Math.Max(0, chunkStarted), Math.Max(0, chunkEnded));
+            }}
           }}
         }}
         if (!stopRequested && !lanes.All(lane => lane.Completed)) {{
@@ -366,12 +380,22 @@ namespace MeetingCopilot {{
               lane.Pending.Clear();
               var chunkStarted = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - started - (long)(ready.Length / 2.0 / 16000.0 * 1000.0);
               var chunkEnded = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - started;
-              chunkIndex++;
-              whisper.TranscribeChunk(language, lane.Source, ready, chunkIndex, Math.Max(0, chunkStarted), Math.Max(0, chunkEnded));
+              if (source == "mixed" && lane.Source == "mic") {{
+                if (whisper.CanDeferChunk()) {{
+                  postMeetingChunkIndex++;
+                  whisper.DeferChunk(language, lane.Source, ready, postMeetingChunkIndex, Math.Max(0, chunkStarted), Math.Max(0, chunkEnded));
+                }} else {{
+                  whisper.ReportDeferredChunkDropped();
+                }}
+              }} else {{
+                chunkIndex++;
+                whisper.TranscribeChunk(language, lane.Source, ready, chunkIndex, Math.Max(0, chunkStarted), Math.Max(0, chunkEnded));
+              }}
             }}
             lane.Stop();
           }}
-          whisper.Close();
+          var postMeetingJobs = whisper.TranscribeDeferred();
+          whisper.Close(postMeetingJobs);
           return;
         }}
       }}
@@ -411,8 +435,11 @@ namespace MeetingCopilot {{
 
     public sealed class PersistentWhisperRunner {{
       private readonly Process process;
+      private readonly List<DeferredWhisperJob> deferred = new List<DeferredWhisperJob>();
+      private bool deferredDropReported = false;
 
       public PersistentWhisperRunner(string runner, string model) {{
+        SweepStalePostMeetingFiles();
         process = new Process();
         process.StartInfo.FileName = runner;
         process.StartInfo.UseShellExecute = false;
@@ -429,19 +456,63 @@ namespace MeetingCopilot {{
         var path = Path.Combine(Path.GetTempPath(), "meeting-copilot-whisper-" + Process.GetCurrentProcess().Id + "-" + source + "-" + index + ".wav");
         try {{
           WriteWav(path, pcm);
-          process.StandardInput.WriteLine("{{\"file\":\"" + JsonEscape(path) + "\",\"language\":\"" + JsonEscape(language) + "\",\"source\":\"" + JsonEscape(source) + "\",\"route\":\"" + JsonEscape(source) + "\",\"startedAtMs\":" + startedAtMs.ToString(CultureInfo.InvariantCulture) + ",\"endedAtMs\":" + endedAtMs.ToString(CultureInfo.InvariantCulture) + "}}");
-          process.StandardInput.Flush();
+          SendJob(new DeferredWhisperJob(path, language, source, source, startedAtMs, endedAtMs));
         }} catch (Exception error) {{
           Console.Error.WriteLine("Whisper chunk transcription failed: " + error.Message);
         }}
       }}
 
-      public void Close() {{
+      public bool CanDeferChunk() {{
+        return deferred.Count < MaxDeferredPostMeetingChunks;
+      }}
+
+      public void ReportDeferredChunkDropped() {{
+        if (!deferredDropReported) {{
+          Console.Error.WriteLine("Whisper post-meeting chunk dropped: deferred mic cap reached");
+          deferredDropReported = true;
+        }}
+      }}
+
+      public void DeferChunk(string language, string source, byte[] pcm, int index, long startedAtMs, long endedAtMs) {{
+        var path = Path.Combine(Path.GetTempPath(), "meeting-copilot-whisper-" + Process.GetCurrentProcess().Id + "-post-meeting-" + source + "-" + index + ".wav");
+        try {{
+          WriteWav(path, pcm);
+          deferred.Add(new DeferredWhisperJob(path, language, source, "post_meeting_" + source, startedAtMs, endedAtMs));
+        }} catch (Exception error) {{
+          Console.Error.WriteLine("Whisper post-meeting chunk buffering failed: " + error.Message);
+        }}
+      }}
+
+      public int TranscribeDeferred() {{
+        var dispatched = 0;
+        foreach (var job in deferred) {{
+          try {{
+            SendJob(job);
+            dispatched++;
+          }} catch (Exception error) {{
+            try {{ File.Delete(job.Path); }} catch {{ }}
+            Console.Error.WriteLine("Whisper post-meeting chunk transcription failed: " + error.Message);
+          }}
+        }}
+        return dispatched;
+      }}
+
+      public void Close(int postMeetingJobCount) {{
         try {{ process.StandardInput.Close(); }} catch {{ }}
-        if (!process.WaitForExit(10000)) {{
+        var timeoutMs = postMeetingJobCount > 0
+          ? Math.Min(MaxPostMeetingStopTimeoutMs, Math.Max(MinPostMeetingStopTimeoutMs, postMeetingJobCount * PostMeetingMillisecondsPerChunk))
+          : 10000;
+        if (!process.WaitForExit(timeoutMs)) {{
           try {{ process.Kill(); }} catch {{ }}
           process.WaitForExit();
         }}
+        CleanupDeferredFiles();
+        deferred.Clear();
+      }}
+
+      private void SendJob(DeferredWhisperJob job) {{
+        process.StandardInput.WriteLine("{{\"file\":\"" + JsonEscape(job.Path) + "\",\"language\":\"" + JsonEscape(job.Language) + "\",\"source\":\"" + JsonEscape(job.Source) + "\",\"route\":\"" + JsonEscape(job.Route) + "\",\"startedAtMs\":" + job.StartedAtMs.ToString(CultureInfo.InvariantCulture) + ",\"endedAtMs\":" + job.EndedAtMs.ToString(CultureInfo.InvariantCulture) + "}}");
+        process.StandardInput.Flush();
       }}
 
       private static void Forward(StreamReader reader, bool error) {{
@@ -454,6 +525,41 @@ namespace MeetingCopilot {{
         }});
         thread.IsBackground = true;
         thread.Start();
+      }}
+
+      private static void SweepStalePostMeetingFiles() {{
+        try {{
+          foreach (var path in Directory.GetFiles(Path.GetTempPath(), "meeting-copilot-whisper-*-post-meeting-*.wav")) {{
+            // Six hours is intentionally wider than normal meetings so concurrent
+            // in-flight post-meeting chunks from another app instance survive.
+            if ((DateTime.UtcNow - File.GetLastWriteTimeUtc(path)).TotalHours < 6) continue;
+            try {{ File.Delete(path); }} catch {{ }}
+          }}
+        }} catch {{ }}
+      }}
+
+      private void CleanupDeferredFiles() {{
+        foreach (var job in deferred) {{
+          try {{ File.Delete(job.Path); }} catch {{ }}
+        }}
+      }}
+
+      private sealed class DeferredWhisperJob {{
+        public string Path {{ get; private set; }}
+        public string Language {{ get; private set; }}
+        public string Source {{ get; private set; }}
+        public string Route {{ get; private set; }}
+        public long StartedAtMs {{ get; private set; }}
+        public long EndedAtMs {{ get; private set; }}
+
+        public DeferredWhisperJob(string path, string language, string source, string route, long startedAtMs, long endedAtMs) {{
+          Path = path;
+          Language = language;
+          Source = source;
+          Route = route;
+          StartedAtMs = startedAtMs;
+          EndedAtMs = endedAtMs;
+        }}
       }}
     }}
 

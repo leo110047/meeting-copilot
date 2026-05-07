@@ -835,6 +835,11 @@ function renderRuntimePayload(payload) {
     }
   }
   if (payload.decisionState) latestDecisionState = payload.decisionState;
+  if (payload.event && document.body.dataset.state === "review") {
+    const artifact = renderPostMeetingReview();
+    reviewStatus.textContent = reviewTranscriptUpdateStatus(payload.event, artifact);
+    return;
+  }
   providerState.textContent = `逐字稿 ${payload.persisted.transcriptEvents} 句｜正在判斷是否需要提醒`;
   if (payload.suggestions.length > 0) {
     const latest = payload.suggestions.at(-1);
@@ -850,6 +855,18 @@ function renderRuntimePayload(payload) {
     suggestion.innerHTML = renderDecisionOverview(payload.decisionState);
     feedbackRow.hidden = true;
   }
+}
+
+function reviewTranscriptUpdateStatus(event, artifact) {
+  const source = event?.source ?? "unknown";
+  if (source === "mic") {
+    const micLines = artifact.rawTranscript.filter((line) => line.source === "mic").length;
+    return activeCaptureSource === "mixed"
+      ? `麥克風後處理已更新逐字稿，目前補上 ${micLines} 段我的發言。`
+      : "我的麥克風逐字稿已更新。";
+  }
+  if (source === "system") return "系統音訊逐字稿已更新。";
+  return "會後逐字稿已更新。";
 }
 
 function renderSuggestionCard(item) {

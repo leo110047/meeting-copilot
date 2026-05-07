@@ -302,6 +302,12 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /waitForReviewPaint/);
   assert.match(js, /const stoppingSessionId = activeSessionId/);
   assert.match(js, /finishNativeStopInBackground/);
+  assert.doesNotMatch(js, /await waitForReviewPaint\(\);\s*finishPostMeetingReview\(sessionId\)/);
+  assert.match(js, /document\.body\.dataset\.state === "review"/);
+  assert.match(js, /reviewTranscriptUpdateStatus/);
+  assert.match(js, /麥克風後處理已更新逐字稿/);
+  assert.match(js, /系統音訊逐字稿已更新/);
+  assert.doesNotMatch(js, /providerState\.textContent = reviewStatus\.textContent/);
   assert.match(js, /allowNewMeeting: false/);
   assert.match(js, /newMeetingButton\.disabled = !allowNewMeeting/);
   assert.match(js, /runAiSummary: false/);

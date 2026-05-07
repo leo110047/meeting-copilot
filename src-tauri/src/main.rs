@@ -28,6 +28,10 @@ pub(crate) struct ManagedNativeTranscriber {
     pub(crate) child: Child,
     pub(crate) stdin: Option<ChildStdin>,
     pub(crate) stop_file: Option<PathBuf>,
+    // True only when the helper can keep working after Stop to finish deferred
+    // mic transcription. Startup cleanup approximates this from mixed+stop_file
+    // because the original runtime profile is no longer available there.
+    pub(crate) may_defer_post_meeting: bool,
 }
 
 pub(crate) static NATIVE_TRANSCRIBERS: OnceLock<Mutex<HashMap<String, ManagedNativeTranscriber>>> =

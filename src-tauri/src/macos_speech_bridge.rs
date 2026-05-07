@@ -526,11 +526,16 @@ pub(crate) fn stop_macos_speech_bridge(
         })
         .cloned()
         .collect::<Vec<_>>();
-    for key in keys {
-        if let Some(session) = bridges.remove(&key) {
-            unsafe {
-                (api.stop)(session.handle);
-            }
+    let sessions = keys
+        .into_iter()
+        .filter_map(|key| bridges.remove(&key))
+        .collect::<Vec<_>>();
+    // Release the bridge registry lock before stop; Whisper bridges may spend
+    // minutes draining deferred post-meeting mic chunks in the background.
+    drop(bridges);
+    for session in sessions {
+        unsafe {
+            (api.stop)(session.handle);
         }
     }
     Ok(())

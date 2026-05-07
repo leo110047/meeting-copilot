@@ -299,6 +299,7 @@ pub(crate) fn start_native_transcription(
                     })?,
                     stdin: process.stdin.take(),
                     stop_file: process.stop_file.take(),
+                    may_defer_post_meeting: process.source == "mixed" && whisper_runtime.is_some(),
                 },
             );
         }
@@ -398,6 +399,7 @@ pub(crate) fn stop_spawned_native_processes(processes: Vec<NativeTranscriberProc
                 child,
                 stdin: process.stdin.take(),
                 stop_file: process.stop_file.take(),
+                may_defer_post_meeting: process.source == "mixed" && process.stop_file.is_some(),
             };
             stop_managed_native_transcriber_background(
                 "startup".to_string(),
@@ -459,7 +461,15 @@ fn finish_managed_native_transcriber(
     transcriber: &mut ManagedNativeTranscriber,
     force_on_timeout: bool,
 ) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    let stop_timeout = if transcriber.may_defer_post_meeting {
+        // Mixed Whisper helpers defer mic transcription after Stop. The helper
+        // enforces its own count-based 30-minute cap; this outer reap timeout
+        // only gives it a small margin to close pipes and exit.
+        Duration::from_secs(31 * 60)
+    } else {
+        Duration::from_secs(35)
+    };
+    let deadline = std::time::Instant::now() + stop_timeout;
     loop {
         match transcriber.child.try_wait() {
             Ok(Some(_)) => break,

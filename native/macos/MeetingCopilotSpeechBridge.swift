@@ -156,6 +156,11 @@ private func audioDiagnosticsEnabled() -> Bool {
     return ["1", "true", "yes"].contains(value.lowercased())
 }
 
+private let maxDeferredPostMeetingChunks = 1_200
+private let postMeetingSecondsPerChunk: TimeInterval = 8
+private let minPostMeetingStopTimeoutSeconds: TimeInterval = 30
+private let maxPostMeetingStopTimeoutSeconds: TimeInterval = 30 * 60
+
 private func hasScreenCaptureAccess() -> Bool {
     if #available(macOS 10.15, *) {
         return CGPreflightScreenCaptureAccess()
@@ -204,6 +209,26 @@ private func requestSpeechAuthorizationSync() -> SFSpeechRecognizerAuthorization
     }
     semaphore.wait()
     return resolved
+}
+
+private func cleanupStalePostMeetingWhisperFiles() {
+    let directory = FileManager.default.temporaryDirectory
+    guard let entries = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey]) else {
+        return
+    }
+    let staleCutoff = Date().addingTimeInterval(-6 * 60 * 60)
+    for url in entries {
+        let name = url.lastPathComponent
+        let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+        // Six hours is intentionally wider than normal meetings so concurrent
+        // in-flight post-meeting chunks from another app instance survive.
+        if name.hasPrefix("meeting-copilot-whisper-")
+            && name.contains("-post-meeting-")
+            && name.hasSuffix(".wav")
+            && modifiedAt < staleCutoff {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
 }
 
 private func stringFromPointer(_ pointer: UnsafePointer<CChar>?, fallback: String) -> String {
@@ -758,7 +783,10 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
     private var stdinPipe: Pipe?
     private let outputGroup = DispatchGroup()
     private var sourceBuffers: [String: WhisperSourceBuffer] = [:]
+    private var deferredPostMeetingJobs: [BridgeWhisperJob] = []
     private var chunkIndex = 0
+    private var postMeetingChunkIndex = 0
+    private var postMeetingDropReported = false
     private var pendingChunkCount = 0
     private var isStopping = false
 
@@ -787,6 +815,7 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
     }
 
     func start() throws {
+        cleanupStalePostMeetingWhisperFiles()
         try startRunner()
         if source == "mixed" {
             try startMixedCapture()
@@ -932,32 +961,41 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
     }
 
     func stop() {
-        let shouldCloseRunner = onCaptureQueue {
-            guard !isStopping else { return false }
+        let deferredJobs: [BridgeWhisperJob] = onCaptureQueue {
+            guard !isStopping else { return [] }
             isStopping = true
             for source in Array(sourceBuffers.keys) {
                 finishResidualBufferLocked(source: source)
             }
-            return true
+            let jobs = deferredPostMeetingJobs
+            deferredPostMeetingJobs.removeAll(keepingCapacity: false)
+            return jobs
         }
         stopAudioInputs()
-        if shouldCloseRunner {
-            transcriptionQueue.async { [self] in
-                closeRunnerInputAndWait(terminate: false)
-            }
+        transcriptionQueue.async { [self] in
+            let dispatchedPostMeetingJobs = drainDeferredPostMeetingJobs(deferredJobs)
+            closeRunnerInputAndWait(
+                terminate: false,
+                timeoutSeconds: gracefulStopTimeoutSeconds(postMeetingJobCount: dispatchedPostMeetingJobs)
+            )
+            cleanupDeferredPostMeetingJobs(deferredJobs)
         }
     }
 
     private func stopSynchronouslyForDeinit() {
-        onCaptureQueue {
-            guard !isStopping else { return }
+        let deferredJobs: [BridgeWhisperJob] = onCaptureQueue {
+            guard !isStopping else { return [] }
             isStopping = true
             for source in Array(sourceBuffers.keys) {
                 finishResidualBufferLocked(source: source)
             }
+            let jobs = deferredPostMeetingJobs
+            deferredPostMeetingJobs.removeAll(keepingCapacity: false)
+            return jobs
         }
+        cleanupDeferredPostMeetingJobs(deferredJobs)
         onTranscriptionQueue {
-            closeRunnerInputAndWait(terminate: true)
+            closeRunnerInputAndWait(terminate: true, timeoutSeconds: 10)
         }
         stopAudioInputs()
     }
@@ -1050,7 +1088,11 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
             let ended = started + Int64(Double(chunk.count) / 16_000.0 * 1000)
             buffer.chunkStartedAtMs = ended
             sourceBuffers[source] = buffer
-            enqueue(chunk: chunk, source: source, startedAtMs: started, endedAtMs: ended)
+            if shouldDeferPostMeetingTranscription(source: source) {
+                deferPostMeetingChunk(chunk: chunk, source: source, startedAtMs: started, endedAtMs: ended)
+            } else {
+                enqueue(chunk: chunk, source: source, startedAtMs: started, endedAtMs: ended)
+            }
             if let latest = sourceBuffers[source] {
                 buffer = latest
             }
@@ -1114,6 +1156,77 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
             pendingChunks: pendingChunks(),
             chunkDurationMs: Double(residualCount) / 16_000.0 * 1000
         ), always: true)
+    }
+
+    private func shouldDeferPostMeetingTranscription(source chunkSource: String) -> Bool {
+        source == "mixed" && chunkSource == "mic"
+    }
+
+    private func deferPostMeetingChunk(chunk: [Int16], source: String, startedAtMs: Int64, endedAtMs: Int64) {
+        let level = whisperAudioLevel(samples: chunk)
+        guard whisperChunkLooksSpeechLike(level) else {
+            if var buffer = sourceBuffers[source] {
+                buffer.droppedSamples += chunk.count
+                sourceBuffers[source] = buffer
+            }
+            emitDiagnostic(BridgeDiagnosticLine(
+                kind: "audio_diagnostic",
+                source: source,
+                code: "local_whisper_post_meeting_silence_dropped",
+                message: String(
+                    format: "local Whisper deferred mic dropped low-energy chunk rms=%.5f peak=%.5f",
+                    level.rms,
+                    level.peak
+                ),
+                rms: level.rms,
+                peak: level.peak,
+                droppedSamples: sourceBuffers[source]?.droppedSamples,
+                chunkDurationMs: Double(chunk.count) / 16_000.0 * 1000
+            ))
+            return
+        }
+        guard deferredPostMeetingJobs.count < maxDeferredPostMeetingChunks else {
+            if var buffer = sourceBuffers[source] {
+                buffer.droppedSamples += chunk.count
+                sourceBuffers[source] = buffer
+            }
+            if !postMeetingDropReported {
+                postMeetingDropReported = true
+                emitDiagnostic(BridgeDiagnosticLine(
+                    kind: "audio_diagnostic",
+                    source: source,
+                    code: "local_whisper_post_meeting_chunk_dropped",
+                    message: "local Whisper dropped deferred mic chunk because the post-meeting queue reached its cap",
+                    droppedSamples: sourceBuffers[source]?.droppedSamples,
+                    chunkDurationMs: Double(chunk.count) / 16_000.0 * 1000
+                ), always: true)
+            }
+            return
+        }
+        postMeetingChunkIndex += 1
+        let jobIndex = postMeetingChunkIndex
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meeting-copilot-whisper-\(bridgeId)-post-meeting-\(source)-\(jobIndex).wav")
+        do {
+            try writeWhisperPcm16Wav(samples: chunk, to: url)
+            deferredPostMeetingJobs.append(BridgeWhisperJob(
+                file: url.path,
+                language: language,
+                source: source,
+                route: "post_meeting_\(source)",
+                startedAtMs: startedAtMs,
+                endedAtMs: endedAtMs
+            ))
+            emitDiagnostic(BridgeDiagnosticLine(
+                kind: "audio_diagnostic",
+                source: source,
+                code: "local_whisper_post_meeting_chunk_buffered",
+                message: "local Whisper buffered mic chunk for post-meeting transcription",
+                chunkDurationMs: Double(chunk.count) / 16_000.0 * 1000
+            ))
+        } catch {
+            emitError("Whisper post-meeting chunk buffering failed: \(error.localizedDescription)", code: "local_whisper_post_meeting_chunk")
+        }
     }
 
     private func enqueue(chunk: [Int16], source: String, startedAtMs: Int64, endedAtMs: Int64) {
@@ -1212,7 +1325,48 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
         }
     }
 
-    private func closeRunnerInputAndWait(terminate: Bool) {
+    private func drainDeferredPostMeetingJobs(_ jobs: [BridgeWhisperJob]) -> Int {
+        guard !jobs.isEmpty else { return 0 }
+        guard let input = stdinPipe?.fileHandleForWriting else {
+            cleanupDeferredPostMeetingJobs(jobs)
+            emitError("Whisper runner stdin is unavailable for post-meeting mic transcription", code: "local_whisper_post_meeting_runner")
+            return 0
+        }
+        var dispatched = 0
+        for job in jobs {
+            do {
+                let data = try JSONEncoder().encode(job)
+                input.write(data)
+                input.write(Data("\n".utf8))
+                dispatched += 1
+                emitDiagnostic(BridgeDiagnosticLine(
+                    kind: "audio_diagnostic",
+                    source: job.source,
+                    code: "local_whisper_post_meeting_chunk_dispatched",
+                    message: "local Whisper post-meeting mic chunk dispatched",
+                    pendingChunks: pendingChunks(),
+                    chunkDurationMs: Double(max(0, job.endedAtMs - job.startedAtMs))
+                ))
+            } catch {
+                try? FileManager.default.removeItem(atPath: job.file)
+                emitError("Whisper post-meeting mic transcription failed: \(error.localizedDescription)", code: "local_whisper_post_meeting_chunk")
+            }
+        }
+        return dispatched
+    }
+
+    private func cleanupDeferredPostMeetingJobs(_ jobs: [BridgeWhisperJob]) {
+        for job in jobs {
+            try? FileManager.default.removeItem(atPath: job.file)
+        }
+    }
+
+    private func gracefulStopTimeoutSeconds(postMeetingJobCount: Int) -> TimeInterval {
+        guard postMeetingJobCount > 0 else { return 10 }
+        return min(maxPostMeetingStopTimeoutSeconds, max(minPostMeetingStopTimeoutSeconds, Double(postMeetingJobCount) * postMeetingSecondsPerChunk))
+    }
+
+    private func closeRunnerInputAndWait(terminate: Bool, timeoutSeconds: TimeInterval) {
         try? stdinPipe?.fileHandleForWriting.close()
         stdinPipe = nil
         guard let process else { return }
@@ -1221,7 +1375,7 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
                 process.terminate()
             }
         } else if process.isRunning {
-            waitForRunnerExit(process, timeoutSeconds: 10)
+            waitForRunnerExit(process, timeoutSeconds: timeoutSeconds)
         }
         self.process = nil
     }
