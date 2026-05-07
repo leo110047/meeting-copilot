@@ -155,7 +155,10 @@ pub(crate) struct NativeDecisionState {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct IngestTranscriptResponse {
-    pub(crate) event: TranscriptEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) event: Option<TranscriptEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) live_evidence_event: Option<TranscriptEvent>,
     pub(crate) suggestions: Vec<NativeSuggestion>,
     pub(crate) decision_state: NativeDecisionState,
     pub(crate) persisted: PersistedSummary,

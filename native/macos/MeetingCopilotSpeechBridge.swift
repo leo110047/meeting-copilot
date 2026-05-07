@@ -35,6 +35,43 @@ struct BridgeDiagnosticLine: Codable {
     let message: String
     let rms: Double?
     let peak: Double?
+    let capturedSamplesPerSecond: Double?
+    let bufferedMs: Double?
+    let droppedSamples: Int?
+    let pendingChunks: Int?
+    let chunkDurationMs: Double?
+    let queueDelayMs: Double?
+    let stdinWriteMs: Double?
+
+    init(
+        kind: String,
+        source: String,
+        code: String,
+        message: String,
+        rms: Double? = nil,
+        peak: Double? = nil,
+        capturedSamplesPerSecond: Double? = nil,
+        bufferedMs: Double? = nil,
+        droppedSamples: Int? = nil,
+        pendingChunks: Int? = nil,
+        chunkDurationMs: Double? = nil,
+        queueDelayMs: Double? = nil,
+        stdinWriteMs: Double? = nil
+    ) {
+        self.kind = kind
+        self.source = source
+        self.code = code
+        self.message = message
+        self.rms = rms
+        self.peak = peak
+        self.capturedSamplesPerSecond = capturedSamplesPerSecond
+        self.bufferedMs = bufferedMs
+        self.droppedSamples = droppedSamples
+        self.pendingChunks = pendingChunks
+        self.chunkDurationMs = chunkDurationMs
+        self.queueDelayMs = queueDelayMs
+        self.stdinWriteMs = stdinWriteMs
+    }
 }
 
 struct BridgeWhisperJob: Codable {
@@ -701,6 +738,8 @@ extension NativeSpeechBridge: SCStreamDelegate, SCStreamOutput {
 }
 
 final class NativeWhisperBridge: NSObject, NativeBridgeSession {
+    private static let captureQueueKey = DispatchSpecificKey<Bool>()
+    private static let transcriptionQueueKey = DispatchSpecificKey<Bool>()
     private let source: String
     private let language: String
     private let runner: String
@@ -710,7 +749,9 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
     private let context: UnsafeMutableRawPointer?
     private let releaseContext: NativeSpeechReleaseContext?
     private let startedAt = Date()
-    private let queue = DispatchQueue(label: "meeting-copilot.whisper-bridge")
+    private let captureQueue = DispatchQueue(label: "meeting-copilot.whisper-bridge.capture")
+    private let transcriptionQueue = DispatchQueue(label: "meeting-copilot.whisper-bridge.transcription")
+    private let pendingChunkLock = NSLock()
     private var audioEngine: AVAudioEngine?
     private var stream: Any?
     private var process: Process?
@@ -718,6 +759,7 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
     private let outputGroup = DispatchGroup()
     private var sourceBuffers: [String: WhisperSourceBuffer] = [:]
     private var chunkIndex = 0
+    private var pendingChunkCount = 0
     private var isStopping = false
 
     init(source: String, language: String, runner: String, model: String, callback: @escaping NativeSpeechCallback, context: UnsafeMutableRawPointer?, releaseContext: NativeSpeechReleaseContext?) throws {
@@ -735,6 +777,8 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
         self.context = context
         self.releaseContext = releaseContext
         super.init()
+        captureQueue.setSpecific(key: Self.captureQueueKey, value: true)
+        transcriptionQueue.setSpecific(key: Self.transcriptionQueueKey, value: true)
     }
 
     deinit {
@@ -764,6 +808,16 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
         try process.run()
+        // Lower runner priority to keep the capture queue responsive under load.
+        if setpriority(PRIO_PROCESS, id_t(process.processIdentifier), 10) != 0 {
+            let errorNumber = errno
+            emitDiagnostic(BridgeDiagnosticLine(
+                kind: "audio_diagnostic",
+                source: source,
+                code: "local_whisper_priority_failed",
+                message: "local Whisper runner priority change failed errno=\(errorNumber)"
+            ), always: true)
+        }
         self.process = process
         self.stdinPipe = stdinPipe
         forwardPipe(stdoutPipe, asError: false)
@@ -786,6 +840,9 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
                 pending = hasTrailingNewline ? "" : (parts.popLast() ?? "")
                 for line in parts where !line.isEmpty {
                     if asError {
+                        if isLocalWhisperRunnerDiagnostic(line) {
+                            continue
+                        }
                         self?.emitError(line, code: "local_whisper_runner")
                     } else {
                         self?.emitRawLine(line)
@@ -794,6 +851,9 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
             }
             if !pending.isEmpty {
                 if asError {
+                    if isLocalWhisperRunnerDiagnostic(pending) {
+                        return
+                    }
                     self?.emitError(pending, code: "local_whisper_runner")
                 } else {
                     self?.emitRawLine(pending)
@@ -830,7 +890,9 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
                 do {
                     try await self.startScreenCaptureKitStream()
                 } catch {
-                    self.emitError(error.localizedDescription, code: "screen_capture")
+                    if !self.captureIsStopping() {
+                        self.emitError(error.localizedDescription, code: "screen_capture")
+                    }
                 }
             }
         } else {
@@ -855,53 +917,87 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 1)
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "meeting-copilot.whisper-bridge-system-audio"))
-        self.stream = stream
+        let shouldStart = onCaptureQueue {
+            if isStopping {
+                return false
+            }
+            self.stream = stream
+            return true
+        }
+        guard shouldStart else { return }
         try await stream.startCapture()
+        if captureIsStopping() {
+            try? await stream.stopCapture()
+        }
     }
 
     func stop() {
-        stopAudioInputs()
-        queue.async { [self] in
-            guard !isStopping else { return }
+        let shouldCloseRunner = onCaptureQueue {
+            guard !isStopping else { return false }
             isStopping = true
             for source in Array(sourceBuffers.keys) {
-                flushLocked(source: source, force: true)
+                finishResidualBufferLocked(source: source)
             }
-            try? stdinPipe?.fileHandleForWriting.close()
-            stdinPipe = nil
-            if let process, process.isRunning {
-                waitForRunnerExit(process, timeoutSeconds: 10)
+            return true
+        }
+        stopAudioInputs()
+        if shouldCloseRunner {
+            transcriptionQueue.async { [self] in
+                closeRunnerInputAndWait(terminate: false)
             }
-            process = nil
         }
     }
 
     private func stopSynchronouslyForDeinit() {
-        queue.sync {
+        onCaptureQueue {
             guard !isStopping else { return }
             isStopping = true
             for source in Array(sourceBuffers.keys) {
-                flushLocked(source: source, force: true)
+                finishResidualBufferLocked(source: source)
             }
-            try? stdinPipe?.fileHandleForWriting.close()
-            stdinPipe = nil
-            if let process, process.isRunning {
-                process.terminate()
-            }
-            process = nil
+        }
+        onTranscriptionQueue {
+            closeRunnerInputAndWait(terminate: true)
         }
         stopAudioInputs()
     }
 
+    private func onCaptureQueue<T>(_ work: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: Self.captureQueueKey) == true {
+            return work()
+        } else {
+            return captureQueue.sync(execute: work)
+        }
+    }
+
+    private func onTranscriptionQueue<T>(_ work: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: Self.transcriptionQueueKey) == true {
+            return work()
+        } else {
+            return transcriptionQueue.sync(execute: work)
+        }
+    }
+
+    private func captureIsStopping() -> Bool {
+        onCaptureQueue { isStopping }
+    }
+
     private func stopAudioInputs() {
-        if let engine = audioEngine {
+        let inputs = onCaptureQueue { () -> (AVAudioEngine?, Any?) in
+            let engine = audioEngine
+            let activeStream = stream
+            audioEngine = nil
+            stream = nil
+            return (engine, activeStream)
+        }
+        if let engine = inputs.0 {
             engine.stop()
             engine.inputNode.removeTap(onBus: 0)
-            audioEngine = nil
         }
-        if #available(macOS 13.0, *), let stream = stream as? SCStream {
-            Task { try? await stream.stopCapture() }
-            self.stream = nil
+        if #available(macOS 13.0, *), let stream = inputs.1 as? SCStream {
+            Task {
+                try? await stream.stopCapture()
+            }
         }
     }
 
@@ -926,15 +1022,19 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
 
     private func append(samples newSamples: [Int16], source: String) {
         guard !newSamples.isEmpty else { return }
-        queue.async { [weak self] in
+        captureQueue.async { [weak self] in
             guard let self, !self.isStopping else { return }
             var buffer = self.sourceBuffers[source] ?? WhisperSourceBuffer()
             if buffer.samples.isEmpty {
                 buffer.chunkStartedAtMs = self.elapsedMs()
             }
             buffer.samples.append(contentsOf: newSamples)
+            buffer.capturedSamplesSinceDiagnostic += newSamples.count
+            buffer.totalCapturedSamples += newSamples.count
+            self.trimBufferIfNeeded(&buffer, source: source)
             self.sourceBuffers[source] = buffer
             self.flushLocked(source: source, force: false)
+            self.emitPipelineDiagnosticIfNeeded(source: source)
         }
     }
 
@@ -949,13 +1049,142 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
             let started = buffer.chunkStartedAtMs
             let ended = started + Int64(Double(chunk.count) / 16_000.0 * 1000)
             buffer.chunkStartedAtMs = ended
-            send(chunk: chunk, source: source, startedAtMs: started, endedAtMs: ended)
+            sourceBuffers[source] = buffer
+            enqueue(chunk: chunk, source: source, startedAtMs: started, endedAtMs: ended)
+            if let latest = sourceBuffers[source] {
+                buffer = latest
+            }
         }
         sourceBuffers[source] = buffer
     }
 
-    private func send(chunk: [Int16], source: String, startedAtMs: Int64, endedAtMs: Int64) {
+    private func trimBufferIfNeeded(_ buffer: inout WhisperSourceBuffer, source: String) {
+        let maxBufferedSamples = 16_000 * 30
+        guard buffer.samples.count > maxBufferedSamples else { return }
+        let overflow = buffer.samples.count - maxBufferedSamples
+        buffer.samples.removeFirst(overflow)
+        buffer.chunkStartedAtMs += Int64(Double(overflow) / 16_000.0 * 1000)
+        buffer.droppedSamples += overflow
+        emitDiagnostic(BridgeDiagnosticLine(
+            kind: "audio_diagnostic",
+            source: source,
+            code: "local_whisper_audio_dropped",
+            message: "local Whisper audio buffer overflow dropped \(overflow) samples",
+            bufferedMs: Double(buffer.samples.count) / 16_000.0 * 1000,
+            droppedSamples: buffer.droppedSamples,
+            pendingChunks: pendingChunks()
+        ), always: true)
+    }
+
+    private func finishResidualBufferLocked(source: String) {
+        guard let buffer = sourceBuffers[source], !buffer.samples.isEmpty else { return }
+        let residualCount = buffer.samples.count
+        if residualCount < 4_000 {
+            ignoreResidualBelowRunnerMinimumLocked(source: source)
+            return
+        }
+        emitDiagnostic(BridgeDiagnosticLine(
+            kind: "audio_diagnostic",
+            source: source,
+            code: "local_whisper_residual_flushed",
+            message: "local Whisper flushed residual audio on stop",
+            pendingChunks: pendingChunks(),
+            chunkDurationMs: Double(residualCount) / 16_000.0 * 1000
+        ), always: true)
+        flushLocked(source: source, force: true)
+        // Forced flush can leave a tail shorter than the runner minimum; drop it explicitly.
+        ignoreResidualBelowRunnerMinimumLocked(source: source)
+    }
+
+    private func ignoreResidualBelowRunnerMinimumLocked(source: String) {
+        guard var buffer = sourceBuffers[source], !buffer.samples.isEmpty, buffer.samples.count < 4_000 else {
+            return
+        }
+        let residualCount = buffer.samples.count
+        let level = whisperAudioLevel(samples: buffer.samples)
+        buffer.samples.removeAll(keepingCapacity: false)
+        sourceBuffers[source] = buffer
+        emitDiagnostic(BridgeDiagnosticLine(
+            kind: "audio_diagnostic",
+            source: source,
+            code: "local_whisper_residual_ignored",
+            message: "local Whisper ignored residual audio shorter than the runner minimum",
+            rms: level.rms,
+            peak: level.peak,
+            pendingChunks: pendingChunks(),
+            chunkDurationMs: Double(residualCount) / 16_000.0 * 1000
+        ), always: true)
+    }
+
+    private func enqueue(chunk: [Int16], source: String, startedAtMs: Int64, endedAtMs: Int64) {
+        let level = whisperAudioLevel(samples: chunk)
+        guard whisperChunkLooksSpeechLike(level) else {
+            if var buffer = sourceBuffers[source] {
+                buffer.droppedSamples += chunk.count
+                sourceBuffers[source] = buffer
+            }
+            emitDiagnostic(BridgeDiagnosticLine(
+                kind: "audio_diagnostic",
+                source: source,
+                code: "local_whisper_silence_dropped",
+                message: String(
+                    format: "local Whisper dropped low-energy chunk rms=%.5f peak=%.5f",
+                    level.rms,
+                    level.peak
+                ),
+                rms: level.rms,
+                peak: level.peak,
+                droppedSamples: sourceBuffers[source]?.droppedSamples,
+                pendingChunks: pendingChunks(),
+                chunkDurationMs: Double(chunk.count) / 16_000.0 * 1000
+            ))
+            return
+        }
+        let maxPendingChunks = 20
+        let pending = pendingChunks()
+        if pending >= maxPendingChunks {
+            var droppedSamples = chunk.count
+            if var buffer = sourceBuffers[source] {
+                buffer.droppedSamples += chunk.count
+                droppedSamples = buffer.droppedSamples
+                sourceBuffers[source] = buffer
+            }
+            emitDiagnostic(BridgeDiagnosticLine(
+                kind: "audio_diagnostic",
+                source: source,
+                code: "local_whisper_chunk_dropped",
+                message: "local Whisper transcription queue full dropped chunk",
+                droppedSamples: droppedSamples,
+                pendingChunks: pending
+            ), always: true)
+            return
+        }
         chunkIndex += 1
+        let jobIndex = chunkIndex
+        let enqueuedAt = Date()
+        incrementPendingChunks()
+        transcriptionQueue.async { [weak self] in
+            guard let self else { return }
+            defer { self.decrementPendingChunks() }
+            self.send(
+                chunk: chunk,
+                source: source,
+                chunkIndex: jobIndex,
+                startedAtMs: startedAtMs,
+                endedAtMs: endedAtMs,
+                enqueuedAt: enqueuedAt
+            )
+        }
+    }
+
+    private func send(
+        chunk: [Int16],
+        source: String,
+        chunkIndex: Int,
+        startedAtMs: Int64,
+        endedAtMs: Int64,
+        enqueuedAt: Date
+    ) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("meeting-copilot-whisper-\(bridgeId)-\(source)-\(chunkIndex).wav")
         do {
@@ -965,11 +1194,82 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
             guard let input = stdinPipe?.fileHandleForWriting else {
                 throw NSError(domain: "MeetingCopilotSpeechBridge", code: 22, userInfo: [NSLocalizedDescriptionKey: "Whisper runner stdin is unavailable"])
             }
+            let writeStarted = Date()
             input.write(data)
             input.write(Data("\n".utf8))
+            emitDiagnostic(BridgeDiagnosticLine(
+                kind: "audio_diagnostic",
+                source: source,
+                code: "local_whisper_chunk_dispatched",
+                message: "local Whisper chunk dispatched",
+                pendingChunks: pendingChunks(),
+                chunkDurationMs: Double(chunk.count) / 16_000.0 * 1000,
+                queueDelayMs: writeStarted.timeIntervalSince(enqueuedAt) * 1000,
+                stdinWriteMs: Date().timeIntervalSince(writeStarted) * 1000
+            ))
         } catch {
             emitError("Whisper chunk transcription failed: \(error.localizedDescription)", code: "local_whisper_chunk")
         }
+    }
+
+    private func closeRunnerInputAndWait(terminate: Bool) {
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        guard let process else { return }
+        if terminate {
+            if process.isRunning {
+                process.terminate()
+            }
+        } else if process.isRunning {
+            waitForRunnerExit(process, timeoutSeconds: 10)
+        }
+        self.process = nil
+    }
+
+    private func incrementPendingChunks() {
+        pendingChunkLock.lock()
+        pendingChunkCount += 1
+        pendingChunkLock.unlock()
+    }
+
+    private func decrementPendingChunks() {
+        pendingChunkLock.lock()
+        pendingChunkCount = max(0, pendingChunkCount - 1)
+        pendingChunkLock.unlock()
+    }
+
+    private func pendingChunks() -> Int {
+        pendingChunkLock.lock()
+        let count = pendingChunkCount
+        pendingChunkLock.unlock()
+        return count
+    }
+
+    private func emitPipelineDiagnosticIfNeeded(source: String) {
+        guard audioDiagnosticsEnabled(), var buffer = sourceBuffers[source] else { return }
+        let now = Date()
+        let elapsed = now.timeIntervalSince(buffer.lastDiagnosticAt)
+        guard elapsed >= 2 else { return }
+        let samplesPerSecond = Double(buffer.capturedSamplesSinceDiagnostic) / max(elapsed, 0.001)
+        buffer.capturedSamplesSinceDiagnostic = 0
+        buffer.lastDiagnosticAt = now
+        sourceBuffers[source] = buffer
+        emitDiagnostic(BridgeDiagnosticLine(
+            kind: "audio_diagnostic",
+            source: source,
+            code: "local_whisper_pipeline",
+            message: String(
+                format: "local Whisper capture samplesPerSecond=%.1f bufferedMs=%.1f pendingChunks=%d droppedSamples=%d",
+                samplesPerSecond,
+                Double(buffer.samples.count) / 16_000.0 * 1000,
+                pendingChunks(),
+                buffer.droppedSamples
+            ),
+            capturedSamplesPerSecond: samplesPerSecond,
+            bufferedMs: Double(buffer.samples.count) / 16_000.0 * 1000,
+            droppedSamples: buffer.droppedSamples,
+            pendingChunks: pendingChunks()
+        ))
     }
 
     private func elapsedMs() -> Int64 {
@@ -988,11 +1288,39 @@ final class NativeWhisperBridge: NSObject, NativeBridgeSession {
         guard let data = try? encoder.encode(value), let line = String(data: data, encoding: .utf8) else { return }
         emitRawLine(line)
     }
+
+    private func emitDiagnostic(_ value: BridgeDiagnosticLine, always: Bool = false) {
+        guard always || audioDiagnosticsEnabled() else { return }
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(value), let line = String(data: data, encoding: .utf8) else { return }
+        emitRawLine(line)
+    }
 }
 
 private struct WhisperSourceBuffer {
     var samples: [Int16] = []
     var chunkStartedAtMs: Int64 = 0
+    var totalCapturedSamples: Int = 0
+    var capturedSamplesSinceDiagnostic: Int = 0
+    var droppedSamples: Int = 0
+    var lastDiagnosticAt = Date()
+}
+
+private func whisperAudioLevel(samples: [Int16]) -> (rms: Double, peak: Double) {
+    guard !samples.isEmpty else { return (0, 0) }
+    var sumSquares = 0.0
+    var peak = 0.0
+    for sample in samples {
+        let normalized = Double(sample) / Double(Int16.max)
+        let magnitude = abs(normalized)
+        peak = max(peak, magnitude)
+        sumSquares += normalized * normalized
+    }
+    return (sqrt(sumSquares / Double(samples.count)), peak)
+}
+
+private func whisperChunkLooksSpeechLike(_ level: (rms: Double, peak: Double)) -> Bool {
+    level.rms >= 0.0025 || level.peak >= 0.018
 }
 
 @available(macOS 13.0, *)
@@ -1098,6 +1426,14 @@ func whisperResampleToPcm16(_ samples: [Float], inputRate: Double) -> [Int16] {
         let value = samples[lower] * (1 - fraction) + samples[upper] * fraction
         return Int16(max(Double(Int16.min), min(Double(Int16.max), Double(value) * 32767.0)))
     }
+}
+
+func isLocalWhisperRunnerDiagnostic(_ message: String) -> Bool {
+    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.hasPrefix("whisper_init_")
+        || trimmed.hasPrefix("whisper_model_load:")
+        || trimmed.hasPrefix("whisper_backend_init:")
+        || trimmed.hasPrefix("whisper_backend_init_gpu: no GPU found")
 }
 
 func writeWhisperPcm16Wav(samples: [Int16], to url: URL) throws {

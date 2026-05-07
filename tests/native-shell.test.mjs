@@ -85,7 +85,8 @@ test("Tauri native shell is tray/status-item first", async () => {
     runWithRustScript,
     macBridge,
     macHelper,
-    windowsHelper
+    windowsHelper,
+    whisperRunner
   ] = await Promise.all([
     readFile(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/src/desktop_types.rs", import.meta.url), "utf8"),
@@ -105,7 +106,8 @@ test("Tauri native shell is tray/status-item first", async () => {
     readFile(new URL("../scripts/run-with-rust.mjs", import.meta.url), "utf8"),
     readFile(new URL("../native/macos/MeetingCopilotSpeechBridge.swift", import.meta.url), "utf8"),
     readFile(new URL("../native/macos/MeetingCopilotSpeech.swift", import.meta.url), "utf8"),
-    readFile(new URL("../native/windows/meeting-copilot-windows-speech.rs", import.meta.url), "utf8")
+    readFile(new URL("../native/windows/meeting-copilot-windows-speech.rs", import.meta.url), "utf8"),
+    readFile(new URL("../crates/meeting-copilot-whisper/src/main.rs", import.meta.url), "utf8")
   ]);
   const desktopShellSource = [mainRoot, desktopTypes, commandsCore, commandsAudio, shellStorage, oauthProvider, nativeStorage, localStt, decisionLogic, macosSpeechBridge].join("\n");
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -181,6 +183,10 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(desktopShellSource, /build_prep_summary_prompt/);
   assert.match(desktopShellSource, /parse_prep_summary_points/);
   assert.match(desktopShellSource, /extract_live_state_patch_oauth/);
+  assert.match(desktopTypes, /live_evidence_event: Option<TranscriptEvent>/);
+  assert.match(commandsCore, /event: None/);
+  assert.match(commandsCore, /live_evidence_event: Some\(last_event\)/);
+  assert.match(commandsAudio, /event: Some\(event\)/);
   assert.match(desktopShellSource, /build_live_state_patch_prompt/);
   assert.match(desktopShellSource, /parse_live_state_patch/);
   assert.match(desktopShellSource, /parse_live_coaching_suggestions/);
@@ -298,6 +304,34 @@ test("Tauri native shell is tray/status-item first", async () => {
   assert.match(macBridge, /meeting_copilot_native_audio_request_permissions/);
   assert.match(macBridge, /final class NativeWhisperBridge/);
   assert.match(macBridge, /"--serve", "--model"/);
+  assert.match(macBridge, /meeting-copilot\.whisper-bridge\.capture/);
+  assert.match(macBridge, /meeting-copilot\.whisper-bridge\.transcription/);
+  assert.match(macBridge, /DispatchSpecificKey<Bool>/);
+  assert.match(macBridge, /captureIsStopping/);
+  assert.match(macBridge, /local_whisper_pipeline/);
+  assert.match(macBridge, /local_whisper_chunk_dropped/);
+  assert.match(macBridge, /local_whisper_chunk_dispatched/);
+  assert.match(macBridge, /local_whisper_silence_dropped/);
+  assert.match(macBridge, /finishResidualBufferLocked/);
+  assert.match(macBridge, /flushLocked\(source: source, force: true\)/);
+  assert.match(macBridge, /local_whisper_residual_flushed/);
+  assert.match(macBridge, /local_whisper_residual_ignored/);
+  assert.doesNotMatch(macBridge, /dropResidualBufferLocked/);
+  assert.doesNotMatch(macBridge, /local_whisper_residual_dropped/);
+  assert.match(macBridge, /setpriority\(PRIO_PROCESS/);
+  assert.match(macBridge, /Lower runner priority to keep the capture queue responsive under load/);
+  assert.match(macBridge, /local_whisper_priority_failed/);
+  assert.match(macBridge, /always: true/);
+  assert.match(macBridge, /isLocalWhisperRunnerDiagnostic/);
+  assert.match(macBridge, /whisper_backend_init:/);
+  assert.match(whisperRunner, /set_n_threads\(whisper_thread_count\(\)\)/);
+  assert.doesNotMatch(whisperRunner, /set_single_segment\(true\)/);
+  assert.doesNotMatch(whisperRunner, /set_temperature_inc\(0\.0\)/);
+  assert.match(whisperRunner, /MEETING_COPILOT_WHISPER_THREADS/);
+  assert.match(whisperRunner, /audio chunk is below speech energy threshold/);
+  assert.match(macosSpeechBridge, /bridgeSource/);
+  assert.match(macosSpeechBridge, /audio_diagnostic_severity/);
+  assert.match(macosSpeechBridge, /local_whisper_audio_dropped" \| "local_whisper_chunk_dropped" => "warning"/);
   assert.match(macBridge, /waitForRunnerExit/);
   assert.match(macBridge, /pending\.append\(text\)/);
   assert.match(macBridge, /BridgeDiagnosticLine/);

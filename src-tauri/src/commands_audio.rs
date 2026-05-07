@@ -992,7 +992,8 @@ pub(crate) fn ingest_transcript_inner(
     insert_decision_snapshot(&conn, &snapshot_id, &session_id, &decision_state)?;
 
     Ok(IngestTranscriptResponse {
-        event,
+        event: Some(event),
+        live_evidence_event: None,
         suggestions: suggestions.clone(),
         decision_state,
         persisted: PersistedSummary {

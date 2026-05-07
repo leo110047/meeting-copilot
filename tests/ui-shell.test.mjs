@@ -169,9 +169,14 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /請先登入並啟用 AI/);
   assert.match(js, /extract_live_state_patch_oauth/);
   assert.match(js, /maybeRunLiveAiExtraction/);
-  assert.match(js, /liveAiExtractionRunning/);
+  assert.match(js, /liveAiPipelineState = \{ \.\.\.liveAiPipelineState, running: true \}/);
+  assert.match(js, /LIVE_AI_POLICY/);
+  assert.match(js, /shouldTriggerLiveAiForEvent/);
+  assert.match(js, /scheduleLiveAiExtractionForEvent\(payload\.event\)/);
   assert.match(js, /revise_transcript_oauth/);
   assert.match(js, /scheduleLiveTranscriptRevision/);
+  assert.match(js, /const LIVE_TRANSCRIPT_REVISION_DURING_CAPTURE_ENABLED = false/);
+  assert.match(js, /function scheduleLiveTranscriptRevision\(\) \{\s*if \(!LIVE_TRANSCRIPT_REVISION_DURING_CAPTURE_ENABLED\) return;/);
   assert.match(js, /TRANSCRIPT_REVISION_CONTEXT_WINDOW_SIZE/);
   assert.match(js, /TRANSCRIPT_REVISION_EDITABLE_WINDOW_SIZE/);
   assert.match(js, /TRANSCRIPT_REVISION_MIN_NEW_EVENTS/);
@@ -179,7 +184,7 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /buildTranscriptRevisionSnapshot/);
   assert.match(js, /lastTranscriptRevisionEventCount = revisionSnapshot\.endCount/);
   assert.match(js, /lastTranscriptRevisionAt = Date\.now\(\)/);
-  assert.match(js, /transcriptEvents\.length > eventCount\) scheduleLiveTranscriptRevision/);
+  assert.match(js, /await maybeRunLiveTranscriptRevision\(\{ allowReview: true, force: true \}\)/);
   assert.doesNotMatch(js, /lastTranscriptRevisionEventCount = transcriptEvents\.length/);
   assert.match(js, /displayedTranscriptEvents/);
   assert.match(js, /editableStartIndex/);
@@ -189,9 +194,10 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(js, /setAiActivity/);
   assert.match(js, /clearAiActivity/);
   assert.match(js, /對方 A|未標記來源/);
-  assert.match(js, /Math\.max\(0, lastAiExtractionEventCount - 1\)/);
-  assert.match(js, /lastAiExtractionEventCount/);
-  assert.match(js, /AI 正在判斷是否需要提醒/);
+  assert.match(js, /markLiveAiFailure/);
+  assert.match(js, /suspendedUntilMs/);
+  assert.doesNotMatch(js, /lastAiExtractionEventCount/);
+  assert.match(js, /AI 正在盯對方發言/);
   assert.match(js, /oauthAiEnabled/);
   assert.doesNotMatch(js, /AI_ENABLED_STORAGE_KEY/);
   assert.doesNotMatch(js, /readAiEnabledPreference/);

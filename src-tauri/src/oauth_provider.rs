@@ -1096,13 +1096,14 @@ fn is_allowed_remote_speaker(speaker: &str) -> bool {
 
 pub(crate) fn build_live_state_patch_prompt(
     brief: &MeetingBrief,
-    events: &[TranscriptEvent],
+    events: &[&TranscriptEvent],
     local_state: &NativeDecisionState,
 ) -> Result<String, String> {
     let recent_events: Vec<&TranscriptEvent> = events
         .iter()
         .rev()
         .take(8)
+        .copied()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -1171,6 +1172,26 @@ Meeting payload:
 {payload}
 "#
     ))
+}
+
+pub(crate) const LIVE_AI_REMOTE_SOURCE: &str = "system";
+
+pub(crate) fn is_live_ai_remote_event(event: &TranscriptEvent) -> bool {
+    event.source == LIVE_AI_REMOTE_SOURCE
+}
+
+pub(crate) fn live_ai_remote_events(events: &[TranscriptEvent]) -> Vec<TranscriptEvent> {
+    live_ai_remote_event_refs(events)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn live_ai_remote_event_refs(events: &[TranscriptEvent]) -> Vec<&TranscriptEvent> {
+    events
+        .iter()
+        .filter(|event| is_live_ai_remote_event(event))
+        .collect()
 }
 
 pub(crate) fn run_codex_oauth_prompt_with_timeout(
@@ -1393,6 +1414,15 @@ pub(crate) fn parse_live_coaching_suggestions(
     session_id: &str,
     events: &[TranscriptEvent],
 ) -> Result<Vec<NativeSuggestion>, (&'static str, String)> {
+    let event_refs = events.iter().collect::<Vec<_>>();
+    parse_live_coaching_suggestions_from_refs(raw_output, session_id, &event_refs)
+}
+
+pub(crate) fn parse_live_coaching_suggestions_from_refs(
+    raw_output: &str,
+    session_id: &str,
+    events: &[&TranscriptEvent],
+) -> Result<Vec<NativeSuggestion>, (&'static str, String)> {
     let value = parse_json_object_value(raw_output).map_err(|error| ("malformed_json", error))?;
     let Some(cards) = value
         .get("coaching")
@@ -1448,7 +1478,7 @@ fn parse_live_coaching_card(
     card: &serde_json::Value,
     index: usize,
     session_id: &str,
-    events: &[TranscriptEvent],
+    events: &[&TranscriptEvent],
 ) -> Result<CoachingCardParseResult, String> {
     let object = card
         .as_object()

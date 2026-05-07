@@ -10,6 +10,14 @@ pub(crate) fn derive_decision_state(
     session_id: &str,
     events: &[TranscriptEvent],
 ) -> NativeDecisionState {
+    let event_refs = events.iter().collect::<Vec<_>>();
+    derive_decision_state_from_refs(session_id, &event_refs)
+}
+
+pub(crate) fn derive_decision_state_from_refs(
+    session_id: &str,
+    events: &[&TranscriptEvent],
+) -> NativeDecisionState {
     let texts: Vec<String> = events.iter().map(|event| event.text.clone()).collect();
     let joined = texts.join(" ").to_lowercase();
     let mut blockers = vec![];
@@ -63,9 +71,18 @@ pub(crate) fn derive_decision_state(
 }
 
 pub(crate) fn apply_live_state_patch(
-    mut state: NativeDecisionState,
+    state: NativeDecisionState,
     patch: &LiveStatePatchEnvelope,
     events: &[TranscriptEvent],
+) -> NativeDecisionState {
+    let event_refs = events.iter().collect::<Vec<_>>();
+    apply_live_state_patch_from_refs(state, patch, &event_refs)
+}
+
+pub(crate) fn apply_live_state_patch_from_refs(
+    mut state: NativeDecisionState,
+    patch: &LiveStatePatchEnvelope,
+    events: &[&TranscriptEvent],
 ) -> NativeDecisionState {
     let allowed_ids: HashSet<String> = events.iter().map(|event| event.id.clone()).collect();
     for item in &patch.meeting_state_patch.add_items {

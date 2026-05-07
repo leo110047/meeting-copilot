@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 const SAMPLE_RATE: u32 = 16_000;
+const DEFAULT_MAX_NO_SPEECH_PROBABILITY: f32 = 0.65;
+const DEFAULT_MIN_AVERAGE_TOKEN_PROBABILITY: f32 = 0.25;
 
 #[derive(Debug, Default)]
 struct CliOptions {
@@ -173,6 +175,114 @@ fn run_server(options: CliOptions) -> Result<(), String> {
 fn is_expected_empty_transcript(error: &str) -> bool {
     error == "Whisper produced no transcript"
         || error == "audio chunk is too short for Whisper transcription"
+        || error == "audio chunk is below speech energy threshold"
+        || error == "Whisper classified the chunk as no speech"
+        || error == "Whisper produced a low-confidence transcript"
+}
+
+fn whisper_thread_count() -> i32 {
+    if let Ok(value) = env::var("MEETING_COPILOT_WHISPER_THREADS")
+        && let Ok(parsed) = value.parse::<i32>()
+    {
+        return parsed.clamp(1, 4);
+    }
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get() as i32)
+        .unwrap_or(2);
+    available.clamp(1, 2)
+}
+
+fn audio_level(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_squares = 0.0_f32;
+    let mut peak = 0.0_f32;
+    for sample in samples {
+        let magnitude = sample.abs();
+        peak = peak.max(magnitude);
+        sum_squares += sample * sample;
+    }
+    ((sum_squares / samples.len() as f32).sqrt(), peak)
+}
+
+fn chunk_looks_speech_like(level: (f32, f32)) -> bool {
+    level.0 >= 0.0025 || level.1 >= 0.018
+}
+
+#[derive(Debug, Default)]
+struct TranscriptQuality {
+    token_probability_sum: f32,
+    token_count: usize,
+    max_no_speech_probability: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TranscriptQualityThresholds {
+    max_no_speech_probability: f32,
+    min_average_token_probability: f32,
+}
+
+impl Default for TranscriptQualityThresholds {
+    fn default() -> Self {
+        Self {
+            max_no_speech_probability: DEFAULT_MAX_NO_SPEECH_PROBABILITY,
+            min_average_token_probability: DEFAULT_MIN_AVERAGE_TOKEN_PROBABILITY,
+        }
+    }
+}
+
+fn transcript_quality_thresholds() -> TranscriptQualityThresholds {
+    let max_no_speech = env::var("MEETING_COPILOT_WHISPER_MAX_NO_SPEECH_PROBABILITY").ok();
+    let min_token = env::var("MEETING_COPILOT_WHISPER_MIN_TOKEN_PROBABILITY").ok();
+    TranscriptQualityThresholds {
+        max_no_speech_probability: probability_threshold(
+            max_no_speech.as_deref(),
+            DEFAULT_MAX_NO_SPEECH_PROBABILITY,
+        ),
+        min_average_token_probability: probability_threshold(
+            min_token.as_deref(),
+            DEFAULT_MIN_AVERAGE_TOKEN_PROBABILITY,
+        ),
+    }
+}
+
+fn probability_threshold(value: Option<&str>, default: f32) -> f32 {
+    value
+        .and_then(|item| item.parse::<f32>().ok())
+        .filter(|item| item.is_finite())
+        .map(|item| item.clamp(0.0, 1.0))
+        .unwrap_or(default)
+}
+
+impl TranscriptQuality {
+    fn observe_segment(&mut self, segment_no_speech_probability: f32) {
+        self.max_no_speech_probability = self
+            .max_no_speech_probability
+            .max(segment_no_speech_probability);
+    }
+
+    fn observe_token(&mut self, token_probability: f32) {
+        self.token_probability_sum += token_probability;
+        self.token_count += 1;
+    }
+
+    fn average_token_probability(&self) -> Option<f32> {
+        (self.token_count > 0).then(|| self.token_probability_sum / self.token_count as f32)
+    }
+
+    fn reject_reason(&self, thresholds: TranscriptQualityThresholds) -> Option<&'static str> {
+        if self.max_no_speech_probability >= thresholds.max_no_speech_probability {
+            return Some("Whisper classified the chunk as no speech");
+        }
+        if self
+            .average_token_probability()
+            .is_some_and(|value| value < thresholds.min_average_token_probability)
+        {
+            return Some("Whisper produced a low-confidence transcript");
+        }
+        None
+    }
 }
 
 fn health_line(model: Option<&Path>) -> HealthLine {
@@ -234,10 +344,19 @@ fn transcribe_file_with_context(
     if audio.len() < SAMPLE_RATE as usize / 4 {
         return Err("audio chunk is too short for Whisper transcription".to_string());
     }
+    let level = audio_level(&audio);
+    if !chunk_looks_speech_like(level) {
+        return Err("audio chunk is below speech energy threshold".to_string());
+    }
     let mut state = ctx
         .create_state()
         .map_err(|error| format!("failed to create Whisper state: {error}"))?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_n_threads(whisper_thread_count());
+    params.set_no_context(true);
+    params.set_suppress_blank(true);
+    params.set_suppress_nst(true);
+    params.set_temperature(0.0);
     params.set_translate(false);
     params.set_language(Some(whisper_language(language)));
     params.set_print_special(false);
@@ -249,7 +368,14 @@ fn transcribe_file_with_context(
         .map_err(|error| format!("failed to run Whisper: {error}"))?;
     let mut text = String::new();
     let mut last_end = None;
+    let mut quality = TranscriptQuality::default();
     for segment in state.as_iter() {
+        quality.observe_segment(segment.no_speech_probability());
+        for token_index in 0..segment.n_tokens() {
+            if let Some(token) = segment.get_token(token_index) {
+                quality.observe_token(token.token_probability());
+            }
+        }
         let segment_text = segment
             .to_str_lossy()
             .map_err(|error| format!("failed to read Whisper segment: {error}"))?;
@@ -266,6 +392,9 @@ fn transcribe_file_with_context(
     if text.is_empty() {
         return Err("Whisper produced no transcript".to_string());
     }
+    if let Some(reason) = quality.reject_reason(transcript_quality_thresholds()) {
+        return Err(reason.to_string());
+    }
     let inferred_end = started_at_ms
         + last_end
             .map(|centiseconds| i64::from(centiseconds) * 10)
@@ -274,8 +403,7 @@ fn transcribe_file_with_context(
         kind: "transcript",
         text,
         is_final: true,
-        // whisper-rs does not expose a stable utterance-level confidence here.
-        confidence: 0.72,
+        confidence: quality.average_token_probability().unwrap_or(0.0) as f64,
         language: language.to_string(),
         source: source.to_string(),
         route,
@@ -377,4 +505,73 @@ fn write_json<T: Serialize>(value: &T) {
 fn exit_with_error(message: String) -> ! {
     eprintln!("{message}");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_energy_chunks_are_treated_as_empty() {
+        assert!(!chunk_looks_speech_like(audio_level(&[0.0; 16_000])));
+        assert!(chunk_looks_speech_like(audio_level(&[0.02; 16_000])));
+        assert!(is_expected_empty_transcript(
+            "audio chunk is below speech energy threshold"
+        ));
+    }
+
+    #[test]
+    fn no_speech_and_low_confidence_results_are_treated_as_empty() {
+        let mut no_speech = TranscriptQuality::default();
+        no_speech.observe_segment(0.7);
+        no_speech.observe_token(0.9);
+        assert_eq!(
+            no_speech.reject_reason(TranscriptQualityThresholds::default()),
+            Some("Whisper classified the chunk as no speech")
+        );
+        assert!(is_expected_empty_transcript(
+            "Whisper classified the chunk as no speech"
+        ));
+
+        let mut low_confidence = TranscriptQuality::default();
+        low_confidence.observe_segment(0.1);
+        low_confidence.observe_token(0.1);
+        assert_eq!(
+            low_confidence.reject_reason(TranscriptQualityThresholds::default()),
+            Some("Whisper produced a low-confidence transcript")
+        );
+    }
+
+    #[test]
+    fn quality_thresholds_are_explicit_and_tunable() {
+        let mut quality = TranscriptQuality::default();
+        quality.observe_segment(0.7);
+        quality.observe_token(0.2);
+        assert_eq!(
+            quality.reject_reason(TranscriptQualityThresholds::default()),
+            Some("Whisper classified the chunk as no speech")
+        );
+        assert_eq!(
+            quality.reject_reason(TranscriptQualityThresholds {
+                max_no_speech_probability: 0.8,
+                min_average_token_probability: 0.1,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn probability_threshold_parser_rejects_invalid_values_and_clamps_bounds() {
+        assert_eq!(probability_threshold(Some("0.4"), 0.65), 0.4);
+        assert_eq!(probability_threshold(Some("abc"), 0.65), 0.65);
+        assert_eq!(probability_threshold(Some("NaN"), 0.65), 0.65);
+        assert_eq!(probability_threshold(Some("2"), 0.65), 1.0);
+        assert_eq!(probability_threshold(Some("-1"), 0.65), 0.0);
+    }
+
+    #[test]
+    fn default_whisper_threads_are_bounded_for_live_capture() {
+        let count = whisper_thread_count();
+        assert!((1..=2).contains(&count));
+    }
 }

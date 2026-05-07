@@ -583,7 +583,6 @@ pub(crate) unsafe extern "C" fn macos_speech_bridge_callback(
     }
     if let Ok(diagnostic_line) = serde_json::from_str::<serde_json::Value>(&line)
         && diagnostic_line.get("kind").and_then(|kind| kind.as_str()) == Some("audio_diagnostic")
-        && diagnostic_line.get("code").and_then(|code| code.as_str()) == Some("audio_input_level")
     {
         let message = diagnostic_line
             .get("message")
@@ -594,17 +593,30 @@ pub(crate) unsafe extern "C" fn macos_speech_bridge_callback(
             .get("code")
             .and_then(|code| code.as_str())
             .unwrap_or("diagnostic");
+        let severity = audio_diagnostic_severity(code);
+        let diagnostic_source = diagnostic_line
+            .get("source")
+            .and_then(|source| source.as_str())
+            .unwrap_or(&context.source);
         let _ = log_app_error_inner(
             Some(&context.session_id),
             "native_transcription.bridge_diagnostic",
             "macos_speech_bridge",
-            "info",
+            severity,
             &message,
             serde_json::json!({
-                "source": context.source,
+                "source": diagnostic_source,
+                "bridgeSource": context.source,
                 "code": code,
                 "rms": diagnostic_line.get("rms").and_then(|value| value.as_f64()),
-                "peak": diagnostic_line.get("peak").and_then(|value| value.as_f64())
+                "peak": diagnostic_line.get("peak").and_then(|value| value.as_f64()),
+                "capturedSamplesPerSecond": diagnostic_line.get("capturedSamplesPerSecond").and_then(|value| value.as_f64()),
+                "bufferedMs": diagnostic_line.get("bufferedMs").and_then(|value| value.as_f64()),
+                "droppedSamples": diagnostic_line.get("droppedSamples").and_then(|value| value.as_i64()),
+                "pendingChunks": diagnostic_line.get("pendingChunks").and_then(|value| value.as_i64()),
+                "chunkDurationMs": diagnostic_line.get("chunkDurationMs").and_then(|value| value.as_f64()),
+                "queueDelayMs": diagnostic_line.get("queueDelayMs").and_then(|value| value.as_f64()),
+                "stdinWriteMs": diagnostic_line.get("stdinWriteMs").and_then(|value| value.as_f64())
             }),
         );
         return;
@@ -659,5 +671,12 @@ pub(crate) unsafe extern "C" fn macos_speech_bridge_callback(
             );
             emit_native_transcription_error(&context.app, message, &context.source);
         }
+    }
+}
+
+pub(crate) fn audio_diagnostic_severity(code: &str) -> &'static str {
+    match code {
+        "local_whisper_audio_dropped" | "local_whisper_chunk_dropped" => "warning",
+        _ => "info",
     }
 }

@@ -1,6 +1,7 @@
 use crate::commands_audio::ingest_transcript_inner;
 use crate::decision_logic::{
-    apply_live_state_patch, default_brief, derive_decision_state, now_ms, stable_id,
+    apply_live_state_patch_from_refs, default_brief, derive_decision_state,
+    derive_decision_state_from_refs, now_ms, stable_id,
 };
 use crate::desktop_types::desktop_shell_plan;
 use crate::desktop_types::{
@@ -25,10 +26,10 @@ use crate::native_storage::{
 use crate::oauth_provider::{
     build_ai_summary_prompt, build_live_state_patch_prompt, build_prep_summary_prompt,
     build_transcript_revision_prompt, cleanup_transcript_text_with_provider_inner,
-    parse_ai_summary_sections, parse_live_coaching_suggestions, parse_live_state_patch,
-    parse_prep_summary_points, parse_transcript_revision_response,
-    run_text_provider_prompt_with_timeout, start_text_provider_login_for,
-    text_provider_install_guide_url, text_provider_status_for,
+    live_ai_remote_event_refs, parse_ai_summary_sections,
+    parse_live_coaching_suggestions_from_refs, parse_live_state_patch, parse_prep_summary_points,
+    parse_transcript_revision_response, run_text_provider_prompt_with_timeout,
+    start_text_provider_login_for, text_provider_install_guide_url, text_provider_status_for,
     text_provider_status_for_with_refresh, text_provider_summary,
 };
 use crate::shell_storage::{
@@ -45,6 +46,7 @@ use std::time::Duration;
 
 pub(crate) const LIVE_SESSION_STOP_GRACE_MS: i64 = 60_000;
 const LIVE_SESSION_STOP_GRACE: Duration = Duration::from_millis(LIVE_SESSION_STOP_GRACE_MS as u64);
+const LIVE_AI_PROVIDER_TIMEOUT_MS: u64 = 15_000;
 
 #[cfg(target_os = "macos")]
 use crate::macos_speech_bridge::{
@@ -753,14 +755,20 @@ pub(crate) fn extract_live_state_patch_oauth(
             .ok_or_else(|| "session not found".to_string())?;
         (session.brief.clone(), session.events.clone())
     };
-    let last_event = events
+    let live_events = live_ai_remote_event_refs(&events);
+    let last_event = live_events
         .last()
-        .cloned()
-        .ok_or_else(|| "no transcript available for live AI extraction".to_string())?;
+        .map(|event| (*event).clone())
+        .ok_or_else(|| "no remote transcript available for live AI extraction".to_string())?;
     let local_state = derive_decision_state(&session_id, &events);
-    let prompt = build_live_state_patch_prompt(&brief, &events, &local_state)?;
+    let live_prompt_state = derive_decision_state_from_refs(&session_id, &live_events);
+    let prompt = build_live_state_patch_prompt(&brief, &live_events, &live_prompt_state)?;
     let started = now_ms();
-    let run = match run_text_provider_prompt_with_timeout(provider_id_ref, &prompt, 25_000) {
+    let run = match run_text_provider_prompt_with_timeout(
+        provider_id_ref,
+        &prompt,
+        LIVE_AI_PROVIDER_TIMEOUT_MS,
+    ) {
         Ok(run) => run,
         Err(error) => {
             let (provider, _) = text_provider_summary(provider_id_ref);
@@ -785,40 +793,44 @@ pub(crate) fn extract_live_state_patch_oauth(
             ));
         }
     };
-    let decision_state = apply_live_state_patch(local_state, &patch, &events);
+    // The provider sees only the remote/system transcript. The returned patch is
+    // then applied to the full local state so the app keeps the user's own
+    // locally derived context without sending it to the provider.
+    let decision_state = apply_live_state_patch_from_refs(local_state, &patch, &live_events);
     let mut coaching_error = None;
-    let mut suggestions = match parse_live_coaching_suggestions(&raw_output, &session_id, &events) {
-        Ok(suggestions) => suggestions,
-        Err(("coaching_cards_discarded", error)) => {
-            let _ = log_app_error_inner(
-                Some(&session_id),
-                "live_coaching.cards_discarded",
-                "text_provider",
-                "info",
-                &error,
-                serde_json::json!({
-                    "provider": run.provider_id,
-                    "promptVersion": "extract_state_patch.oauth.v1",
-                    "rawOutputRef": stable_id(&raw_output)
-                }),
-            );
-            coaching_error = Some("AI 暫時沒有可信的提醒。".to_string());
-            vec![]
-        }
-        Err((failure_kind, error)) => {
-            log_extraction_failure_for(
-                &session_id,
-                run.provider_id,
-                failure_kind,
-                &format!(
-                    "live coaching rejected: {error}: {}",
-                    stable_id(&raw_output)
-                ),
-            )?;
-            coaching_error = Some("AI 回傳的提醒格式不完整，已保留會議判斷。".to_string());
-            vec![]
-        }
-    };
+    let mut suggestions =
+        match parse_live_coaching_suggestions_from_refs(&raw_output, &session_id, &live_events) {
+            Ok(suggestions) => suggestions,
+            Err(("coaching_cards_discarded", error)) => {
+                let _ = log_app_error_inner(
+                    Some(&session_id),
+                    "live_coaching.cards_discarded",
+                    "text_provider",
+                    "info",
+                    &error,
+                    serde_json::json!({
+                        "provider": run.provider_id,
+                        "promptVersion": "extract_state_patch.oauth.v1",
+                        "rawOutputRef": stable_id(&raw_output)
+                    }),
+                );
+                coaching_error = Some("AI 暫時沒有可信的提醒。".to_string());
+                vec![]
+            }
+            Err((failure_kind, error)) => {
+                log_extraction_failure_for(
+                    &session_id,
+                    run.provider_id,
+                    failure_kind,
+                    &format!(
+                        "live coaching rejected: {error}: {}",
+                        stable_id(&raw_output)
+                    ),
+                )?;
+                coaching_error = Some("AI 回傳的提醒格式不完整，已保留會議判斷。".to_string());
+                vec![]
+            }
+        };
     {
         let mut sessions = LIVE_SESSIONS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -867,7 +879,8 @@ pub(crate) fn extract_live_state_patch_oauth(
     )?;
 
     Ok(IngestTranscriptResponse {
-        event: last_event,
+        event: None,
+        live_evidence_event: Some(last_event),
         suggestions: suggestions.clone(),
         decision_state,
         persisted: PersistedSummary {

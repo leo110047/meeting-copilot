@@ -18,21 +18,23 @@ use crate::desktop_types::{
 use crate::local_stt::{
     is_local_whisper_profile, local_stt_profiles, normalize_local_stt_profile_id,
 };
+use crate::macos_speech_bridge::audio_diagnostic_severity;
 use crate::native_storage::{
     insert_app_error_log, insert_session, list_app_error_logs, record_session_text_provider,
 };
 #[cfg(not(target_os = "windows"))]
 use crate::oauth_provider::codex_unix_fallback_candidates;
 use crate::oauth_provider::{
-    CLAUDE_TEXT_PROVIDER_ID, CODEX_TEXT_PROVIDER_ID, SubscriptionOAuthParse,
+    CLAUDE_TEXT_PROVIDER_ID, CODEX_TEXT_PROVIDER_ID, LIVE_AI_REMOTE_SOURCE, SubscriptionOAuthParse,
     build_live_state_patch_prompt, build_transcript_cleanup_prompt,
     build_transcript_revision_prompt, cached_text_provider_count_for_tests, claude_command_path,
-    claude_status_from_print_probe, codex_command_available, normalize_text_provider_id,
-    parse_claude_auth_status, parse_claude_cli_capabilities, parse_claude_print_result,
-    parse_live_coaching_suggestions, parse_subscription_oauth_authenticated,
-    parse_transcript_cleanup_text, parse_transcript_revision_response,
-    start_subscription_oauth_login, text_provider_summary, validate_live_state_patch_value,
-    windows_codex_executable_names, windows_executable_extensions_from_pathext,
+    claude_status_from_print_probe, codex_command_available, is_live_ai_remote_event,
+    live_ai_remote_events, normalize_text_provider_id, parse_claude_auth_status,
+    parse_claude_cli_capabilities, parse_claude_print_result, parse_live_coaching_suggestions,
+    parse_subscription_oauth_authenticated, parse_transcript_cleanup_text,
+    parse_transcript_revision_response, start_subscription_oauth_login, text_provider_summary,
+    validate_live_state_patch_value, windows_codex_executable_names,
+    windows_executable_extensions_from_pathext,
 };
 use crate::shell_storage::{open_db, read_dropped_context_file};
 use std::fs;
@@ -82,6 +84,23 @@ fn native_transcription_error_classifier_handles_no_speech_without_locale_only_m
     assert_eq!(
         classify_native_transcription_error("Recognition request was canceled"),
         "recognition_request_canceled"
+    );
+}
+
+#[test]
+fn macos_audio_diagnostic_severity_promotes_drop_events() {
+    assert_eq!(
+        audio_diagnostic_severity("local_whisper_audio_dropped"),
+        "warning"
+    );
+    assert_eq!(
+        audio_diagnostic_severity("local_whisper_chunk_dropped"),
+        "warning"
+    );
+    assert_eq!(audio_diagnostic_severity("local_whisper_pipeline"), "info");
+    assert_eq!(
+        audio_diagnostic_severity("local_whisper_silence_dropped"),
+        "info"
     );
 }
 
@@ -739,13 +758,97 @@ fn live_state_prompt_requires_actionable_coaching_cards() {
         is_final: true,
     }];
     let state = derive_decision_state("s1", &events);
+    let event_refs = events.iter().collect::<Vec<_>>();
     let prompt =
-        build_live_state_patch_prompt(&crate::decision_logic::default_brief(), &events, &state)
+        build_live_state_patch_prompt(&crate::decision_logic::default_brief(), &event_refs, &state)
             .expect("build live state prompt");
     assert!(prompt.contains("\"coaching\""));
     assert!(prompt.contains("what the user should say next"));
     assert!(prompt.contains("Return at most one high-value coaching card"));
     assert!(prompt.contains("Use the meeting brief as the user's goals"));
+}
+
+#[test]
+fn live_ai_remote_events_exclude_user_mic_from_live_prompt() {
+    let events = vec![
+        TranscriptEvent {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            source: "mic".to_string(),
+            speaker: Some("我".to_string()),
+            speaker_confidence: 0.8,
+            language: "zh-TW".to_string(),
+            started_at_ms: 0,
+            ended_at_ms: Some(1000),
+            text: "owner 還沒定，我先不要承諾下週交。".to_string(),
+            is_final: true,
+        },
+        TranscriptEvent {
+            id: "s1".to_string(),
+            session_id: "s1".to_string(),
+            source: LIVE_AI_REMOTE_SOURCE.to_string(),
+            speaker: Some("對方 A".to_string()),
+            speaker_confidence: 0.7,
+            language: "zh-TW".to_string(),
+            started_at_ms: 1200,
+            ended_at_ms: Some(3000),
+            text: "那下週就直接上正式版吧".to_string(),
+            is_final: true,
+        },
+    ];
+    assert!(!is_live_ai_remote_event(&events[0]));
+    assert!(is_live_ai_remote_event(&events[1]));
+    let remote_events = live_ai_remote_events(&events);
+    assert_eq!(remote_events.len(), 1);
+    assert_eq!(remote_events[0].id, "s1");
+    let state = derive_decision_state("s1", &remote_events);
+    let remote_event_refs = remote_events.iter().collect::<Vec<_>>();
+    let prompt = build_live_state_patch_prompt(
+        &crate::decision_logic::default_brief(),
+        &remote_event_refs,
+        &state,
+    )
+    .expect("build live state prompt");
+    assert!(prompt.contains("那下週就直接上正式版吧"));
+    assert!(!prompt.contains("owner 還沒定"));
+    assert!(!prompt.contains("\"m1\""));
+
+    let full_local_state = derive_decision_state("s1", &events);
+    let patch = LiveStatePatchEnvelope {
+        meeting_state_patch: LiveMeetingStatePatch {
+            add_items: vec![
+                serde_json::json!({"kind": "risk", "text": "對方要求下週直接上正式版"}),
+            ],
+            update_items: vec![],
+            resolve_item_ids: vec![],
+            phase_change: None,
+            evidence_transcript_ids: vec!["s1".to_string()],
+        },
+        decision_state_patch: LiveDecisionStatePatch {
+            current_decision: Some("下週正式版 scope 需要再確認".to_string()),
+            add_options: vec![],
+            update_options: vec![],
+            add_risks: vec![],
+            add_missing_inputs: vec![],
+            readiness_patch: None,
+            evidence_transcript_ids: vec!["s1".to_string()],
+        },
+    };
+    let patched = apply_live_state_patch(full_local_state, &patch, &remote_events);
+    assert!(
+        patched
+            .missing_inputs
+            .iter()
+            .any(|input| value_string(input, "kind") == "owner")
+    );
+    assert!(
+        patched
+            .meeting_items
+            .iter()
+            .any(|item| value_string(item, "text").contains("下週直接上正式版"))
+    );
+    assert!(patched.evidence_transcript_ids.contains(&"m1".to_string()));
+    assert!(patched.evidence_transcript_ids.contains(&"s1".to_string()));
 }
 
 #[test]
