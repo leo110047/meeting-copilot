@@ -10,6 +10,7 @@ import {
   shouldTriggerLiveAiForEvent
 } from "./liveAiPolicy.mjs";
 import { PARTIAL_TRANSCRIPT_COMMIT_IDLE_MS, shouldCommitIdlePartial, shouldCommitReplacedPartial } from "./partialTranscriptPolicy.mjs";
+import { buildLiveMeetingBrief } from "./briefBuilder.mjs";
 import { createSetupController } from "./setupController.mjs";
 import { upsertTranscriptEventInPlace } from "./transcriptState.mjs";
 import { renderTranscriptDrawerView, transcriptSpeakerLabel } from "./transcriptDrawer.mjs";
@@ -33,6 +34,8 @@ const captureSource = document.querySelector("#captureSource");
 const curtainOpacity = document.querySelector("#curtainOpacity");
 const curtainOpacityValue = document.querySelector("#curtainOpacityValue");
 const setupContext = document.querySelector("#setupContext");
+const counterpartyContext = document.querySelector("#counterpartyContext");
+const counterpartyContextMeta = document.querySelector("#counterpartyContextMeta");
 const setupDropZone = document.querySelector("#setupDropZone");
 const setupContextMeta = document.querySelector("#setupContextMeta");
 const droppedFileCount = document.querySelector("#droppedFileCount");
@@ -155,6 +158,8 @@ const nativeListen = window.__TAURI__?.event?.listen;
 const setupController = createSetupController({
   elements: {
     setupContext,
+    counterpartyContext,
+    counterpartyContextMeta,
     setupDropZone,
     setupContextMeta,
     droppedFileCount,
@@ -2246,31 +2251,13 @@ function resetNativeWindowOpacity() {
 }
 
 function createBriefFromSetupContext() {
-  const series = selectedMeetingSeries();
-  const context = setupController.combinedPrepContext();
-  const contextLine = context ? `會議背景：${context.slice(0, 1400)}` : "未提供會議背景，會議中只依照即時內容判斷。";
-  const title = series?.title ?? DEFAULT_MEETING_TITLE;
-  return {
-    sessionId: makeClientId("native"),
-    projectId: "live_default_project",
-    meetingType: "live_decision_copilot",
-    title,
-    goal: series
-      ? `延續「${series.title}」追蹤本場會議決策，確認舊脈絡是否仍成立`
-      : context
-        ? `依據會議背景追蹤會議決策：${context.slice(0, 160)}`
-      : "即時追蹤會議決策，避免在 owner、deadline、驗收標準不清楚時承諾 scope",
-    mustConfirm: ["owner", "deadline", "驗收標準", "rollback plan"],
-    risks: ["未定義 owner/deadline 就做承諾", "demo scope 和正式版 scope 混在一起"],
-    constraints: [
-      "先確認決策條件再承諾交付",
-      series ? `本場選用既有會議脈絡：${series.title}` : "本場未選用既有會議脈絡",
-      contextLine
-    ],
-    knownParticipants: [],
-    preferredTone: "direct",
-    startedAt: new Date().toISOString()
-  };
+  return buildLiveMeetingBrief({
+    series: selectedMeetingSeries(),
+    prepContext: setupController.combinedPrepContext(),
+    counterpartyContext: setupController.counterpartyContext(),
+    makeSessionId: makeClientId,
+    defaultMeetingTitle: DEFAULT_MEETING_TITLE
+  });
 }
 
 function logAppError(stage, error, detail = {}, severity = "error") {

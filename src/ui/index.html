@@ -103,9 +103,18 @@
             <textarea
               id="setupContext"
               rows="8"
+              aria-describedby="setupContextMeta"
               placeholder="例：這場只確認 demo 範圍，不承諾正式版時程。需要問清楚負責人、驗收標準、回復方案。"
             ></textarea>
             <small id="setupContextMeta">尚未加入會議背景。</small>
+            <label class="field-label" for="counterpartyContext">對方背景 / 會議策略</label>
+            <textarea
+              id="counterpartyContext"
+              rows="5"
+              aria-describedby="counterpartyContextMeta"
+              placeholder="例：對方是 PM，常在 demo review 裡順手帶正式版 scope；這場只允許確認 demo。"
+            ></textarea>
+            <small id="counterpartyContextMeta">尚未加入對方背景。啟用 AI 後，這段會作為本場會議背景送給你選的 AI 連接器。</small>
           </section>
 
           <section id="setupDropZone" class="context-dropzone" aria-label="拖拉會議檔案">

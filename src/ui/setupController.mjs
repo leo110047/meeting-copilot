@@ -23,6 +23,8 @@ export function createSetupController({
 
   const {
     setupContext,
+    counterpartyContext,
+    counterpartyContextMeta,
     setupDropZone,
     setupContextMeta,
     droppedFileCount,
@@ -37,7 +39,11 @@ export function createSetupController({
         ? `已加入 ${length} 字會議背景。`
         : "尚未加入會議背景。";
       renderPrepSummary();
-      schedulePrepSummaryGeneration();
+    });
+    counterpartyContext?.addEventListener("input", () => {
+      const length = counterpartyContext.value.trim().length;
+      if (counterpartyContextMeta) counterpartyContextMeta.textContent = counterpartyContextStatusText(length);
+      renderPrepSummary();
     });
     setupDropZone.addEventListener("dragover", (event) => {
       event.preventDefault();
@@ -194,7 +200,6 @@ export function createSetupController({
     droppedContextChunks.push(...normalized);
     droppedFileCount.textContent = `已加入 ${droppedContextChunks.length} 個檔案`;
     renderPrepSummary();
-    schedulePrepSummaryGeneration();
   }
 
   function recordDroppedFileError(name, error) {
@@ -241,10 +246,31 @@ export function createSetupController({
     return [series, typed, files].filter(Boolean).join("\n\n").trim();
   }
 
+  function currentCounterpartyContext() {
+    return counterpartyContext?.value.trim() ?? "";
+  }
+
+  function counterpartyContextBlock() {
+    const counterparty = currentCounterpartyContext();
+    return counterparty
+      ? `對方背景與可能會議策略\n${counterparty}`
+      : "";
+  }
+
+  function aiPrepContext() {
+    return [combinedPrepContext(), counterpartyContextBlock()].filter(Boolean).join("\n\n").trim();
+  }
+
+  function counterpartyContextStatusText(length) {
+    const prefix = length > 0
+      ? `已加入 ${length} 字對方背景。`
+      : "尚未加入對方背景。";
+    return `${prefix}啟用 AI 後，這段會作為本場會議背景送給你選的 AI 連接器。`;
+  }
+
   function setMeetingSeriesContext(context) {
     meetingSeriesContext = String(context ?? "").trim();
     renderPrepSummary();
-    schedulePrepSummaryGeneration();
   }
 
   function contextDiagnostics() {
@@ -255,7 +281,7 @@ export function createSetupController({
   }
 
   function renderPrepSummary() {
-    const context = combinedPrepContext();
+    const context = aiPrepContext();
     if (!canStartWithAi()) {
       prepSummary.textContent = "請先登入並啟用 AI。啟用後，這裡會整理會議背景，並開放開始會議。";
       return;
@@ -278,7 +304,7 @@ export function createSetupController({
   function schedulePrepSummaryGeneration() {
     clearTimeout(prepSummaryTimer);
     if (!nativeInvoke || !canStartWithAi()) return;
-    const context = combinedPrepContext();
+    const context = aiPrepContext();
     if (!context) return;
     prepSummary.textContent = "AI 正在整理會議背景...";
     const requestId = ++prepSummaryRequestId;
@@ -286,7 +312,7 @@ export function createSetupController({
   }
 
   async function generatePrepSummary(requestId) {
-    const context = combinedPrepContext();
+    const context = aiPrepContext();
     if (!context || !canStartWithAi()) return;
     if (prepSummaryInFlight) {
       prepSummaryQueued = true;
@@ -323,6 +349,8 @@ export function createSetupController({
   return {
     install,
     combinedPrepContext,
+    aiPrepContext,
+    counterpartyContext: currentCounterpartyContext,
     contextDiagnostics,
     setMeetingSeriesContext,
     renderPrepSummary,

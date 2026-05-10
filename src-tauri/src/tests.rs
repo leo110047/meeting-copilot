@@ -825,6 +825,8 @@ fn live_state_prompt_requires_actionable_coaching_cards() {
     assert!(prompt.contains("what the user should say next"));
     assert!(prompt.contains("Return at most one high-value coaching card"));
     assert!(prompt.contains("Use the meeting brief as the user's goals"));
+    assert!(prompt.contains("possible intent or meeting-strategy hypothesis"));
+    assert!(prompt.contains("put the hypothesis in watchOut"));
 }
 
 #[test]

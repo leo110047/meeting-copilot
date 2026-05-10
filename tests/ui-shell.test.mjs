@@ -3,10 +3,11 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 test("UI only exposes stage-appropriate controls", async () => {
-  const [html, css, appJs, exportsJs, setupJs, summariesJs, transcriptDrawerJs, utilsJs, design] = await Promise.all([
+  const [html, css, appJs, briefBuilderJs, exportsJs, setupJs, summariesJs, transcriptDrawerJs, utilsJs, design] = await Promise.all([
     readFile(new URL("../src/ui/index.html", import.meta.url), "utf8"),
     readFile(new URL("../src/ui/styles.css", import.meta.url), "utf8"),
     readFile(new URL("../src/ui/app.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../src/ui/briefBuilder.mjs", import.meta.url), "utf8"),
     readFile(new URL("../src/ui/documentExports.mjs", import.meta.url), "utf8"),
     readFile(new URL("../src/ui/setupController.mjs", import.meta.url), "utf8"),
     readFile(new URL("../src/ui/meetingSummaries.mjs", import.meta.url), "utf8"),
@@ -14,7 +15,7 @@ test("UI only exposes stage-appropriate controls", async () => {
     readFile(new URL("../src/ui/uiUtils.mjs", import.meta.url), "utf8"),
     readFile(new URL("../DESIGN.md", import.meta.url), "utf8")
   ]);
-  const js = `${appJs}\n${exportsJs}\n${setupJs}\n${summariesJs}\n${transcriptDrawerJs}\n${utilsJs}`;
+  const js = `${appJs}\n${briefBuilderJs}\n${exportsJs}\n${setupJs}\n${summariesJs}\n${transcriptDrawerJs}\n${utilsJs}`;
 
   assert.match(design, /three-stage desktop utility/);
   assert.match(design, /Setup/);
@@ -27,6 +28,11 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(html, /setup-screen/);
   assert.match(html, /setupDropZone/);
   assert.match(html, /setupContext/);
+  assert.match(html, /aria-describedby="setupContextMeta"/);
+  assert.match(html, /counterpartyContext/);
+  assert.match(html, /counterpartyContextMeta/);
+  assert.match(html, /aria-describedby="counterpartyContextMeta"/);
+  assert.match(html, /這段會作為本場會議背景送給你選的 AI 連接器/);
   assert.match(html, /provider-settings/);
   assert.match(html, /textProviderName/);
   assert.match(html, /textProviderChoice/);
@@ -135,6 +141,8 @@ test("UI only exposes stage-appropriate controls", async () => {
   assert.match(css, /@keyframes processing-sweep/);
 
   assert.match(js, /initializeSetupState\(\)/);
+  assert.match(js, /buildLiveMeetingBrief/);
+  assert.match(js, /對方背景與可能會議策略/);
   assert.match(js, /loadMeetingSeriesOptions/);
   assert.match(js, /list_meeting_series_command/);
   assert.match(js, /save_meeting_history_command/);
